@@ -11,7 +11,7 @@
 client_id: cn360
 display_name: 国服 360 客户端
 language: zh_cn
-reference_resolution: [2559, 1599]   # 模板采集时的窗口客户区尺寸（实机截图实测）
+reference_resolution: [2560, 1600]   # 游戏客户区实测 2560x1600（截图文件为 2559x1599，归一化区域两者通用）
 notes: 部分模板已从 2026-10-30 实机截图提取；其余待标定。
 
 window:
@@ -56,13 +56,13 @@ exit:
   menu_open_feature: exit_menu_return_port
   return_port_feature: exit_menu_return_port
   confirm_feature: exit_confirm_yes
-  port_feature: port_indicator
+  port_feature: port_battle_button   # 港口页/装备页都有的“加入战斗”按钮，比标签页稳定
   direct_exit_feature: null
   post_click_wait_ms: 500
 
 # 状态识别特征表（详细设计 5.4）。第一个为主判定，其余为辅助；缺失特征会被跳过。
 state_features:
-  PORT: [port_indicator, port_battle_button, coop_mode_selected, port_tab, port_equip_tab]
+  PORT: [port_indicator, port_battle_button, coop_mode_selected, port_equip_tab]
   QUEUEING: [queue_indicator, cancel_queue_button]
   LOADING: []                     # 加载界面模板可缺省：排队结束后直接检测战斗 HUD 进战斗
   BATTLE_ACTIVE: [battle_hud_indicator, hp_bar_present]
@@ -78,8 +78,8 @@ popup_features: []
 # 已提取：18 个（含 2026-10-30 新补的退出菜单/确认框/装备页/标签页模板）。
 features:
   port_indicator:
-    template: features/port_indicator.png          # 顶部“港口”标签
-    region: [0.24, 0.045, 0.36, 0.10]
+    template: features/port_indicator.png          # 顶部“港口”标签（实机画面提取）
+    region: [0.26, 0.045, 0.42, 0.10]
     threshold: 0.82
   port_battle_button:
     template: features/port_battle_button.png      # 顶部“加入战斗”按钮
@@ -140,12 +140,8 @@ features:
     threshold: 0.85
   # ---- 实测港口标签页 / 装备页信号旗（210924 / 214644）----
   port_equip_tab:
-    template: features/port_equip_tab.png             # 顶部“装备”标签（港口页未选中态）
-    region: [0.32, 0.05, 0.42, 0.09]
-    threshold: 0.82
-  port_tab:
-    template: features/port_tab.png                   # 顶部“港口”标签（装备页未选中态）
-    region: [0.24, 0.05, 0.34, 0.09]
+    template: features/port_equip_tab.png             # 顶部“装备”标签（实机画面提取，未选中态）
+    region: [0.34, 0.045, 0.50, 0.10]
     threshold: 0.82
   loadout_signal_flags:
     template: features/loadout_signal_flags.png       # 装备页“信号旗 0/8”（数量为 0 才算空）
@@ -210,7 +206,8 @@ popup_sequence: []
 ship_selection_sequence: []
 
 # 每场战斗前的装备页校验（用户确认：只要求信号旗数量为 0）：
-# 切到“装备”页 → 等“信号旗 0/8”特征（数量不为 0 则匹配失败，进入 PAUSED）→ 切回“港口”页。
+# 点顶部“装备”标签 → 等“信号旗 0/8”特征（数量不为 0 则匹配失败，进入 PAUSED）。
+# 校验后不必切回港口页：“加入战斗”按钮在装备页同样存在，直接开局即可。
 ship_check_sequence:
   - action: click_feature
     feature: port_equip_tab
@@ -220,10 +217,6 @@ ship_check_sequence:
     feature: loadout_signal_flags
     timeout_ms: 3000
     retries: 0
-  - action: click_feature
-    feature: port_tab
-    timeout_ms: 3000
-    retries: 1
 
 # 船只校验：ship_card 由运行时的船只卡片模板注册（来自 ships/<ship_id>/card.png）
 ship_verify_features: [ship_card]

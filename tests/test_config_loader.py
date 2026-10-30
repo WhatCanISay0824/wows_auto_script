@@ -104,8 +104,8 @@ def test_load_profile_real_cn360(project_root: Path) -> None:
     assert issues == []
     assert profile.client_id == "cn360"
     assert profile.display_name
-    assert profile.reference_resolution == (2559, 1599)
-    assert len(profile.features) == 18
+    assert profile.reference_resolution == (2560, 1600)
+    assert len(profile.features) == 17
     # 2026-10-30 实机截图已全部提取（含退出菜单/确认框/装备页/标签页）
     assert all(feature.template_path is not None for feature in profile.features.values())
     assert profile.battle_hud.spectator_features == ()
@@ -127,7 +127,7 @@ def test_load_profile_real_cn360(project_root: Path) -> None:
     assert len(profile.start_sequence_full) == 3
     assert len(profile.result_sequence) == 2
     assert profile.ship_selection_sequence == ()
-    assert len(profile.ship_check_sequence) == 3
+    assert len(profile.ship_check_sequence) == 2
     assert profile.loadout_verify_features == ()
     assert profile.state_features["PORT"][0] == "port_indicator"
     assert profile.profile_dir == project_root / "profiles" / "cn360"

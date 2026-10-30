@@ -5,13 +5,15 @@
 完整截图清单、数量与工具命令见 `docs/截图标定清单.md`；
 已从 2026-10-30 实机截图提取的模板与缺口见 `docs/截图分类与提取结果.md`。
 
-当前进度：**18 个界面模板 + `marker/marker.png` + `ships/leningrad/card.png` 已全部提取**
-（实机截图 2559×1599），`validate` 0 error、`main --dry-run` 退出码 0。
+当前进度：**17 个界面模板 + `marker/marker.png` + `ships/leningrad/card.png` + `ships/iron_duke/card.png` 已全部提取**
+（实机窗口客户区 2560×1600；截图文件为 2559×1599），`validate` 0 error、`main --dry-run` 退出码 0。
 加载界面、观战界面、回港弹窗已按用户口径改为非必需。
+其中 `port_indicator` / `port_equip_tab` 已按实机 2560×1600 画面重新提取（旧截图里的标签位置与实机
+相差约 4% 宽度；若以后改游戏 UI 缩放，需要重取这两个模板与区域）。
 
 需要标定并生成的文件：
 
-- `features/*.png`：profile.yaml 中 `features` 引用的 18 个界面模板，已全部提取；
+- `features/*.png`：profile.yaml 中 `features` 引用的 17 个界面模板，已全部提取；
 - `marker/marker.png`：小地图上自身舰船标记，已提取；运行时由 ShipLocator 自动生成多角度模板；
 - `ships/<ship_id>/card.png`：船只卡片。当前已有 `ships/leningrad/`（列宁格勒）和
   `ships/iron_duke/`（铁公爵）；**每次换一艘新船首次使用前**，截港口底部轮播条里该船卡片完整可见的图，运行
