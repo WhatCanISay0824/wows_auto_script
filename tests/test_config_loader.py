@@ -119,7 +119,7 @@ def test_load_profile_real_cn360(project_root: Path) -> None:
     assert len(profile.start_sequence) == 3
     assert len(profile.start_sequence_full) == 4
     assert len(profile.result_sequence) == 2
-    assert profile.loadout_verify_features == ("loadout_signal_flags", "loadout_economic_bonus")
+    assert profile.loadout_verify_features == ("loadout_signal_flags",)
     assert profile.state_features["PORT"][0] == "port_indicator"
     assert profile.profile_dir == project_root / "profiles" / "cn360"
 
@@ -152,7 +152,7 @@ def test_load_ship_real(project_root: Path) -> None:
     assert ship.card_path is None  # 待标定
     assert ship.scroll_direction == "down"
     assert ship.max_scrolls == 20
-    assert [slot.slot_id for slot in ship.loadout_slots] == ["signal_flags", "economic_bonus"]
+    assert [slot.slot_id for slot in ship.loadout_slots] == ["signal_flags"]
     assert ship.loadout_slots[0].empty_template == "loadout/signal_flags_empty.png"
     assert ship.ship_dir == path.parent
 

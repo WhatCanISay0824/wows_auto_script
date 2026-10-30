@@ -215,25 +215,30 @@ result_sequence:
     timeout_ms: 10000
     retries: 2
 
-# 弹窗清理：代码按 popup_features 循环识别，每轮执行一次本序列，最多 5 轮
+# 弹窗清理：代码按 popup_features 循环识别，每轮执行一次本序列，最多 5 轮。
+# 注意：死亡后提前退出战斗时，港口里可能出现的“原战局战报”弹窗不需要单独模板，
+# 脚本按未知弹窗处理（遮挡港口时 ESC 一次；不点战报里的任何按钮，避免误操作）。
 popup_sequence:
   - action: click_feature
     feature: popup_close_button
     timeout_ms: 3000
     retries: 1
 
-# 船只选择：打开船只列表；之后的滚动查找由 ShipChecker 按 ship.yaml 的
-# scroll_direction / scroll_clicks / max_scrolls 循环执行（详细设计 6.8）
+# 船只选择：打开船只列表；之后的查找由 ShipChecker 用鼠标滚轮滚动列表
+# （Action.move_abs 把光标移到列表区域 + Action.wheel 滚动，配置见 ship.yaml 的
+#  scroll_direction / scroll_clicks / max_scrolls），不拖动滚动条、不点击列表外区域。
 ship_selection_sequence:
   - action: click_feature
     feature: port_ship_panel_button
     timeout_ms: 3000
     retries: 1
 
-# 船只与空装备校验：ship_card 由运行时的船只卡片模板注册；
-# loadout_* 由 ships/<ship_id>/loadout/ 下的空槽模板注册（详细设计 6.8）
+# 船只与空装备校验（详细设计 6.8 + 用户确认口径）：
+# - ship_card 由运行时的船只卡片模板注册；
+# - 只校验信号旗槽为空（数量为 0），左侧配件/升级不读不点；
+# - 不售卖/不消耗任何船只或装备。
 ship_verify_features: [ship_card]
-loadout_verify_features: [loadout_signal_flags, loadout_economic_bonus]
+loadout_verify_features: [loadout_signal_flags]
 
 # 默认不自动清除已装配的信号旗或加成卡（详细设计 6.8）
 clear_loadout_sequence: null
