@@ -124,6 +124,9 @@ class PerceptionEngine:
         self._capture_count = 0
         self._map_identify_count = 0
         self._minimap_expected_scale = config.global_config.map.expected_minimap_scale
+        self._hp_bar_check_enabled = bool(self.profile.features.get("hp_bar_present"))
+        # 以下显示/解析类可选：main 启动时按当前船只调用 configure_ship_hp_bar() 覆盖
+        self._extras_configured = False
 
     # ------------------------------------------------------------------
     # 生命周期与状态
@@ -176,6 +179,42 @@ class PerceptionEngine:
     def close(self) -> None:
         if self._capture is not None:
             self._capture.close()
+
+    # ------------------------------------------------------------------
+    # 船只相关模板（每船一张血条模板，换船时由 main 调用覆盖）
+    # ------------------------------------------------------------------
+    def configure_ship_hp_bar(self, ship) -> None:
+        """按当前船只覆盖“己方血条存在”模板。
+
+        - 船只档案提供 ``hp_bar.png`` 时注册为该船专用模板，启用 hp_bar_absent 死亡信号；
+        - 未提供时注销该特征并禁用该信号，死亡判定改用死亡提示/结算界面兜底
+          （避免用别的船的模板误判“血条消失”）。
+        """
+        template_matcher = self._feature_matcher.template_matcher
+        hp_bar_path = getattr(ship, "hp_bar_path", None)
+        if hp_bar_path is None:
+            if template_matcher.has_feature("hp_bar_present"):
+                template_matcher.unregister_feature("hp_bar_present")
+            self._hp_bar_check_enabled = False
+            self._logger.info("当前船只未提供 hp_bar.png，禁用“血条消失”死亡信号（用死亡提示/结算兜底）")
+            return
+        feature = self.profile.feature("hp_bar_present")
+        region = feature.region if feature is not None else None
+        threshold = feature.threshold if feature is not None else 0.82
+        try:
+            template_matcher.register_feature(
+                "hp_bar_present",
+                hp_bar_path,
+                region=region,
+                threshold=threshold,
+                replace=True,
+            )
+            self._hp_bar_check_enabled = True
+            self._logger.info("已加载船只专用血条模板: %s", hp_bar_path)
+        except Exception as exc:
+            template_matcher.unregister_feature("hp_bar_present")
+            self._hp_bar_check_enabled = False
+            self._logger.warning("船只血条模板加载失败，禁用血条死亡信号: %s", exc)
 
     # ------------------------------------------------------------------
     # 截屏与特征
@@ -493,7 +532,7 @@ class PerceptionEngine:
             ids = self._battle_feature_ids(set())
             features = self._feature_matcher.match_many(ids, frame) if frame is not None else {}
         hud = self.profile.battle_hud
-        hp_bar_feature = "hp_bar_present" in self.profile.features
+        hp_bar_feature = self._hp_bar_check_enabled and "hp_bar_present" in self.profile.features
         hp_bar_found = bool(features.get("hp_bar_present") and features["hp_bar_present"].found)
         hp_bar_absent = hp_bar_feature and not hp_bar_found
         hp_zero = False

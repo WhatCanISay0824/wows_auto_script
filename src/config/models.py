@@ -228,6 +228,9 @@ class ShipProfile:
     display_name: str
     card_template: str = "card.png"
     card_search_region: NormalizedRect | None = None
+    # 每船独立的“己方血条存在”模板：不同船名/舰种的血条面板文字不同，换船需替换；
+    # 未提供时死亡判定不使用“血条消失”信号（改用死亡提示/结算界面兜底）。
+    hp_bar_template: str | None = None
     loadout_preset_feature: str | None = None
     loadout_slots: tuple[LoadoutSlotDef, ...] = ()
     max_scrolls: int = 20
@@ -236,6 +239,7 @@ class ShipProfile:
     notes: str = ""
     ship_dir: Path | None = None
     card_path: Path | None = None
+    hp_bar_path: Path | None = None
 
 
 # ---------------------------------------------------------------------------

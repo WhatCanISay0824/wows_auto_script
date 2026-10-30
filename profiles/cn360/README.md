@@ -15,8 +15,11 @@
 - `marker/marker.png`：小地图上自身舰船标记，已提取；运行时由 ShipLocator 自动生成多角度模板；
 - `ships/<ship_id>/card.png`：船只卡片。当前已有 `ships/leningrad/`（列宁格勒）；
   **每次换一艘新船首次使用前**，截港口底部轮播条里该船卡片完整可见的图，运行
-  `python -m src.tools.calibrate_ship --root . --ship-id <id> --screenshot <截图>` 生成新档案；
-  之后 `python -m src.main --ship-name <船名>` 会自动滚轮查找并选中；
+  `python -m src.tools.calibrate_ship --root . --ship-id <id> --display-name <船名> --screenshot <截图>`
+  生成新档案；之后 `python -m src.main --ship-name <船名>` 会自动滚轮查找并选中；
+- `ships/<ship_id>/hp_bar.png`（可选）：该船战斗画面左下角“等级+舰名”血条文字模板，
+  在 `ship.yaml` 用 `hp_bar_template: hp_bar.png` 引用。不同船名/舰种文字不同，换船需替换；
+  不提供则禁用“血条消失”死亡信号，改用死亡提示/结算界面兜底；
 - 信号旗校验：由 `profile.yaml` 的 `ship_check_sequence` 在**装备页**完成（切到装备页 →
   等“信号旗 0/8”模板命中 → 切回港口页），不再需要 `loadout/*.png` 空槽模板。
 

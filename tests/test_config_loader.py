@@ -159,6 +159,8 @@ def test_load_ship_real(project_root: Path) -> None:
     assert ship.display_name == "列宁格勒"
     assert ship.card_template == "card.png"
     assert ship.card_path == path.parent / "card.png"  # 已从实机截图提取
+    assert ship.hp_bar_template == "hp_bar.png"
+    assert ship.hp_bar_path == path.parent / "hp_bar.png"
     assert ship.scroll_direction == "down"
     assert ship.scroll_clicks == 2
     assert ship.max_scrolls == 20

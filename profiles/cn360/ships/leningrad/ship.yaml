@@ -9,6 +9,7 @@ ship_id: leningrad
 display_name: 列宁格勒
 card_template: card.png
 card_search_region: [0.0, 0.80, 1.0, 1.0]   # 港口底部船只轮播条（实测 UI）
+hp_bar_template: hp_bar.png   # 该船战斗画面左下“VII 列宁格勒”血条文字（每船一份，换船需替换）
 loadout_preset_feature: null
 max_scrolls: 20               # 船只列表最多滚动次数（鼠标滚轮滚动，不用拖动滚动条）
 scroll_direction: down        # 轮播条滚动方向：down=向下滚（待实机确认）

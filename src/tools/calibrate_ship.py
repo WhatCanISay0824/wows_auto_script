@@ -438,6 +438,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--profile", default="cn360", help="客户端配置编号，默认 cn360")
     parser.add_argument("--ship-id", default="placeholder", help="船只编号（对应 ships/<ship_id>/），默认 placeholder")
     parser.add_argument("--ship-dir", default=None, help="直接指定船只目录（优先于 --root/--profile/--ship-id）")
+    parser.add_argument(
+        "--display-name",
+        default=None,
+        help="船只显示名称（例如 铁公爵）；不填则沿用 ship.yaml 或 ship_id，启动后也可在界面修改",
+    )
     parser.add_argument("--screenshot", default=None, help="港口截图路径（启动后也可在界面载入）")
     return parser
 
@@ -455,11 +460,12 @@ def main(argv: list[str] | None = None) -> int:
     """船只标定入口：载入配置与截图并打开 GUI。"""
     args = _build_parser().parse_args(argv)
     ship_dir = resolve_ship_dir(args)
-    if not ship_dir.is_dir():
-        print(f"[ERROR] 船只目录不存在: {ship_dir}", file=sys.stderr)
-        return 2
+    # 新船首次标定时目录可能不存在：直接创建，方便“输入船名 → 标定一次”的流程
+    ship_dir.mkdir(parents=True, exist_ok=True)
     screenshot = Path(args.screenshot).expanduser() if args.screenshot else None
     state = load_ship_editor(ship_dir, screenshot)
+    if args.display_name:
+        state.display_name = args.display_name.strip()
     try:
         root = cc.create_root(f"船只标定 - {ship_dir.name}")
     except RuntimeError as exc:

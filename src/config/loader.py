@@ -1660,6 +1660,8 @@ def load_ship(
 
     card_template = _str_value(raw, "card_template", "card.png", collected, label)
     card_path = resolve_path(card_template, ship_dir) if card_template else None
+    hp_bar_template = _opt_str(raw, "hp_bar_template", None, collected, label)
+    hp_bar_path = resolve_path(hp_bar_template, ship_dir) if hp_bar_template else None
     loadout_slots_raw = raw.get("loadout_slots")
     slots: list[LoadoutSlotDef] = []
     if loadout_slots_raw is None:
@@ -1699,6 +1701,7 @@ def load_ship(
         display_name=_str_value(raw, "display_name", "", collected, label),
         card_template=card_template,
         card_search_region=_normalized_rect(raw, "card_search_region", None, collected, label),
+        hp_bar_template=hp_bar_template,
         loadout_preset_feature=_opt_str(raw, "loadout_preset_feature", None, collected, label),
         loadout_slots=tuple(slots),
         max_scrolls=_int_value(raw, "max_scrolls", 20, collected, label),
@@ -1707,6 +1710,7 @@ def load_ship(
         notes=_str_value(raw, "notes", "", collected, label),
         ship_dir=ship_dir,
         card_path=card_path if card_path is not None and card_path.is_file() else None,
+        hp_bar_path=hp_bar_path if hp_bar_path is not None and hp_bar_path.is_file() else None,
     )
 
 

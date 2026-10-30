@@ -146,6 +146,8 @@ def _build_runtime(app: AppConfig) -> Runtime:
         capture_budget_ms=config.timeouts.capture_ms,
     )
     engine = PerceptionEngine(app, capture, clock)
+    # 每船独立血条模板：换船后血条面板上的舰名不同，必须用当前船的模板，否则会误判“血条消失”
+    engine.configure_ship_hp_bar(app.ship)
     events = EventSink(
         app.project_root / config.paths.data_dir / "wows_script.db",
         logger=text_logger,

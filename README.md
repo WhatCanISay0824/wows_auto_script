@@ -100,8 +100,19 @@ python -m src.main --ship-name 列宁格勒  # 按船名选择固定船只（脚
 ```
 
 > 每次托管的船可以不同：用 `--ship-name` 输入船名即可，脚本会在底部船只轮播条里滚轮查找并点击选中。
-> 每艘**新船**首次使用前需要截一次港口轮播卡片（约 10 秒，`python -m src.tools.calibrate_ship`），
-> 已有 `profiles/cn360/ships/leningrad/` 可直接用；其它船同理新增一个船只档案。
+> 每艘**新船**首次使用前需要做一次约 10 秒的标定（生成该船卡片），已有 `profiles/cn360/ships/leningrad/`
+> 可直接用。以换成“铁公爵”为例：
+>
+> ```powershell
+> # 1) 在港口截图（底部轮播条里能看到铁公爵卡片，最好选中它）
+> # 2) 生成新船档案（GUI 里确认显示名“铁公爵”，框选卡片：只框船体剪影+船名，避开 +50%/等级徽章与选中边框）
+> python -m src.tools.calibrate_ship --root . --ship-id iron_duke --display-name 铁公爵 --screenshot screenshots/铁公爵港口.png
+> # 3) 之后启动时直接输入船名，脚本自动找船并选中
+> python -m src.main --ship-name 铁公爵
+> ```
+>
+> 可选：把该船战斗画面左下角血条截图裁成 `ships/iron_duke/hp_bar.png`（`hp_bar_template: hp_bar.png`），
+> 用于“血条消失”死亡信号；不提供也能跑，死亡判定改用死亡提示/结算界面兜底。
 
 轮换流程：当前账号达到 `max_battles_per_session`（或每日上限/允许时段）后，脚本停止会话并在
 控制台提示手动切换账号；完成客户端切号、回到港口后按回车，脚本以新账号的客户端配置/船只/

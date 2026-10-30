@@ -968,6 +968,15 @@ def validate_ship(ship: ShipProfile, *, location: str | None = None) -> list[Val
     elif ship.ship_dir is not None:
         expected = ship.ship_dir / ship.card_template
         _check_image_file(expected, issues, _loc(location, "card_template"))
+    if ship.hp_bar_template and ship.ship_dir is not None:
+        expected_hp = ship.ship_dir / ship.hp_bar_template
+        if not expected_hp.is_file():
+            _warn(
+                issues,
+                "file_missing",
+                _loc(location, "hp_bar_template"),
+                "船只血条模板缺失：该船将不使用“血条消失”死亡信号（改用死亡提示/结算界面兜底）",
+            )
     if ship.scroll_direction not in SCROLL_DIRECTIONS:
         _error(
             issues,
