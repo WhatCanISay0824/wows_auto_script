@@ -514,16 +514,23 @@ class StateMachine:
                 pass
 
     def _handle_queueing(self, observation: Observation, now: float) -> list[Action]:
+        # 加载界面模板可缺省：直接检测战斗 HUD，排队结束后一步进入战斗（用户确认可跳过加载界面）
+        if self._battle_hud_visible(observation):
+            self._transition(State.BATTLE_ACTIVE, "battle_hud_detected_from_queue")
+            return []
         if self._observed_feature(observation, "loading_indicator") or self._observed_feature(
             observation, "loading_tip_area"
         ):
             self._transition(State.LOADING, "loading_detected")
         return []
 
+    def _battle_hud_visible(self, observation: Observation) -> bool:
+        return self._observed_feature(observation, "battle_hud_indicator") or self._observed_feature(
+            observation, "hp_bar_present"
+        )
+
     def _handle_loading(self, observation: Observation, now: float) -> list[Action]:
-        if self._observed_feature(observation, "battle_hud_indicator") or self._observed_feature(
-            observation, "minimap_frame"
-        ):
+        if self._battle_hud_visible(observation):
             self._transition(State.BATTLE_ACTIVE, "battle_hud_detected")
         return []
 

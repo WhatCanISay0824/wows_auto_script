@@ -7,7 +7,9 @@ import subprocess
 import sys
 from pathlib import Path
 
-from src.main import EXIT_CONFIG_ERROR, build_parser
+import pytest
+from src.common.errors import ConfigError
+from src.main import EXIT_CONFIG_ERROR, _list_ships, _resolve_ship, build_parser
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -32,6 +34,8 @@ def test_parser_help_contains_account_options() -> None:
     assert "--account" in help_text
     assert "--rotate" in help_text
     assert "--dry-run" in help_text
+    assert "--ship-name" in help_text
+    assert "--list-ships" in help_text
 
 
 def test_main_help_exits_zero() -> None:
@@ -50,3 +54,30 @@ def test_main_version() -> None:
     result = _run(["--version"])
     assert result.returncode == 0
     assert "wows_script" in result.stdout
+
+
+def test_list_ships_real_repo() -> None:
+    ships = _list_ships(PROJECT_ROOT, "cn360")
+    assert ships
+    ship_ids = [ship_id for ship_id, _ in ships]
+    assert "placeholder" in ship_ids
+    assert any(display for _, display in ships)
+
+
+def test_resolve_ship_by_display_name() -> None:
+    ships = dict(_list_ships(PROJECT_ROOT, "cn360"))
+    display_name = ships["placeholder"]
+    assert _resolve_ship(PROJECT_ROOT, "cn360", None, display_name) == "placeholder"
+    assert _resolve_ship(PROJECT_ROOT, "cn360", None, "placeholder") == "placeholder"
+
+
+def test_resolve_ship_unknown_name_lists_candidates() -> None:
+    with pytest.raises(ConfigError) as exc_info:
+        _resolve_ship(PROJECT_ROOT, "cn360", None, "不存在的船")
+    assert "现有船只" in str(exc_info.value)
+
+
+def test_main_list_ships_cli() -> None:
+    result = _run(["--list-ships"])
+    assert result.returncode == 0, result.stderr
+    assert "placeholder" in result.stdout

@@ -570,6 +570,26 @@ def test_dead_exit_flow_to_port(tmp_path: Path) -> None:
     assert h.machine.battles_completed == 1
 
 
+def test_queue_to_battle_without_loading_template(tmp_path: Path) -> None:
+    """用户确认加载界面可跳过：排队后直接检测到战斗 HUD 即进战斗。"""
+    h = Harness(tmp_path)
+    h.machine.start()
+    h.perception.detected = State.PORT
+    h.step()
+    h.step()
+    h.step()
+    h.step()
+    h.step()
+    assert h.machine.state is State.START_COOP
+    h.perception.features["queue_indicator"] = _match("queue_indicator")
+    h.step()
+    assert h.machine.state is State.QUEUEING
+    # 不设置 loading 特征，直接出现战斗 HUD
+    h.perception.features["battle_hud_indicator"] = _match("battle_hud_indicator")
+    h.step()
+    assert h.machine.state is State.BATTLE_ACTIVE
+
+
 def test_autopilot_mode_starts_without_map_recognition(tmp_path: Path) -> None:
     """简化需求：autopilot 模式开局后自动驾驶启动，不做地图识别。"""
     h = Harness(tmp_path)

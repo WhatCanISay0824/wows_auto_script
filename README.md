@@ -26,7 +26,7 @@
 | 配置加载与校验、地图包、SQLite 日志、截图管理、`validate` 工具 | ✅ M0 已实现并单测 |
 | 账号档案加载、分账号统计、会话间轮换 | ✅ 已实现（用户扩展需求，见下文） |
 | GDI 截屏、模板匹配、特征匹配 | ✅ M0 已实现并单测 |
-| 界面模板标定（实机截图） | 🚧 已从 12 张实机截图提取 13 个界面模板 + 自身标记；剩 10 个界面模板、船卡、空信号旗槽待补（validate 12 error） |
+| 界面模板标定（实机截图） | 🚧 已从 12 张实机截图提取 13 个界面模板 + 自身标记；剩 4 个退出模板、船卡、空信号旗槽待补（validate 6 error） |
 | ORB 地图识别、舰船定位、死亡投票 | ✅ M0 已实现并单测（合成图验证） |
 | SendInput 输入、输入线程、安全热键 | ✅ M0 已实现并单测 |
 | 步骤序列、会话控制、导航、随机行为 | ✅ M0 已实现并单测 |
@@ -95,6 +95,8 @@ navigation:
 ```powershell
 python -m src.main --account alt1     # 只运行指定账号档案
 python -m src.main --rotate           # 按 accounts.yaml 轮换启用账号
+python -m src.main --list-ships       # 列出客户端配置下的船只档案（ship_id 与显示名）
+python -m src.main --ship-name 列宁格勒  # 按船名选择固定船只（脚本用鼠标在港口服部轮播条里找并选中）
 ```
 
 轮换流程：当前账号达到 `max_battles_per_session`（或每日上限/允许时段）后，脚本停止会话并在
@@ -136,6 +138,7 @@ python -m ruff check src tests
 
 # 运行脚本（需要游戏已安装并完成标定）
 python -m src.main --profile cn360 --ship <ship_id>
+python -m src.main --profile cn360 --ship-name <船只显示名>
 
 # 环境检查 / 标定 / 录制回放（M0-b 完成后可用）
 python -m src.tools.check_env --profile cn360

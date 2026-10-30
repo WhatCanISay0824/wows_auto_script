@@ -32,7 +32,7 @@ from .common.clock import Clock, SystemClock
 from .common.errors import ConfigError
 from .common.types import Observation, Rect, WindowInfo
 from .common.window import WindowLocator, set_dpi_awareness
-from .config.loader import load_app, load_project
+from .config.loader import load_app, load_project, load_ship
 from .config.models import AccountsConfig, AppConfig
 from .config.validate import validate_app
 from .execution.queue import InputExecutor
@@ -385,6 +385,39 @@ def _load_accounts(root: Path) -> AccountsConfig | None:
         return None
 
 
+def _list_ships(root: Path, profile_id: str) -> list[tuple[str, str]]:
+    """列出客户端配置下所有船只档案的 (ship_id, display_name)。"""
+    ships_dir = root / "profiles" / profile_id / "ships"
+    ships: list[tuple[str, str]] = []
+    for ship_yaml in sorted(ships_dir.glob("*/ship.yaml")):
+        try:
+            ship = load_ship(ship_yaml)
+        except Exception:  # 单个船只配置损坏不影响其它船只的列出
+            continue
+        if ship.ship_id:
+            ships.append((ship.ship_id, ship.display_name))
+    return ships
+
+
+def _resolve_ship(root: Path, profile_id: str, ship_id: str | None, ship_name: str | None) -> str | None:
+    """把 --ship-name（显示名称/编号）解析为 ship_id；未指定名称时原样返回 ship_id。"""
+    if not ship_name:
+        return ship_id
+    ships = _list_ships(root, profile_id)
+    if not ships:
+        raise ConfigError([_issue(f"客户端 {profile_id} 下没有任何船只档案（profiles/{profile_id}/ships/<id>/）")])
+    exact = [item for item in ships if item[1] == ship_name or item[0] == ship_name]
+    partial = [item for item in ships if ship_name in item[1]]
+    matches = exact or partial
+    if not matches:
+        available = "、".join(f"{sid}({name})" for sid, name in ships)
+        raise ConfigError([_issue(f"找不到船只名称 {ship_name!r}；现有船只：{available}")])
+    if len(matches) > 1:
+        available = "、".join(f"{sid}({name})" for sid, name in matches)
+        raise ConfigError([_issue(f"船只名称 {ship_name!r} 匹配到多个档案：{available}；请改用 ship_id 精确指定")])
+    return matches[0][0]
+
+
 def _print_issues(issues: list[Any]) -> None:
     for issue in issues:
         print(issue.format(), file=sys.stderr)
@@ -403,6 +436,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--root", default=".", help="项目根目录（默认当前目录）")
     parser.add_argument("--profile", default="cn360", help="客户端配置 id（默认 cn360）")
     parser.add_argument("--ship", default=None, help="会话固定船只 id（默认用 config.yaml 的 ship.ship_id）")
+    parser.add_argument(
+        "--ship-name",
+        default=None,
+        help="按船只显示名称选择会话固定船只（如 列宁格勒）；脚本会在港口船只轮播条里找并选中它",
+    )
+    parser.add_argument("--list-ships", action="store_true", help="列出当前客户端配置下的船只档案后退出")
     parser.add_argument("--account", default=None, help="账号档案别名（accounts.yaml 中的 alias）")
     parser.add_argument("--rotate", action="store_true", help="按 accounts.yaml 轮换启用账号（需手动切号）")
     parser.add_argument("--max-battles", type=int, default=None, help="单账号本次会话最多场次（覆盖配置）")
@@ -419,6 +458,23 @@ def main(argv: list[str] | None = None) -> int:
     if not (root / "config.yaml").is_file():
         print(f"找不到配置文件: {root / 'config.yaml'}", file=sys.stderr)
         return EXIT_CONFIG_ERROR
+
+    if args.list_ships:
+        ships = _list_ships(root, args.profile)
+        if not ships:
+            print(f"客户端 {args.profile} 下没有船只档案（profiles/{args.profile}/ships/<id>/）", file=sys.stderr)
+            return EXIT_CONFIG_ERROR
+        for ship_id, display_name in ships:
+            print(f"{ship_id}\t{display_name}")
+        return EXIT_OK
+
+    # --ship-name 解析为 ship_id（脚本随后在船只轮播条里用卡片模板找并选中该船）
+    try:
+        ship_id = _resolve_ship(root, args.profile, args.ship, args.ship_name)
+    except ConfigError as exc:
+        _print_issues(exc.errors + exc.warnings)
+        return EXIT_CONFIG_ERROR
+    args.ship = ship_id
 
     # 账号档案
     accounts = _load_accounts(root) if (args.rotate or args.account) else None

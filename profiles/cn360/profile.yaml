@@ -40,9 +40,9 @@ battle_hud:
   hp_fill_hsv_lower: [68, 150, 150]             # 实测绿色填充 HSV ≈ (80, 190~217, 200~244)
   hp_fill_hsv_upper: [92, 255, 255]
   hp_fill_zero_ratio: 0.05
-  spectator_features: [spectator_indicator]     # 待截图
+  spectator_features: []                        # 用户确认：死亡立刻退出，不需要观战界面
   death_banner_feature: death_banner            # 已提取（“您的战舰已被玩家摧毁”）
-  result_feature: battle_results                # 已提取（结算页顶部分页栏）
+  result_feature: battle_results                # 已提取（结算页右侧固定分页栏）
 
 camera:
   relative: true        # 视角使用鼠标相对移动（详细设计 8.4）
@@ -63,15 +63,15 @@ exit:
 state_features:
   PORT: [port_indicator, port_battle_button, coop_mode_selected]
   QUEUEING: [queue_indicator, cancel_queue_button]
-  LOADING: [loading_indicator, loading_tip_area]
+  LOADING: []                     # 加载界面模板可缺省：排队结束后直接检测战斗 HUD 进战斗
   BATTLE_ACTIVE: [battle_hud_indicator, hp_bar_present]
   BATTLE_FINISHED: [battle_results, result_panel]
   EXIT_MENU_OPEN: [exit_menu_panel, exit_menu_return_port]
   EXIT_CONFIRMING: [exit_confirm_dialog, exit_confirm_yes]
-  POST_EXIT_INTERFACE: [popup_close_button, reward_panel, mission_panel]
+  POST_EXIT_INTERFACE: []         # 回港弹窗暂不处理（未知弹窗由异常恢复 ESC 兜底）
 
-# 回港后可能出现的弹窗面板特征（详细设计 5.10）。战报弹窗按未知弹窗忽略，不需要模板。
-popup_features: [reward_panel, mission_panel]
+# 回港后弹窗特征（暂未截图；先留空，遇未知弹窗由异常恢复 ESC 处理，后续可补）
+popup_features: []
 
 # 界面特征模板（详细设计 3.2 / 5.4）。region 为归一化搜索区域 [x1,y1,x2,y2]。
 # 已提取：13 个；待截图：loading_*、spectator_indicator、exit_*、popup_*。
@@ -128,19 +128,8 @@ features:
     template: features/result_return_port_button.png  # “回到港口”按钮
     region: [0.38, 0.88, 0.64, 0.98]
     threshold: 0.85
-  # ---- 以下待实机截图（当前 validate 会报 file_missing）----
-  loading_indicator:
-    template: features/loading_indicator.png
-    region: [0.30, 0.40, 0.70, 0.70]
-    threshold: 0.85
-  loading_tip_area:
-    template: features/loading_tip_area.png
-    region: [0.10, 0.78, 0.90, 0.98]
-    threshold: 0.85
-  spectator_indicator:
-    template: features/spectator_indicator.png
-    region: [0.45, 0.00, 0.99, 0.16]
-    threshold: 0.85
+  # ---- 以下退出相关模板待实机截图（当前 validate 会报 file_missing）----
+  # 说明：点击“返回港口”后如果没有确认框，把 exit.confirm_feature 改为 null 即可去掉后两项。
   exit_menu_panel:
     template: features/exit_menu_panel.png
     region: [0.25, 0.15, 0.75, 0.85]
@@ -156,18 +145,6 @@ features:
   exit_confirm_yes:
     template: features/exit_confirm_yes.png
     region: [0.50, 0.55, 0.80, 0.70]
-    threshold: 0.85
-  popup_close_button:
-    template: features/popup_close_button.png
-    region: [0.85, 0.05, 0.99, 0.20]
-    threshold: 0.85
-  reward_panel:
-    template: features/reward_panel.png
-    region: [0.15, 0.10, 0.85, 0.90]
-    threshold: 0.85
-  mission_panel:
-    template: features/mission_panel.png
-    region: [0.15, 0.10, 0.85, 0.90]
     threshold: 0.85
 
 # 开局步骤（实测 UI）：港口 → 点“加入战斗” → 若弹出“未学习技能”确认框点“是” → 等待排队界面
@@ -218,12 +195,9 @@ result_sequence:
     timeout_ms: 10000
     retries: 2
 
-# 弹窗清理：代码按 popup_features 循环识别，每轮执行一次本序列，最多 5 轮
-popup_sequence:
-  - action: click_feature
-    feature: popup_close_button
-    timeout_ms: 3000
-    retries: 1
+# 弹窗清理：暂未截图 popup_close_button，先留空；未知弹窗由异常恢复 ESC 兜底。
+# 后续若观察到固定奖励/任务弹窗，补模板后在此加入 click_feature 步骤。
+popup_sequence: []
 
 # 船只选择：实测港口是底部船只轮播条，没有单独的“船只列表”按钮；
 # ShipChecker 直接把光标移到 card_search_region（轮播条）用鼠标滚轮滚动，找到卡片后点击选中，

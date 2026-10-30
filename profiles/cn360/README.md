@@ -6,15 +6,15 @@
 已从 2026-10-30 实机截图提取的模板与缺口见 `docs/截图分类与提取结果.md`。
 
 当前进度：13 个界面模板 + `marker/marker.png` 已提取（实机截图 2559×1599）；
-仍缺 10 个界面模板（加载、观战、ESC 菜单、退出确认、回港弹窗）、船只卡片与空信号旗槽模板，
-`validate` 会报 12 个 `file_missing`（预期）。
+仍缺 4 个退出相关模板（ESC 菜单面板/返回港口按钮/退出确认框/确认按钮）、船只卡片与空信号旗槽模板，
+`validate` 会报 6 个 `file_missing`（预期）。加载界面、观战界面、回港弹窗已按用户口径改为非必需。
 
 需要标定并生成的文件：
 
-- `features/*.png`：profile.yaml 中 `features` 引用的界面模板（共 23 个，已提取 13 个）；
+- `features/*.png`：profile.yaml 中 `features` 引用的界面模板（共 17 个，已提取 13 个）；
 - `marker/marker.png`：小地图上自身舰船标记（autopilot 对称敌区目标依赖它），已提取；
   运行时由 ShipLocator 自动生成多角度模板，不需要手工生成 `marker_*.png`；
-- `ships/<ship_id>/card.png`：港口船只卡片（待定目标船）；
+- `ships/<ship_id>/card.png`：目标船只卡片（船名确定后从港口底部轮播条截图裁取）；
 - `ships/<ship_id>/loadout/signal_flags_empty.png`：空信号旗槽模板
   （**只校验信号旗数量为 0**，左侧配件/升级不参与校验）。
 

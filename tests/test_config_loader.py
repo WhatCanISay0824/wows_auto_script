@@ -104,22 +104,19 @@ def test_load_profile_real_cn360(project_root: Path) -> None:
     assert profile.client_id == "cn360"
     assert profile.display_name
     assert profile.reference_resolution == (2559, 1599)
-    assert len(profile.features) == 23
-    # 2026-10-30 实机截图已提取 13 个界面模板；其余 10 个仍待标定（路径为 None，由校验器报 error）
+    assert len(profile.features) == 17
+    # 2026-10-30 实机截图已提取 13 个界面模板；剩余 4 个退出相关模板待标定
     loaded = {fid for fid, feature in profile.features.items() if feature.template_path is not None}
     assert len(loaded) == 13
     assert {
-        "loading_indicator",
-        "loading_tip_area",
-        "spectator_indicator",
         "exit_menu_panel",
         "exit_menu_return_port",
         "exit_confirm_dialog",
         "exit_confirm_yes",
-        "popup_close_button",
-        "reward_panel",
-        "mission_panel",
     } == set(profile.features) - loaded
+    assert profile.battle_hud.spectator_features == ()
+    assert profile.popup_features == ()
+    assert profile.state_features["LOADING"] == ()
     feature = profile.feature("port_battle_button")
     assert feature is not None
     assert feature.template == "features/port_battle_button.png"
@@ -200,11 +197,11 @@ def test_load_app_repo_raises_with_calibration_errors(project_root: Path) -> Non
         load_app(project_root, "cn360")
     errors = exc_info.value.errors
     warnings = exc_info.value.warnings
-    # 2026-10-30 已从实机截图提取 13 个界面模板；当前仓库剩 10 个界面模板 + 船卡 + 空信号旗槽
-    # 共 12 个“待标定” error。标定推进后数量会变化，这里只断言这一类错误存在。
-    assert len(errors) >= 10
+    # 2026-10-30 已从实机截图提取 13 个界面模板；当前仓库剩 4 个退出模板 + 船卡 + 空信号旗槽
+    # 共 6 个“待标定” error。标定推进后数量会变化，这里只断言这一类错误存在。
+    assert len(errors) >= 4
     codes = [issue.code for issue in errors]
-    assert codes.count("file_missing") >= 10
+    assert codes.count("file_missing") >= 4
     assert all("待实机标定" in issue.message for issue in errors if issue.code == "file_missing")
     # autopilot 模式：空地图包不是必需项，应为 warning 而非 error
     warning_codes = [issue.code for issue in warnings]
