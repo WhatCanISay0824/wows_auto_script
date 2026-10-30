@@ -1433,7 +1433,16 @@ def validate_app(config: AppConfig) -> list[ValidationIssue]:
             allowed_runtime_features=allowed_runtime,
         )
     )
-    issues.extend(validate_ship(config.ship, location=_ship_label(config)))
+    ship_issues = validate_ship(config.ship, location=_ship_label(config))
+    if config.profile.ship_check_sequence:
+        # 信号旗已由 profile.ship_check_sequence（切装备页校验“信号旗 0/8”）负责，
+        # 此时 ship.yaml 不再配置 loadout_slots 属预期，去掉这条误导性 warning
+        ship_issues = [
+            issue
+            for issue in ship_issues
+            if not (issue.code == "empty" and issue.location.endswith("loadout_slots"))
+        ]
+    issues.extend(ship_issues)
     issues.extend(validate_maps(config.maps, root=root))
 
     # --- 跨文件引用 ---

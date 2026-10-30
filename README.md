@@ -156,24 +156,29 @@ design/                    设计文档与评审补充
 ## 常用命令
 
 ```powershell
-# 校验配置、客户端配置、地图包（当前仓库因待标定会报 error，退出码 2）
-python -m src.tools.validate --root .
+# 校验配置、客户端配置、地图包（当前仓库已 0 error，仅剩有意保留的 warning）
+.\wows-tool.cmd validate --root .
 
 # 运行单元测试（离线，不需要游戏）
-python -m pytest tests -q
+py -3.14 -m pytest tests -q
 
 # 代码静态检查
-python -m ruff check src tests
+py -3.14 -m ruff check src tests
 
 # 运行脚本（需要游戏已安装并完成标定）
-python -m src.main --profile cn360 --ship <ship_id>
-python -m src.main --profile cn360 --ship-name <船只显示名>
+.\wows.cmd --ship-name <船只显示名> --max-battles 1 --log-level DEBUG
 
 # 环境检查 / 标定 / 录制回放（M0-b 完成后可用）
-python -m src.tools.check_env --profile cn360
-python -m src.tools.calibrate_map --map-dir maps/<map_id>
-python -m src.tools.calibrate_profile --profile cn360
+.\wows-tool.cmd check_env --profile cn360
+.\wows-tool.cmd calibrate_map --map-dir maps/<map_id>
+.\wows-tool.cmd calibrate_profile --profile cn360
 ```
+
+运行说明：
+- 启动时脚本会自动把**游戏窗口切到前台**；运行中切走会按安全策略暂停，需点回游戏后按 **F11** 恢复；
+- **F12 紧急停止**（释放所有按键/鼠标），任何异常先按 F12；
+- 启动后日志会依次出现 `INIT -> PORT`、装备页信号旗校验、船只卡片校验、开局排队等记录；
+- `--max-battles 1` 表示跑 1 场后自动停止；日志里的 `max_battles: 20` 是配置里的会话安全上限，不冲突。
 
 ## 运行前提与边界
 

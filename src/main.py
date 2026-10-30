@@ -36,7 +36,7 @@ from .config.loader import load_app, load_project, load_ship
 from .config.models import AccountsConfig, AppConfig
 from .config.validate import validate_app
 from .execution.queue import InputExecutor
-from .execution.safety import SafetyMonitor, SafetyWatchdog, Win32KeyStateSource
+from .execution.safety import SafetyMonitor, SafetyWatchdog, StopController, Win32KeyStateSource
 from .execution.winput import make_backend
 from .navigation.autopilot import AutoPilotNavigator
 from .navigation.navigator import Navigator
@@ -265,6 +265,45 @@ def _teardown(runtime: Runtime) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _sync_safety_controller(machine: Any, controller: StopController) -> bool:
+    """把安全监控器的停止/暂停请求同步给状态机，返回当前是否处于暂停状态。
+
+    安全监控（F12 紧急停止、F11 暂停/恢复、心跳超时）只产生 StopController 请求，
+    由本函数在主循环里转成状态机动作（避免在监控线程里直接操作状态机）。
+    """
+    stop_request = controller.stop_request
+    if stop_request is not None and machine.state.value != "STOPPING":
+        machine.request_stop(str(stop_request.reason), stop_request.detail)
+    pause_request = controller.pause_request
+    if pause_request is not None:
+        machine.request_pause(str(pause_request.reason), pause_request.detail)
+    return controller.paused
+
+
+def _ensure_game_foreground(runtime: Runtime) -> bool:
+    """启动时把游戏窗口切到前台（截屏要求游戏在前台）；失败返回 False。
+
+    只用于启动阶段：运行中用户主动切走仍会按安全策略暂停，不会自动抢焦点。
+    """
+    try:
+        info = runtime.window_locator.find()
+        if info is None:
+            return False
+        if info.foreground:
+            return True
+        if not runtime.window_locator.bring_to_foreground(info.hwnd):
+            return False
+        time.sleep(0.3)
+        info = runtime.window_locator.find()
+        focused = bool(info is not None and info.foreground)
+        if focused:
+            runtime.logger.info("已把游戏窗口切换到前台")
+        return focused
+    except Exception as exc:  # 非 Windows/窗口消失等都不应阻塞启动
+        runtime.logger.debug("切换游戏窗口到前台失败: %s", exc)
+        return False
+
+
 def _run_session(runtime: Runtime, *, max_battles: int | None = None) -> tuple[str, int]:
     """运行一个账号的一次会话，返回 (停止原因, 完成场次)。"""
     machine = runtime.machine
@@ -283,6 +322,7 @@ def _run_session(runtime: Runtime, *, max_battles: int | None = None) -> tuple[s
 
     machine.start(clock.now())
     watchdog.start()
+    _ensure_game_foreground(runtime)
     _LAST_WINDOW[0] = runtime.window_locator.find()
     last_window_at = 0.0
     was_paused = False
@@ -291,11 +331,10 @@ def _run_session(runtime: Runtime, *, max_battles: int | None = None) -> tuple[s
         while not machine.finished:
             now = clock.now()
             monitor.heartbeat(now)
-            controller = monitor.controller()
-            stop_request = controller.stop_request
-            if stop_request is not None and machine.state.value != "STOPPING":
-                machine.request_stop(str(stop_request.reason), stop_request.detail)
-            if controller.paused:
+            # 安全监控的 StopController：F12 停止、F11 暂停/恢复、心跳超时暂停都通过它下发
+            controller = monitor.controller
+            paused_now = _sync_safety_controller(machine, controller)
+            if paused_now:
                 was_paused = True
             elif was_paused:
                 was_paused = False
