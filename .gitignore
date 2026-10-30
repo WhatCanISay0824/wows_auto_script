@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 工具缓存
+.pytest_cache/
+.ruff_cache/
+
+# 运行产物（设计第 2.5 / 11 章：日志、截图、数据库只保存在本地）
+data/*.db
+data/*.db-*
+data/*.sqlite*
+logs/*
+!logs/.gitkeep
+screenshots/*
+!screenshots/.gitkeep
+
+# 编辑器
+.idea/
+.vscode/
+*.swp

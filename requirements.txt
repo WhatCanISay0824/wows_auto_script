@@ -1,0 +1,5 @@
+# 运行时依赖（详细设计 1.2 / 2.6）
+# 目标环境：Windows 11 + Python 3.14.x，不引入重量级依赖。
+numpy>=2.5
+opencv-python>=5.0.0.93
+PyYAML>=6.0.3

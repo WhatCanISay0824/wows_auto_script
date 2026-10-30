@@ -1,0 +1,19 @@
+[project]
+name = "wows-script"
+version = "0.1.0"
+description = "战舰世界联合作战（PvE）本地自动化研究脚本"
+requires-python = ">=3.14"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 120
+target-version = "py314"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501"]

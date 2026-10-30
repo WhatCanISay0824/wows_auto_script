@@ -1,0 +1,23 @@
+# 船只配置（详细设计 3.2 / 6.8）
+# 状态：占位配置。M0 阶段用标定工具从港口实机截图中截取 card.png 与 loadout/ 空槽模板，
+# 并确认空槽外观后替换本文件。当前 card.png 不存在，validate 会报错，属预期。
+
+ship_id: placeholder
+display_name: 占位船只（待实机标定）
+card_template: card.png
+card_search_region: null      # 留空表示使用船只列表区域
+loadout_preset_feature: null  # 若游戏内有“空装备预设”，填对应特征名
+max_scrolls: 20               # 船只列表最多滚动次数
+scroll_direction: down        # 船只列表滚动方向（详细设计 6.8）
+scroll_clicks: 1              # 每次滚动格数
+
+# 空装备槽校验：全部命中才允许开始战斗（详细设计 6.8）
+loadout_slots:
+  - slot_id: signal_flags
+    name: 信号旗槽位
+    empty_template: loadout/signal_flags_empty.png
+  - slot_id: economic_bonus
+    name: 经济加成槽位
+    empty_template: loadout/economic_bonus_empty.png
+
+notes: 占位配置；实机标定后替换 card.png、loadout/*.png 与显示名称。

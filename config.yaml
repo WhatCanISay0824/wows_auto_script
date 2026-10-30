@@ -1,0 +1,179 @@
+# =============================================================================
+# 战舰世界联合作战挂机脚本 - 全局运行配置
+# 实现依据：design/战舰世界联合作战挂机脚本详细设计文档.docx v0.4 第 3.3 节
+#
+# 说明：
+# - 所有相对路径以项目根目录为基准解析；
+# - 本文件之外的参数（窗口、界面模板、按键、退出步骤）在 profiles/<client_id>/
+#   下，地图数据在 maps/<map_id>/ 下；
+# - 带「待验证」注释的参数是详细设计第 16 章待实机确认项，先按初始假设取值，
+#   实机确认后只改配置、不改代码。
+# =============================================================================
+
+runtime:
+  loop_hz: 10                  # 主循环决策频率（详细设计 2.4）
+  capture_hz: 2                # 截屏频率，每秒约 2 帧
+  debug: false                 # DEBUG 日志与中间图像
+  log_level: INFO              # 文本日志级别
+
+paths:
+  data_dir: data               # SQLite 运行日志
+  log_dir: logs                # 文本日志
+  screenshot_dir: screenshots  # 战斗内临时截图，战斗结束后删除
+  maps_dir: maps               # 地图包目录
+  profiles_dir: profiles       # 客户端配置目录
+
+ship:
+  # 会话固定船只编号，对应 profiles/<client_id>/ships/<ship_id>/；命令行 --ship 优先
+  # 待标定：M0 完成船只卡片与空装备标定后填写
+  ship_id: placeholder
+  verify_each_battle: true     # 每场开始前重新确认船只与空装备
+
+map:
+  auto_identify: true          # 运行时自动识别地图
+  forced_map_id: null          # 非空时强制使用该地图（调试用）
+  spawn_tolerance_m: 500       # 出生点识别容差（米），与验收指标 14.3/14.5 对齐
+  default_spawn_id: null       # 出生点识别失败时的回退出生点，null 表示无
+  expected_minimap_scale: null # 期望小地图缩放比例，null 表示按底图与小地图尺寸自动推导
+
+navigation:
+  surface: minimap             # v1 只实现 minimap；full_map 未实现，校验器拒绝
+  arrival_m: 400               # 到达航点判定距离（世界米，仅作上限）
+  overshoot_m: 800             # 越点判定距离
+  overshoot_cos_threshold: -0.5  # 越点判定的方向余弦阈值
+  click_retry: 2               # 点击后未移动的重试次数
+  click_confirm_first_s: 8     # 首次点击后的移动确认窗口
+  click_confirm_s: 5           # 后续点击后的移动确认窗口
+  move_confirm_px: 3           # 确认已移动的最小位移（小地图像素，约 120 米）
+  click_min_interval_s: 4      # 两次导航点击的最小间隔
+  retry_interval_s: 4          # 重试点击间隔
+  stuck_window_s: 20           # 卡住判定观察窗口（2Hz 下约 40 帧）
+  stuck_distance_px: 3         # 观察窗口内允许的最小位移（小地图像素）
+  max_skipped: 3               # 连续跳过航点上限，超过后放弃导航
+  ship_speed_window_s: 4       # 速度估计窗口
+  ship_speed_samples: 9        # 速度估计最少位置样本
+  ship_lost_degrade_s: 3       # 自身位置丢失后进入降级模式的时间
+  ship_lost_abandon_s: 10      # 自身位置丢失后放弃导航的时间
+  route_end_action: wait       # 航线结束后行为：v1 仅支持 wait
+  full_map_rect: null          # 全屏地图归一化区域（v1 未实现）
+  full_map_toggle_key: full_map  # 全屏地图开关，对应 keys.yaml 动作名
+
+behavior:
+  camera_interval_s: [3, 15]           # 视角动作间隔范围（秒）
+  camera_mean_s: 8                     # 视角间隔均值（再除以本场活跃度倍率）
+  camera_sd_s: 2.8                     # 视角间隔标准差（0.35×均值，截断正态采样）
+  attack_interval_s: [25, 120]         # 攻击事件间隔范围（开火与消耗品共用）
+  attack_mean_s: 60                    # 攻击间隔均值（再除以本场频率倍率）
+  attack_sd_s: 21                      # 攻击间隔标准差（0.35×均值，截断正态采样）
+  consumable_ratio: 0.15               # 攻击事件选择消耗品的概率
+  consumable_ratio_range: [0.05, 0.25] # 本场随机档案中消耗品概率范围
+  camera_activity_range: [0.6, 1.4]    # 本场视角频率倍率范围（越大动作越频繁，间隔=均值/倍率）
+  attack_frequency_range: [0.5, 1.5]   # 本场攻击频率倍率范围（越大攻击越频繁，间隔=均值/倍率）
+  long_stare_bias_range: [0.0, 1.0]    # 本场长时间凝视倾向范围
+  long_stare_probability: 0.15         # 单次视角动作进入长时间凝视的概率
+  long_stare_s: [5, 20]                # 长时间凝视持续范围（秒）
+  move_px: [20, 160]                   # 视角单次移动总幅度（像素）
+  move_steps: [3, 6]                   # 视角移动拆分步数
+  move_duration_ms: [200, 800]         # 视角移动总耗时
+  fire_sector_deg: 60                  # 开火方向相对当前视角的半角
+  fire_turn_probability: 0.5           # 开火前先转向的概率
+  fire_burst: [1, 4]                   # 每次开火点射发数
+  fire_interval_ms: [300, 1100]        # 点射内每发间隔
+  fire_click_region: [0.30, 0.30, 0.70, 0.70]  # 开火点击落点归一化区域（画面中心）
+  consumable_max_per_battle: 10        # 单场消耗品点击上限
+  activity_watchdog_s: [35, 95]        # 无操作兜底动作间隔范围
+  actions_per_minute_max: 40           # 每分钟输入事件上限（含视角拆分步与点射发数）
+  battle_start_quiet_s: 10             # 战斗开始后保持安静的时长
+  max_input_frame_age_s: 1.0           # 行为输入前允许的最大感知帧年龄，超时跳过本次动作
+
+perception:
+  template_scales: [0.95, 1.0, 1.05]   # 模板多尺度匹配的默认缩放
+  feature_confirm_frames: 2            # 状态切换需要的连续命中帧数
+  state_unknown_timeout_s: 2           # 连续无法识别状态后进入异常恢复的时间
+  orb_features_background: 2000        # 底图 ORB 特征数量
+  orb_features_minimap: 1000           # 小地图 ORB 特征数量
+  orb_ratio_test: 0.75                 # KNN Lowe 比例筛选
+  ransac_reproj_px: 3.0                # 仿射估计重投影阈值（像素）
+  min_inliers: 15                      # 地图识别最少内点数
+  max_reprojection_error_px: 2.5       # 重投影误差中位数上限
+  map_scale_tolerance: 0.5             # 缩放比例允许偏差（相对值）
+  map_rotation_tolerance_deg: 10       # 旋转角接近 90 度整数倍的容差
+  map_candidate_margin: 0.30           # 多地图候选需要的最小领先比例
+  map_refresh_s: 30                    # 地图识别刷新间隔
+  map_identify_retries: 3              # 地图识别失败重试帧数
+  map_min_inlier_hull_ratio: 0.25      # 内点凸包面积占小地图内容区的最小比例
+  map_verify_ncc: 0.30                 # 仿射 warp 后与原图的边缘 NCC 二次验证下限
+  map_refresh_inlier_gain: 0.20        # 刷新时新结果内点数需提升的相对比例
+  map_refresh_translation_px: 5.0      # 刷新时新结果允许的平移差上限
+  death:
+    weights:                           # 死亡信号权重（详细设计 5.9）
+      hp_bar_absent: 0.35
+      hp_zero: 0.25
+      banner: 0.25
+      marker_lost: 0.10
+      spectator_ui: 0.05
+    score_threshold: 0.65              # 综合得分阈值（0.75 在 hp_zero 不可用时不可达）
+    stable_s: 1.0                      # 综合判定稳定时间
+    strong_stable_s: 1.5               # 强信号直接判定的稳定时间
+    marker_lost_stable_s: 3.0          # 自身标记消失信号的稳定时间
+    ignore_start_s: 5.0                # 战斗开始后不判定死亡的时长
+    banner_latch_s: 5.0                # 死亡提示命中后的锁存时间（提示可能只显示数秒）
+
+input:
+  backend: sendinput                   # sendinput（默认）或 setcursor（备选，详细设计 9.6）
+  min_action_interval_ms: 150          # 相邻动作最小间隔
+  click_hold_ms: [30, 80]              # 鼠标按下到释放间隔
+  key_hold_ms: [30, 60]                # 按键按下到释放间隔
+  interval_jitter: 0.2                 # 间隔随机抖动比例
+  queue_max: 10                        # 动作队列上限
+  dpi_aware: true                      # 启动时声明 DPI 感知
+
+safety:
+  emergency_stop_key: f12              # 紧急停止热键
+  resume_key: f11                      # 暂停恢复热键
+  max_session_minutes: 240             # 单次会话最长运行时间
+  max_battles_per_session: 20          # 单次会话最多场次
+  pause_when_unfocused: true           # 游戏窗口失去焦点时暂停
+  heartbeat_s: 10                      # 主循环心跳超时
+  topmost: false                       # 是否把游戏窗口置顶（无人值守时可选开启）
+  auto_restart_game: false             # 游戏崩溃/退出时是否自动重启（默认不重启）
+  restart_wait_s: 30                   # 自动重启前等待
+  restart_max_attempts: 2              # 自动重启最大尝试次数
+
+session:
+  between_battle_s: [15, 60]           # 两场之间的随机等待
+  daily_battle_cap: 30                 # 每日场次上限（跨进程累计）
+  allowed_hours: null                  # 允许运行的时段，例如 ["08:00", "23:00"]；null 表示不限
+  max_consecutive_start_failures: 2    # 连续开局失败多少次后暂停
+  recovery_max_per_10min: 3            # 10 分钟内异常恢复次数上限
+
+timeouts:
+  queue_s: 600                         # 匹配排队
+  loading_s: 300                       # 战斗加载
+  exit_menu_s: 5                       # 打开退出菜单
+  exit_confirm_s: 5                    # 退出确认框
+  exit_s: 180                          # 退出到港口
+  port_s: 180                          # 回港确认
+  popup_s: 60                          # 回港后弹窗清理总时限
+  recovery_s: 30                       # 单次异常恢复
+  heartbeat_s: 10                      # 主循环心跳
+  capture_ms: 300                      # 单帧截屏耗时告警阈值
+  init_s: 30                           # INIT 状态超时
+  start_coop_s: 30                     # START_COOP 状态超时
+  port_state_s: 60                     # PORT 状态超时
+  dead_wait_s: 10                      # DEAD_PENDING_EXIT 超时
+  battle_finished_s: 60                # BATTLE_FINISHED 超时
+  stop_s: 10                           # STOPPING 状态超时
+
+logging:
+  screenshot_on_error: true            # 异常时保存截图
+  delete_screenshots_after_battle: true  # 战斗结束后删除该场次截图
+  log_max_bytes: 20971520              # 文本日志单文件 20 MB
+  log_backup_count: 5                  # 文本日志保留份数
+  db_fallback_log: logs/db_fallback.log  # 数据库写入失败时的备用日志
+  capture_stats: true                  # 记录感知耗时统计
+  diagnostics_dir: screenshots/diagnostics  # 异常诊断截图留存目录（与临时战斗截图区分）
+  diagnostics_max_files: 200           # 诊断截图文件数上限，超出后删除最旧
+  diagnostics_max_mb: 100              # 诊断截图总大小上限（MB）
+  disk_warn_gb: 2                      # 磁盘剩余低于该值时只写文本日志、不存截图
+  disk_pause_gb: 0.5                   # 磁盘剩余低于该值时进入暂停
