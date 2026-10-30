@@ -30,7 +30,7 @@ from typing import Any
 from .behavior.scheduler import BehaviorScheduler
 from .common.clock import Clock, SystemClock
 from .common.errors import ConfigError
-from .common.types import Observation, Rect, WindowInfo
+from .common.types import Observation, Rect, State, WindowInfo
 from .common.window import WindowLocator, set_dpi_awareness
 from .config.loader import load_app, load_project, load_ship
 from .config.models import AccountsConfig, AppConfig
@@ -349,6 +349,12 @@ def _run_session(runtime: Runtime, *, max_battles: int | None = None) -> tuple[s
                     machine.request_pause("window_lost", "找不到游戏窗口")
                 elif info.foreground:
                     _LAST_WINDOW[0] = info
+                elif (
+                    runtime.app.profile.window.require_foreground
+                    and machine.state not in (State.PAUSED, State.STOPPING)
+                ):
+                    # 港口/菜单状态也要检查前台，否则 SendInput 点击会落在别的窗口上而静默失败
+                    machine.request_pause("window_unfocused", "游戏窗口不在前台")
 
             info = _LAST_WINDOW[0]
             if info is not None:

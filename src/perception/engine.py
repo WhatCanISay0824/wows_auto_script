@@ -65,6 +65,40 @@ _BATTLE_EXTRA_FEATURES: tuple[str, ...] = (
 )
 
 
+def _collect_sequence_features(profile: ClientProfile) -> tuple[str, ...]:
+    """收集步骤序列 / 弹窗 / 退出配置引用的特征，供每帧 Observation 一并匹配。
+
+    Observation.features 只包含当前状态的特征表，而 wait_feature 步骤可能等待
+    状态特征表之外的特征（例如装备页的 ``loadout_signal_flags``），因此必须补齐。
+    """
+    feature_ids: set[str] = set()
+    sequences = (
+        profile.start_sequence,
+        profile.start_sequence_full,
+        profile.popup_sequence,
+        profile.result_sequence,
+        profile.ship_selection_sequence,
+        profile.ship_check_sequence,
+        profile.clear_loadout_sequence or (),
+    )
+    for sequence in sequences:
+        for step in sequence:
+            feature_id = getattr(step, "feature", None)
+            if feature_id:
+                feature_ids.add(str(feature_id))
+    feature_ids.update(str(feature_id) for feature_id in profile.popup_features if feature_id)
+    exit_config = profile.exit
+    for feature_id in (
+        exit_config.menu_open_feature,
+        exit_config.return_port_feature,
+        exit_config.confirm_feature,
+        exit_config.direct_exit_feature,
+    ):
+        if feature_id:
+            feature_ids.add(str(feature_id))
+    return tuple(sorted(feature_ids))
+
+
 @dataclass(frozen=True, slots=True)
 class PerceptionStats:
     """感知耗时统计（详细设计 5.11）。"""
@@ -108,6 +142,9 @@ class PerceptionEngine:
             project_root=config.project_root,
         )
         self._state_features = merge_state_features(self.profile.state_features)
+        # 步骤序列/退出配置里引用的特征也必须每帧匹配，否则 wait_feature 永远等不到
+        # （例如装备页的 loadout_signal_flags 不在 PORT 状态特征表里）
+        self._extra_feature_ids = _collect_sequence_features(self.profile)
         self._state: State = State.INIT
         self._last_frame: Frame | None = None
         self._last_window: WindowInfo | None = None
@@ -574,6 +611,7 @@ class PerceptionEngine:
     # ------------------------------------------------------------------
     def _feature_ids_for(self, state: State) -> tuple[str, ...]:
         ids = tuple(self._state_features.get(state.value, ()))
+        ids = tuple(dict.fromkeys(ids + self._extra_feature_ids))
         if state.is_battle:
             ids = tuple(dict.fromkeys(ids + _BATTLE_EXTRA_FEATURES))
         return ids
