@@ -103,22 +103,37 @@ def test_load_profile_real_cn360(project_root: Path) -> None:
     assert issues == []
     assert profile.client_id == "cn360"
     assert profile.display_name
-    assert profile.reference_resolution == (2560, 1600)
-    assert len(profile.features) == 24
-    # 模板图片尚未标定：路径字段为 None，由校验器报 error
-    assert all(feature.template_path is None for feature in profile.features.values())
+    assert profile.reference_resolution == (2559, 1599)
+    assert len(profile.features) == 23
+    # 2026-10-30 实机截图已提取 13 个界面模板；其余 10 个仍待标定（路径为 None，由校验器报 error）
+    loaded = {fid for fid, feature in profile.features.items() if feature.template_path is not None}
+    assert len(loaded) == 13
+    assert {
+        "loading_indicator",
+        "loading_tip_area",
+        "spectator_indicator",
+        "exit_menu_panel",
+        "exit_menu_return_port",
+        "exit_confirm_dialog",
+        "exit_confirm_yes",
+        "popup_close_button",
+        "reward_panel",
+        "mission_panel",
+    } == set(profile.features) - loaded
     feature = profile.feature("port_battle_button")
     assert feature is not None
     assert feature.template == "features/port_battle_button.png"
-    assert feature.region.to_list() == [0.55, 0.82, 0.98, 0.99]
+    assert feature.region.to_list() == [0.40, 0.0, 0.56, 0.06]
     assert profile.minimap is not None
     assert profile.minimap.marker_template == "marker/marker.png"
+    assert profile.minimap.rect.to_list() == [0.798, 0.677, 0.999, 0.994]
     assert profile.minimap.marker_hsv_lower == (0, 0, 200)
-    assert profile.battle_hud.hp_fill_zero_ratio == 0.03
+    assert profile.battle_hud.hp_fill_zero_ratio == 0.05
     assert profile.exit.menu_key == "escape"
-    assert len(profile.start_sequence) == 3
-    assert len(profile.start_sequence_full) == 4
+    assert len(profile.start_sequence) == 4
+    assert len(profile.start_sequence_full) == 3
     assert len(profile.result_sequence) == 2
+    assert profile.ship_selection_sequence == ()
     assert profile.loadout_verify_features == ("loadout_signal_flags",)
     assert profile.state_features["PORT"][0] == "port_indicator"
     assert profile.profile_dir == project_root / "profiles" / "cn360"
@@ -185,15 +200,15 @@ def test_load_app_repo_raises_with_calibration_errors(project_root: Path) -> Non
         load_app(project_root, "cn360")
     errors = exc_info.value.errors
     warnings = exc_info.value.warnings
-    # 当前仓库：24 个界面模板 + 2 个船只/空槽模板（autopilot 模式下小地图标记模板与
-    # 空地图包已降级为 warning）。标定推进后数量会变化，这里只断言“待标定”类错误存在。
-    assert len(errors) >= 26
+    # 2026-10-30 已从实机截图提取 13 个界面模板；当前仓库剩 10 个界面模板 + 船卡 + 空信号旗槽
+    # 共 12 个“待标定” error。标定推进后数量会变化，这里只断言这一类错误存在。
+    assert len(errors) >= 10
     codes = [issue.code for issue in errors]
-    assert codes.count("file_missing") >= 24
+    assert codes.count("file_missing") >= 10
     assert all("待实机标定" in issue.message for issue in errors if issue.code == "file_missing")
-    # autopilot 模式：地图包与自身标记模板不是必需项，应为 warning 而非 error
+    # autopilot 模式：空地图包不是必需项，应为 warning 而非 error
     warning_codes = [issue.code for issue in warnings]
-    assert "empty" in warning_codes or any("marker_template" in issue.location for issue in warnings)
+    assert "empty" in warning_codes
 
 
 # ---------------------------------------------------------------------------

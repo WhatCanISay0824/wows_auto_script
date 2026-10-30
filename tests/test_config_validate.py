@@ -69,16 +69,16 @@ def test_real_repo_reports_errors_instead_of_crashing(project_root: Path) -> Non
     report = validate_project(project_root, "cn360")
     assert report.has_errors
     errors = report.errors
-    # 当前仓库处于“模板/船只待实机标定”的状态：断言这一类错误存在，具体条数随标定推进变化。
-    # autopilot 模式下空地图包与自身标记模板已降级为 warning，不再是 error。
-    assert len(errors) >= 26
-    assert _codes(errors).count("file_missing") >= 24
+    # 当前仓库：13 个界面模板已从实机截图提取，剩 10 个界面模板 + 船卡 + 空信号旗槽待标定。
+    # autopilot 模式下空地图包已降级为 warning，不再是 error。
+    assert len(errors) >= 10
+    assert _codes(errors).count("file_missing") >= 10
     assert all("待实机标定" in issue.message for issue in errors if issue.code == "file_missing")
     # 问题定位包含文件与字段路径
     assert all(issue.location for issue in errors)
     file_issues = [issue for issue in errors if issue.code == "file_missing"]
     assert all(": " in issue.location for issue in file_issues)
-    assert any("features.port_indicator.template" in issue.location for issue in errors)
+    assert any("features.exit_menu_panel.template" in issue.location for issue in errors)
 
 
 def test_real_repo_tool_exit_code_and_output(project_root: Path, capsys: pytest.CaptureFixture[str]) -> None:

@@ -1,16 +1,18 @@
 # 客户端配置：国服 360 客户端（cn360）
 # 实现依据：详细设计第 3.2 节、第 12.3 节客户端标定流程
 #
-# 状态：骨架已建立，模板图片与坐标全部待实机标定（详细设计第 16 章 V04~V24）。
-# 本目录下的 features/*.png、marker/marker.png、ships/<ship_id>/card.png 等
-# 文件由标定工具在 M0 阶段从实机截图生成；缺失时 `python -m src.tools.validate`
-# 会报错，这是预期行为，不是代码缺陷。
+# 标定进度（2026-10-30）：已从实机截图（2559×1599）提取 13 个界面模板 + 自身标记模板，
+# 见 docs/截图分类与提取结果.md。仍缺：加载界面、ESC 退出菜单、退出确认框、观战界面、
+# 回港弹窗、装备页信号旗槽、目标船只卡片；缺失项 validate 会报 file_missing（预期），
+# 补齐截图后按 docs/截图标定清单.md 用标定工具生成即可。
+#
+# 截图/模板均为实机同分辨率（2559×1599）；模板匹配只覆盖 ±5% 缩放，若实际窗口尺寸变化需重采。
 
 client_id: cn360
 display_name: 国服 360 客户端
 language: zh_cn
-reference_resolution: [2560, 1600]   # 模板采集时的窗口客户区尺寸
-notes: 待实机标定。所有区域坐标为归一化值，按 2560×1600 采集。
+reference_resolution: [2559, 1599]   # 模板采集时的窗口客户区尺寸（实机截图实测）
+notes: 部分模板已从 2026-10-30 实机截图提取；其余待标定。
 
 window:
   process_names: [WorldOfWarships.exe]      # 待验证 V01
@@ -19,88 +21,114 @@ window:
 
 keys_file: keys.yaml
 
-# 小地图标定（详细设计 5.6/5.7）。rect 为小地图内容区的归一化矩形，不含边框；
-# border_px 为内容区四周需要裁掉的像素宽度。
+# 小地图标定（实测 211346 战斗截图）：小地图位于右下角，内容区为深色网格面板
+# （不含上方 1~10 数字栏和左侧 A~J 字母栏的外侧？字母在面板内），右下贴边。
 minimap:
-  rect: [0.86, 0.03, 0.99, 0.24]       # 待验证 V08/V09：位置、大小、是否整图、是否北向固定
+  rect: [0.798, 0.677, 0.999, 0.994]
   border_px: 2
-  frame_feature: minimap_frame          # 可选，用于启动时精确定位小地图
-  marker_template: marker/marker.png    # 标定工具从实机截图截取的自身标记模板
-  marker_angles: 24                     # 多角度模板数量（0~345 度，每 15 度）
-  marker_hsv_lower: [0, 0, 200]         # 待验证 V10：自身标记颜色范围
+  frame_feature: null                    # 小地图边框模板不稳定，暂不使用
+  marker_template: marker/marker.png     # 自身舰船白色箭头（已从实机截图提取）
+  marker_angles: 24
+  marker_hsv_lower: [0, 0, 200]          # 白色箭头：低饱和、高亮度
   marker_hsv_upper: [180, 60, 255]
-  marker_jump_px: 300                   # 连续跳变超过该像素视为跟踪失效
-  marker_lost_s: 3                      # 连续丢失多久标记为 lost
+  marker_jump_px: 300
+  marker_lost_s: 3
 
-# 战斗 HUD 与死亡判定标定（详细设计 5.9）
+# 战斗 HUD 与死亡判定标定（实测截图）
 battle_hud:
-  hp_bar_region: [0.02, 0.86, 0.20, 0.93]   # 待验证 V11：己方血条位置
-  hp_fill_hsv_lower: [35, 80, 80]           # 待验证 V11：血条填充颜色范围（初始假设为绿色）
-  hp_fill_hsv_upper: [95, 255, 255]
-  hp_fill_zero_ratio: 0.03                  # 填充像素比例低于该值视为血量归零
-  spectator_features: [spectator_indicator] # 待验证 V13
-  death_banner_feature: death_banner        # 待验证 V12
-  result_feature: battle_results            # 待验证 V17
+  hp_bar_region: [0.026, 0.731, 0.118, 0.758]   # 己方血条绿色填充区域（左下）
+  hp_fill_hsv_lower: [68, 150, 150]             # 实测绿色填充 HSV ≈ (80, 190~217, 200~244)
+  hp_fill_hsv_upper: [92, 255, 255]
+  hp_fill_zero_ratio: 0.05
+  spectator_features: [spectator_indicator]     # 待截图
+  death_banner_feature: death_banner            # 已提取（“您的战舰已被玩家摧毁”）
+  result_feature: battle_results                # 已提取（结算页顶部分页栏）
 
 camera:
   relative: true        # 视角使用鼠标相对移动（详细设计 8.4）
-  sensitivity: 1.0      # 待验证 V20：实机标定，动作可见但不影响观察
+  sensitivity: 1.0      # 待实机标定
 
 # 退出流程（详细设计 6.1 / 10.2）。状态机消费这些特征，不写死按键与按钮。
+# 注意：以下 4 个退出相关模板尚未截图，validate 会报缺失；补齐后即可自动退出。
 exit:
   menu_key: escape
   menu_open_feature: exit_menu_panel
   return_port_feature: exit_menu_return_port
   confirm_feature: exit_confirm_yes
   port_feature: port_indicator
-  direct_exit_feature: null        # 若客户端提供“直接离开战斗”按钮，填特征名
+  direct_exit_feature: null
   post_click_wait_ms: 500
 
-# 状态识别特征表（详细设计 5.4）。第一个为主判定，其余为辅助；缺失时用代码内置默认表。
+# 状态识别特征表（详细设计 5.4）。第一个为主判定，其余为辅助；缺失特征会被跳过。
 state_features:
-  PORT: [port_indicator, port_battle_button, port_mode_selector, coop_mode_selected]
+  PORT: [port_indicator, port_battle_button, coop_mode_selected]
   QUEUEING: [queue_indicator, cancel_queue_button]
   LOADING: [loading_indicator, loading_tip_area]
-  BATTLE_ACTIVE: [battle_hud_indicator, hp_bar_present, minimap_frame]
+  BATTLE_ACTIVE: [battle_hud_indicator, hp_bar_present]
   BATTLE_FINISHED: [battle_results, result_panel]
   EXIT_MENU_OPEN: [exit_menu_panel, exit_menu_return_port]
   EXIT_CONFIRMING: [exit_confirm_dialog, exit_confirm_yes]
   POST_EXIT_INTERFACE: [popup_close_button, reward_panel, mission_panel]
 
-# 回港后可能出现的弹窗面板特征（详细设计 5.10）
+# 回港后可能出现的弹窗面板特征（详细设计 5.10）。战报弹窗按未知弹窗忽略，不需要模板。
 popup_features: [reward_panel, mission_panel]
 
-# 界面特征模板（详细设计 3.2 / 5.4）。
-# region 为归一化搜索区域 [x1, y1, x2, y2]；scales 为多尺度匹配范围。
+# 界面特征模板（详细设计 3.2 / 5.4）。region 为归一化搜索区域 [x1,y1,x2,y2]。
+# 已提取：13 个；待截图：loading_*、spectator_indicator、exit_*、popup_*。
 features:
   port_indicator:
-    template: features/port_indicator.png
-    region: [0.00, 0.00, 0.35, 0.12]
-    threshold: 0.85
+    template: features/port_indicator.png          # 顶部“港口”标签
+    region: [0.24, 0.045, 0.36, 0.10]
+    threshold: 0.82
   port_battle_button:
-    template: features/port_battle_button.png
-    region: [0.55, 0.82, 0.98, 0.99]
-    threshold: 0.85
-  port_mode_selector:
-    template: features/port_mode_selector.png
-    region: [0.55, 0.70, 0.98, 0.85]
+    template: features/port_battle_button.png      # 顶部“加入战斗”按钮
+    region: [0.40, 0.0, 0.56, 0.06]
     threshold: 0.85
   coop_mode_selected:
-    template: features/coop_mode_selected.png
-    region: [0.55, 0.70, 0.98, 0.85]
-    threshold: 0.85
-  port_ship_panel_button:
-    template: features/port_ship_panel_button.png
-    region: [0.00, 0.78, 0.22, 0.99]
+    template: features/coop_mode_selected.png      # “联合作战 / 更改战斗模式”模式块
+    region: [0.52, 0.0, 0.66, 0.06]
+    threshold: 0.82
+  battle_start_confirm_panel:
+    template: features/battle_start_confirm_panel.png  # 未学习指挥官技能确认框文字
+    region: [0.25, 0.52, 0.78, 0.62]
+    threshold: 0.78
+  battle_start_confirm_yes:
+    template: features/battle_start_confirm_yes.png    # 确认框“是”按钮
+    region: [0.36, 0.58, 0.56, 0.67]
     threshold: 0.85
   queue_indicator:
-    template: features/queue_indicator.png
-    region: [0.30, 0.35, 0.70, 0.75]
-    threshold: 0.85
+    template: features/queue_indicator.png         # “您已加入准备战斗的队列中”
+    region: [0.30, 0.15, 0.70, 0.25]
+    threshold: 0.80
   cancel_queue_button:
-    template: features/cancel_queue_button.png
-    region: [0.30, 0.70, 0.70, 0.90]
+    template: features/cancel_queue_button.png     # “离开队列”按钮
+    region: [0.38, 0.89, 0.62, 0.99]
     threshold: 0.85
+  battle_hud_indicator:
+    template: features/battle_hud_indicator.png    # 顶部 A/B/C/D 占点条
+    region: [0.40, 0.02, 0.60, 0.10]
+    threshold: 0.85
+  hp_bar_present:
+    template: features/hp_bar_present.png          # 左下“VII 列宁格勒”血条文字（静态）
+    region: [0.0, 0.72, 0.17, 0.80]
+    threshold: 0.82
+  death_banner:
+    template: features/death_banner.png            # “您的战舰已被玩家摧毁”（静态文字）
+    region: [0.38, 0.82, 0.74, 0.93]
+    threshold: 0.80
+  battle_results:
+    template: features/battle_results.png          # 结算页顶部分页栏
+    region: [0.18, 0.0, 0.82, 0.08]
+    threshold: 0.82
+  result_panel:
+    template: features/result_panel.png            # 结算页“作战任务”小标题
+    region: [0.08, 0.53, 0.27, 0.65]
+    threshold: 0.82
+  result_return_port_button:
+    template: features/result_return_port_button.png  # “回到港口”按钮
+    region: [0.38, 0.88, 0.64, 0.98]
+    threshold: 0.85
+  # ---- 以下待实机截图（当前 validate 会报 file_missing）----
   loading_indicator:
     template: features/loading_indicator.png
     region: [0.30, 0.40, 0.70, 0.70]
@@ -109,37 +137,9 @@ features:
     template: features/loading_tip_area.png
     region: [0.10, 0.78, 0.90, 0.98]
     threshold: 0.85
-  battle_hud_indicator:
-    template: features/battle_hud_indicator.png
-    region: [0.00, 0.85, 0.25, 0.99]
-    threshold: 0.85
-  hp_bar_present:
-    template: features/hp_bar_present.png
-    region: [0.02, 0.86, 0.20, 0.93]
-    threshold: 0.85
-  minimap_frame:
-    template: features/minimap_frame.png
-    region: [0.84, 0.01, 0.995, 0.26]
-    threshold: 0.85
-  death_banner:
-    template: features/death_banner.png
-    region: [0.25, 0.30, 0.75, 0.70]
-    threshold: 0.80
   spectator_indicator:
     template: features/spectator_indicator.png
     region: [0.45, 0.00, 0.99, 0.16]
-    threshold: 0.85
-  battle_results:
-    template: features/battle_results.png
-    region: [0.25, 0.10, 0.75, 0.45]
-    threshold: 0.85
-  result_panel:
-    template: features/result_panel.png
-    region: [0.10, 0.10, 0.90, 0.90]
-    threshold: 0.85
-  result_return_port_button:
-    template: features/result_return_port_button.png
-    region: [0.60, 0.82, 0.99, 0.99]
     threshold: 0.85
   exit_menu_panel:
     template: features/exit_menu_panel.png
@@ -170,41 +170,44 @@ features:
     region: [0.15, 0.10, 0.85, 0.90]
     threshold: 0.85
 
-# 开局步骤：快速路径（详细设计 10.6）。快速路径失败时自动改用 start_sequence_full。
+# 开局步骤（实测 UI）：港口 → 点“加入战斗” → 若弹出“未学习技能”确认框点“是” → 等待排队界面
 start_sequence:
   - action: wait_feature
     feature: coop_mode_selected
     timeout_ms: 2000
     retries: 0
+    optional: true
   - action: click_feature
     feature: port_battle_button
     timeout_ms: 3000
-    retries: 1
+    retries: 2
+  - action: click_feature
+    feature: battle_start_confirm_yes
+    timeout_ms: 1500
+    retries: 0
+    optional: true
   - action: wait_feature
     feature: queue_indicator
-    timeout_ms: 15000
+    timeout_ms: 20000
     retries: 0
 
-# 完整开局路径：打开战斗模式选择 → 选择联合作战 → 点击开始
+# 完整开局路径：重试更宽松（实际 UI 与快速路径相同，保留独立配置便于以后扩展）
 start_sequence_full:
   - action: click_feature
-    feature: port_mode_selector
-    timeout_ms: 3000
-    retries: 1
-  - action: click_feature
-    feature: coop_mode_selected
-    timeout_ms: 5000
-    retries: 1
-  - action: click_feature
     feature: port_battle_button
     timeout_ms: 3000
+    retries: 3
+  - action: click_feature
+    feature: battle_start_confirm_yes
+    timeout_ms: 2500
     retries: 1
+    optional: true
   - action: wait_feature
     feature: queue_indicator
-    timeout_ms: 15000
+    timeout_ms: 20000
     retries: 0
 
-# 结算界面：等待结算稳定后点击返回港口；之后由 EXITING 状态等待回港
+# 结算界面：等结算稳定后点“回到港口”；之后由 EXITING 状态等待回港
 result_sequence:
   - action: wait_feature
     feature: battle_results
@@ -215,30 +218,21 @@ result_sequence:
     timeout_ms: 10000
     retries: 2
 
-# 弹窗清理：代码按 popup_features 循环识别，每轮执行一次本序列，最多 5 轮。
-# 注意：死亡后提前退出战斗时，港口里可能出现的“原战局战报”弹窗不需要单独模板，
-# 脚本按未知弹窗处理（遮挡港口时 ESC 一次；不点战报里的任何按钮，避免误操作）。
+# 弹窗清理：代码按 popup_features 循环识别，每轮执行一次本序列，最多 5 轮
 popup_sequence:
   - action: click_feature
     feature: popup_close_button
     timeout_ms: 3000
     retries: 1
 
-# 船只选择：打开船只列表；之后的查找由 ShipChecker 用鼠标滚轮滚动列表
-# （Action.move_abs 把光标移到列表区域 + Action.wheel 滚动，配置见 ship.yaml 的
-#  scroll_direction / scroll_clicks / max_scrolls），不拖动滚动条、不点击列表外区域。
-ship_selection_sequence:
-  - action: click_feature
-    feature: port_ship_panel_button
-    timeout_ms: 3000
-    retries: 1
+# 船只选择：实测港口是底部船只轮播条，没有单独的“船只列表”按钮；
+# ShipChecker 直接把光标移到 card_search_region（轮播条）用鼠标滚轮滚动，找到卡片后点击选中，
+# 因此不再需要打开列表的步骤。
+ship_selection_sequence: []
 
-# 船只与空装备校验（详细设计 6.8 + 用户确认口径）：
-# - ship_card 由运行时的船只卡片模板注册；
-# - 只校验信号旗槽为空（数量为 0），左侧配件/升级不读不点；
-# - 不售卖/不消耗任何船只或装备。
+# 船只与空装备校验（详细设计 6.8 + 用户确认口径）
 ship_verify_features: [ship_card]
 loadout_verify_features: [loadout_signal_flags]
 
-# 默认不自动清除已装配的信号旗或加成卡（详细设计 6.8）
+# 默认不自动清除已装配的信号旗或加成卡
 clear_loadout_sequence: null

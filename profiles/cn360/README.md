@@ -2,15 +2,19 @@
 
 本目录结构由 `python -m src.tools.calibrate_profile` / `calibrate_ship` / `capture_marker`
 等工具生成或更新，模板图片需要从实机截图截取，**不要把网上图片当作界面模板**。
-完整截图清单、数量与工具命令见 `docs/截图标定清单.md`。
+完整截图清单、数量与工具命令见 `docs/截图标定清单.md`；
+已从 2026-10-30 实机截图提取的模板与缺口见 `docs/截图分类与提取结果.md`。
+
+当前进度：13 个界面模板 + `marker/marker.png` 已提取（实机截图 2559×1599）；
+仍缺 10 个界面模板（加载、观战、ESC 菜单、退出确认、回港弹窗）、船只卡片与空信号旗槽模板，
+`validate` 会报 12 个 `file_missing`（预期）。
 
 需要标定并生成的文件：
 
-- `features/*.png`：profile.yaml 中 `features` 引用的界面模板（港口、排队、加载、
-  战斗 HUD、死亡提示、退出菜单、确认框、回港弹窗等），共 24 张；
-- `marker/marker.png`：小地图上自身舰船标记（autopilot 对称敌区目标依赖它），
-  工具会旋转生成 24 个角度模板；
-- `ships/<ship_id>/card.png`：港口船只卡片；
+- `features/*.png`：profile.yaml 中 `features` 引用的界面模板（共 23 个，已提取 13 个）；
+- `marker/marker.png`：小地图上自身舰船标记（autopilot 对称敌区目标依赖它），已提取；
+  运行时由 ShipLocator 自动生成多角度模板，不需要手工生成 `marker_*.png`；
+- `ships/<ship_id>/card.png`：港口船只卡片（待定目标船）；
 - `ships/<ship_id>/loadout/signal_flags_empty.png`：空信号旗槽模板
   （**只校验信号旗数量为 0**，左侧配件/升级不参与校验）。
 

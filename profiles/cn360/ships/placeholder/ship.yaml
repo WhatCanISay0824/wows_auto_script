@@ -8,12 +8,12 @@
 # - 不售卖、不出售、不消耗任何船只或装备；脚本只做船只列表选择与卡片点击。
 
 ship_id: placeholder
-display_name: 占位船只（待实机标定）
+display_name: 占位船只（待选定目标船后替换）
 card_template: card.png
-card_search_region: null      # 留空表示使用船只列表区域
+card_search_region: [0.0, 0.80, 1.0, 1.0]   # 港口底部船只轮播条（实测 UI）
 loadout_preset_feature: null  # 不使用预设（预设可能包含左侧配件/升级，禁止启用）
 max_scrolls: 20               # 船只列表最多滚动次数（鼠标滚轮滚动，不用拖动滚动条）
-scroll_direction: down        # 船只列表滚动方向：down=向下滚（找后面的船）
+scroll_direction: down        # 船只列表滚动方向：down=向下滚（待实机确认轮播滚动方向）
 scroll_clicks: 1              # 每次滚动格数（MOUSE_WHEEL 1 格 = WHEEL_DELTA）
 
 # 空装备槽校验：只要求信号旗数量为 0（用户确认口径）；左侧配件/升级不参与校验。
