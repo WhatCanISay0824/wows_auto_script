@@ -18,6 +18,15 @@ def test_leningrad_ship_profile_has_card_and_hp_bar(project_root: Path) -> None:
     assert app.ship.hp_bar_path is not None and app.ship.hp_bar_path.is_file()
 
 
+def test_iron_duke_ship_profile_has_card_and_hp_bar(project_root: Path) -> None:
+    from src.config.loader import load_ship
+
+    ship = load_ship(project_root / "profiles" / "cn360" / "ships" / "iron_duke" / "ship.yaml")
+    assert ship.display_name == "铁公爵"
+    assert ship.card_path is not None and ship.card_path.is_file()
+    assert ship.hp_bar_path is not None and ship.hp_bar_path.is_file()
+
+
 def test_engine_applies_ship_specific_hp_bar_template(project_root: Path) -> None:
     app = load_project(project_root, "cn360").config
     engine = PerceptionEngine(app, capture=None)

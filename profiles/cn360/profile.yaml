@@ -106,8 +106,8 @@ features:
     region: [0.38, 0.89, 0.62, 0.99]
     threshold: 0.85
   battle_hud_indicator:
-    template: features/battle_hud_indicator.png    # 顶部 A/B/C/D 占点条
-    region: [0.40, 0.02, 0.60, 0.10]
+    template: features/battle_hud_indicator.png    # 顶部绿/红队旗图标（实机画面提取，不受天空光照影响）
+    region: [0.44, 0.02, 0.58, 0.10]
     threshold: 0.85
   hp_bar_present:
     template: features/hp_bar_present.png          # 左下“VII 列宁格勒”血条文字（静态）
