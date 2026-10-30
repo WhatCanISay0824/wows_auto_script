@@ -109,7 +109,6 @@ class StateMachine:
         self._port_phase = "idle"
         self._port_wait_until = 0.0
         self._port_start_attempts = 0
-        self._port_visits = 0
         self._port_loadout_started = False
         # EXIT 子状态
         self._exit_retried = False
@@ -420,9 +419,9 @@ class StateMachine:
         self._exit_method = "none"
         self._exit_error = None
         self._port_phase = "idle"
-        self._port_visits += 1
-        # 会话开始后第一次进港口不需要“两场之间”的等待，直接做校验/开局；之后按随机间隔冷却
-        between = 0.0 if self._port_visits <= 1 else self.deps.session.sample_between_battle_s()
+        # 本会话尚未完成任何战斗（含暂停恢复后的重新进港口）时不等待；
+        # 只有“两场之间”才使用随机冷却
+        between = 0.0 if self._battles_completed == 0 else self.deps.session.sample_between_battle_s()
         self._port_wait_until = now + between
         self._port_start_attempts = 0
         self._port_loadout_started = False

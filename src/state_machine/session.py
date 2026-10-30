@@ -219,7 +219,7 @@ class SessionController:
         now = self._clock.now()
         today = self._clock.wall_now().date()
         cached = self._daily_count_cache
-        if cached is not None and cached[1] == today and now - cached[0] < 5.0:
+        if cached is not None and cached[1] == today and now - cached[0] < 30.0:
             return cached[2]
         try:
             count = int(self._count_battles_on(today))

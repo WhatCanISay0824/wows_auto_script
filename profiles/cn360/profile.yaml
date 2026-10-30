@@ -207,16 +207,18 @@ ship_selection_sequence: []
 
 # 每场战斗前的装备页校验（用户确认：只要求信号旗数量为 0）：
 # 点顶部“装备”标签 → 等“信号旗 0/8”特征（数量不为 0 则匹配失败，进入 PAUSED）。
-# 校验后不必切回港口页：“加入战斗”按钮在装备页同样存在，直接开局即可。
+# 点击步骤设为 optional：如果因为恢复/上一轮失败已经停在装备页（标签是选中态、无未选中模板），
+# 直接跳过点击，等待信号旗特征即可；校验后不必切回港口页，装备页也有“加入战斗”按钮。
 ship_check_sequence:
   - action: click_feature
     feature: port_equip_tab
     timeout_ms: 3000
     retries: 1
+    optional: true
   - action: wait_feature
     feature: loadout_signal_flags
     timeout_ms: 3000
-    retries: 0
+    retries: 1
 
 # 船只校验：ship_card 由运行时的船只卡片模板注册（来自 ships/<ship_id>/card.png）
 ship_verify_features: [ship_card]

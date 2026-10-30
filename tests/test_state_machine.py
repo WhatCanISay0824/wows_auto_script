@@ -718,7 +718,7 @@ def test_account_rotator_disabled() -> None:
 
 
 def test_first_port_visit_skips_between_battle_wait(tmp_path: Path) -> None:
-    """会话开始后首次进港口不再等 15~60s 随机间隔；第二场之间才等待。"""
+    """本会话还没打完任何一场时（含暂停恢复）进港口不等待；两场之间才随机冷却。"""
     h = Harness(tmp_path)
     h.session.sample_between_battle_s = lambda: 30.0  # type: ignore[method-assign]
     h.machine.start()
@@ -726,6 +726,10 @@ def test_first_port_visit_skips_between_battle_wait(tmp_path: Path) -> None:
     h.step()
     assert h.machine.state is State.PORT
     assert h.machine._port_wait_until == pytest.approx(h.clock.now())
+    h.clock.advance(1.0)
+    h.machine._enter_port(h.clock.now(), "test_resume_visit")
+    assert h.machine._port_wait_until == pytest.approx(h.clock.now())  # 暂停恢复不等待
+    h.machine._battles_completed = 1
     h.clock.advance(1.0)
     h.machine._enter_port(h.clock.now(), "test_second_visit")
     assert h.machine._port_wait_until == pytest.approx(h.clock.now() + 30.0)

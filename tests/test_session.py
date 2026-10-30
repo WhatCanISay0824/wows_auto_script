@@ -137,7 +137,7 @@ def test_daily_count_is_cached_and_invalidated_after_battle() -> None:
     for _ in range(5):
         assert controller.check_stop() is None
     assert len(calls) == 1  # 5 次检查（每 tick 一次）只查一次数据库
-    clock.advance(6.0)
+    clock.advance(31.0)
     controller.check_stop()
     assert len(calls) == 2  # 缓存过期后重新查询
     controller.begin_battle()
