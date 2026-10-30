@@ -148,6 +148,8 @@ class ClientProfile:
     popup_sequence: tuple[StepDef, ...] = ()
     result_sequence: tuple[StepDef, ...] = ()
     ship_selection_sequence: tuple[StepDef, ...] = ()
+    # 每场战斗前在港口执行的“装备页信号旗校验”步骤：切到装备页 → 等待空信号旗特征 → 切回港口页
+    ship_check_sequence: tuple[StepDef, ...] = ()
     ship_verify_features: tuple[str, ...] = ()
     loadout_verify_features: tuple[str, ...] = ()
     clear_loadout_sequence: tuple[StepDef, ...] | None = None

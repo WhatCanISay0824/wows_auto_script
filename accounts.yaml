@@ -1,4 +1,4 @@
-# =============================================================================
+﻿# =============================================================================
 # 账号档案（本地别名 + 每账号独立配置 + 会话间轮换）
 #
 # 安全约定（必须遵守）：
@@ -21,7 +21,7 @@ accounts:
   - alias: alt1
     display_name: 小号一号（本地别名）
     profile: cn360              # 客户端配置，可留空使用命令行 --profile
-    ship_id: placeholder        # 会话固定船只，留空使用全局 ship.ship_id
+    ship_id: leningrad        # 会话固定船只，留空使用全局 ship.ship_id
     daily_battle_cap: 30        # 覆盖 session.daily_battle_cap
     allowed_hours: null         # 覆盖 session.allowed_hours，null 表示继承
     max_battles_per_session: 6  # 本账号单次会话最多场次
@@ -31,7 +31,7 @@ accounts:
   - alias: alt2
     display_name: 小号二号（本地别名）
     profile: cn360
-    ship_id: placeholder
+    ship_id: leningrad
     daily_battle_cap: 20
     allowed_hours: ["09:00", "22:00"]
     max_battles_per_session: 4

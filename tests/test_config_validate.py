@@ -61,33 +61,25 @@ def test_allowed_hours_valid(project: fx.TestProject, tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 真实仓库：待实机标定的模板/船只与空地图应给出错误（不是崩溃）
+# 真实仓库：实机截图提取完成后应无 error（warning 可接受）
 # ---------------------------------------------------------------------------
 
 
-def test_real_repo_reports_errors_instead_of_crashing(project_root: Path) -> None:
+def test_real_repo_has_no_errors_after_calibration(project_root: Path) -> None:
     report = validate_project(project_root, "cn360")
-    assert report.has_errors
-    errors = report.errors
-    # 当前仓库：13 个界面模板已从实机截图提取，剩 4 个退出相关模板 + 船卡 + 空信号旗槽待标定。
-    # autopilot 模式下空地图包已降级为 warning，不再是 error。
-    assert len(errors) >= 4
-    assert _codes(errors).count("file_missing") >= 4
-    assert all("待实机标定" in issue.message for issue in errors if issue.code == "file_missing")
-    # 问题定位包含文件与字段路径
-    assert all(issue.location for issue in errors)
-    file_issues = [issue for issue in errors if issue.code == "file_missing"]
-    assert all(": " in issue.location for issue in file_issues)
-    assert any("features.exit_menu_panel.template" in issue.location for issue in errors)
+    assert not report.has_errors, [issue.format() for issue in report.errors]
+    warnings = report.warnings
+    # 允许的 warning：空地图包（autopilot 不需要）、LOADING/POST_EXIT 状态特征为空等
+    assert warnings
+    assert all(issue.location for issue in warnings)
+    assert any(issue.code == "empty" and issue.location == "maps" for issue in warnings)
 
 
 def test_real_repo_tool_exit_code_and_output(project_root: Path, capsys: pytest.CaptureFixture[str]) -> None:
     exit_code = validate_tool.main(["--root", str(project_root)])
     captured = capsys.readouterr()
-    assert exit_code == 2
-    assert "[ERROR]" in captured.out
-    assert "个错误" in captured.out
-    assert "退出码 2" in captured.out
+    assert exit_code == 0
+    assert "配置校验完成" in captured.out
 
 
 # ---------------------------------------------------------------------------

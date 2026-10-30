@@ -1,0 +1,19 @@
+# 船只配置：VII 级驱逐舰 列宁格勒
+# 模板来源：2026-10-30 实机截图（2559×1599）
+# - card.png：港口底部船只轮播条卡片右侧（船体剪影 + 船名），避开左侧 VII/+50% 徽章与选中边框
+# - 装备校验：用户确认只要求信号旗数量为 0，由 profile.yaml 的 ship_check_sequence 切到装备页校验，
+#   因此这里不再配置 loadout_slots；左侧配件/升级不读取、不点击、不修改。
+# - 不售卖/不出售/不消耗任何船只或装备。
+
+ship_id: leningrad
+display_name: 列宁格勒
+card_template: card.png
+card_search_region: [0.0, 0.80, 1.0, 1.0]   # 港口底部船只轮播条（实测 UI）
+loadout_preset_feature: null
+max_scrolls: 20               # 船只列表最多滚动次数（鼠标滚轮滚动，不用拖动滚动条）
+scroll_direction: down        # 轮播条滚动方向：down=向下滚（待实机确认）
+scroll_clicks: 2              # 每次滚动格数（MOUSE_WHEEL 1 格 = WHEEL_DELTA）
+
+loadout_slots: []             # 信号旗校验改由 profile.ship_check_sequence 在装备页完成
+
+notes: 实机截图 214644 提取卡片模板；信号旗 0/8 模板见 features/loadout_signal_flags.png。

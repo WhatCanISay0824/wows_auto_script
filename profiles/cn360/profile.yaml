@@ -49,10 +49,11 @@ camera:
   sensitivity: 1.0      # 待实机标定
 
 # 退出流程（详细设计 6.1 / 10.2）。状态机消费这些特征，不写死按键与按钮。
-# 注意：以下 4 个退出相关模板尚未截图，validate 会报缺失；补齐后即可自动退出。
+# 实测：ESC → 菜单（215424，含“离开战斗”按钮）→ 确认框（215411，是/否/继续战斗）→ 回港。
+# menu_open_feature 与 return_port_feature 都指向“离开战斗”按钮（菜单一出现即可点击）。
 exit:
   menu_key: escape
-  menu_open_feature: exit_menu_panel
+  menu_open_feature: exit_menu_return_port
   return_port_feature: exit_menu_return_port
   confirm_feature: exit_confirm_yes
   port_feature: port_indicator
@@ -61,20 +62,20 @@ exit:
 
 # 状态识别特征表（详细设计 5.4）。第一个为主判定，其余为辅助；缺失特征会被跳过。
 state_features:
-  PORT: [port_indicator, port_battle_button, coop_mode_selected]
+  PORT: [port_indicator, port_battle_button, coop_mode_selected, port_tab, port_equip_tab]
   QUEUEING: [queue_indicator, cancel_queue_button]
   LOADING: []                     # 加载界面模板可缺省：排队结束后直接检测战斗 HUD 进战斗
   BATTLE_ACTIVE: [battle_hud_indicator, hp_bar_present]
   BATTLE_FINISHED: [battle_results, result_panel]
-  EXIT_MENU_OPEN: [exit_menu_panel, exit_menu_return_port]
-  EXIT_CONFIRMING: [exit_confirm_dialog, exit_confirm_yes]
+  EXIT_MENU_OPEN: [exit_menu_return_port]
+  EXIT_CONFIRMING: [exit_confirm_yes]
   POST_EXIT_INTERFACE: []         # 回港弹窗暂不处理（未知弹窗由异常恢复 ESC 兜底）
 
 # 回港后弹窗特征（暂未截图；先留空，遇未知弹窗由异常恢复 ESC 处理，后续可补）
 popup_features: []
 
 # 界面特征模板（详细设计 3.2 / 5.4）。region 为归一化搜索区域 [x1,y1,x2,y2]。
-# 已提取：13 个；待截图：loading_*、spectator_indicator、exit_*、popup_*。
+# 已提取：18 个（含 2026-10-30 新补的退出菜单/确认框/装备页/标签页模板）。
 features:
   port_indicator:
     template: features/port_indicator.png          # 顶部“港口”标签
@@ -128,24 +129,28 @@ features:
     template: features/result_return_port_button.png  # “回到港口”按钮
     region: [0.38, 0.88, 0.64, 0.98]
     threshold: 0.85
-  # ---- 以下退出相关模板待实机截图（当前 validate 会报 file_missing）----
-  # 说明：点击“返回港口”后如果没有确认框，把 exit.confirm_feature 改为 null 即可去掉后两项。
-  exit_menu_panel:
-    template: features/exit_menu_panel.png
-    region: [0.25, 0.15, 0.75, 0.85]
-    threshold: 0.85
+  # ---- 实测退出菜单 / 退出确认框（215424 / 215411）----
   exit_menu_return_port:
-    template: features/exit_menu_return_port.png
-    region: [0.25, 0.55, 0.75, 0.90]
-    threshold: 0.85
-  exit_confirm_dialog:
-    template: features/exit_confirm_dialog.png
-    region: [0.30, 0.35, 0.70, 0.65]
+    template: features/exit_menu_return_port.png      # ESC 菜单里的“离开战斗”按钮
+    region: [0.40, 0.36, 0.60, 0.44]
     threshold: 0.85
   exit_confirm_yes:
-    template: features/exit_confirm_yes.png
-    region: [0.50, 0.55, 0.80, 0.70]
+    template: features/exit_confirm_yes.png           # “离开战斗?” 确认框里的“是”按钮
+    region: [0.34, 0.45, 0.48, 0.53]
     threshold: 0.85
+  # ---- 实测港口标签页 / 装备页信号旗（210924 / 214644）----
+  port_equip_tab:
+    template: features/port_equip_tab.png             # 顶部“装备”标签（港口页未选中态）
+    region: [0.32, 0.05, 0.42, 0.09]
+    threshold: 0.82
+  port_tab:
+    template: features/port_tab.png                   # 顶部“港口”标签（装备页未选中态）
+    region: [0.24, 0.05, 0.34, 0.09]
+    threshold: 0.82
+  loadout_signal_flags:
+    template: features/loadout_signal_flags.png       # 装备页“信号旗 0/8”（数量为 0 才算空）
+    region: [0.38, 0.41, 0.50, 0.47]
+    threshold: 0.82
 
 # 开局步骤（实测 UI）：港口 → 点“加入战斗” → 若弹出“未学习技能”确认框点“是” → 等待排队界面
 start_sequence:
@@ -204,9 +209,25 @@ popup_sequence: []
 # 因此不再需要打开列表的步骤。
 ship_selection_sequence: []
 
-# 船只与空装备校验（详细设计 6.8 + 用户确认口径）
+# 每场战斗前的装备页校验（用户确认：只要求信号旗数量为 0）：
+# 切到“装备”页 → 等“信号旗 0/8”特征（数量不为 0 则匹配失败，进入 PAUSED）→ 切回“港口”页。
+ship_check_sequence:
+  - action: click_feature
+    feature: port_equip_tab
+    timeout_ms: 3000
+    retries: 1
+  - action: wait_feature
+    feature: loadout_signal_flags
+    timeout_ms: 3000
+    retries: 0
+  - action: click_feature
+    feature: port_tab
+    timeout_ms: 3000
+    retries: 1
+
+# 船只校验：ship_card 由运行时的船只卡片模板注册（来自 ships/<ship_id>/card.png）
 ship_verify_features: [ship_card]
-loadout_verify_features: [loadout_signal_flags]
+loadout_verify_features: []   # 信号旗已在 ship_check_sequence 中校验，不再重复检查
 
 # 默认不自动清除已装配的信号旗或加成卡
 clear_loadout_sequence: null

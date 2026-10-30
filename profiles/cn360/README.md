@@ -5,18 +5,20 @@
 完整截图清单、数量与工具命令见 `docs/截图标定清单.md`；
 已从 2026-10-30 实机截图提取的模板与缺口见 `docs/截图分类与提取结果.md`。
 
-当前进度：13 个界面模板 + `marker/marker.png` 已提取（实机截图 2559×1599）；
-仍缺 4 个退出相关模板（ESC 菜单面板/返回港口按钮/退出确认框/确认按钮）、船只卡片与空信号旗槽模板，
-`validate` 会报 6 个 `file_missing`（预期）。加载界面、观战界面、回港弹窗已按用户口径改为非必需。
+当前进度：**18 个界面模板 + `marker/marker.png` + `ships/leningrad/card.png` 已全部提取**
+（实机截图 2559×1599），`validate` 0 error、`main --dry-run` 退出码 0。
+加载界面、观战界面、回港弹窗已按用户口径改为非必需。
 
 需要标定并生成的文件：
 
-- `features/*.png`：profile.yaml 中 `features` 引用的界面模板（共 17 个，已提取 13 个）；
-- `marker/marker.png`：小地图上自身舰船标记（autopilot 对称敌区目标依赖它），已提取；
-  运行时由 ShipLocator 自动生成多角度模板，不需要手工生成 `marker_*.png`；
-- `ships/<ship_id>/card.png`：目标船只卡片（船名确定后从港口底部轮播条截图裁取）；
-- `ships/<ship_id>/loadout/signal_flags_empty.png`：空信号旗槽模板
-  （**只校验信号旗数量为 0**，左侧配件/升级不参与校验）。
+- `features/*.png`：profile.yaml 中 `features` 引用的 18 个界面模板，已全部提取；
+- `marker/marker.png`：小地图上自身舰船标记，已提取；运行时由 ShipLocator 自动生成多角度模板；
+- `ships/<ship_id>/card.png`：船只卡片。当前已有 `ships/leningrad/`（列宁格勒）；
+  **每次换一艘新船首次使用前**，截港口底部轮播条里该船卡片完整可见的图，运行
+  `python -m src.tools.calibrate_ship --root . --ship-id <id> --screenshot <截图>` 生成新档案；
+  之后 `python -m src.main --ship-name <船名>` 会自动滚轮查找并选中；
+- 信号旗校验：由 `profile.yaml` 的 `ship_check_sequence` 在**装备页**完成（切到装备页 →
+  等“信号旗 0/8”模板命中 → 切回港口页），不再需要 `loadout/*.png` 空槽模板。
 
 操作边界（用户确认）：
 

@@ -24,10 +24,11 @@ paths:
   profiles_dir: profiles       # 客户端配置目录
 
 ship:
-  # 会话固定船只编号，对应 profiles/<client_id>/ships/<ship_id>/；命令行 --ship 优先
-  # 待标定：M0 完成船只卡片与空装备标定后填写
-  ship_id: placeholder
-  verify_each_battle: true     # 每场开始前重新确认船只与空装备
+  # 会话固定船只编号，对应 profiles/<client_id>/ships/<ship_id>/；命令行 --ship-name/--ship 优先。
+  # 每次要托管的船可能不同：启动时用 --ship-name 输入船名，脚本会在船只轮播条里找并选中该船。
+  # 新船首次使用前需截一次船卡模板（python -m src.tools.calibrate_ship）。
+  ship_id: leningrad
+  verify_each_battle: true     # 每场开始前重新确认船只与空信号旗
 
 map:
   auto_identify: false         # autopilot 模式不需要识别地图；waypoints 模式才需要

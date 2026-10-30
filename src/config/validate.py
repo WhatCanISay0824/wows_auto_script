@@ -783,7 +783,14 @@ def validate_profile(
                     f"状态 {state_name} 引用了不存在的界面特征: {feature_id}",
                 )
 
-    for name in ("start_sequence", "start_sequence_full", "popup_sequence", "result_sequence", "ship_selection_sequence"):
+    for name in (
+        "start_sequence",
+        "start_sequence_full",
+        "popup_sequence",
+        "result_sequence",
+        "ship_selection_sequence",
+        "ship_check_sequence",
+    ):
         issues.extend(
             _validate_steps(
                 getattr(profile, name),

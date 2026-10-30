@@ -1541,6 +1541,9 @@ def load_profile(
         ship_selection_sequence=_parse_steps(
             raw.get("ship_selection_sequence"), collected, f"{label}: ship_selection_sequence"
         ),
+        ship_check_sequence=_parse_steps(
+            raw.get("ship_check_sequence"), collected, f"{label}: ship_check_sequence"
+        ),
         ship_verify_features=_str_list(
             raw, "ship_verify_features", (), collected, f"{label}: ship_verify_features"
         ),

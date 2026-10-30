@@ -60,15 +60,16 @@ def test_list_ships_real_repo() -> None:
     ships = _list_ships(PROJECT_ROOT, "cn360")
     assert ships
     ship_ids = [ship_id for ship_id, _ in ships]
-    assert "placeholder" in ship_ids
+    assert "leningrad" in ship_ids
     assert any(display for _, display in ships)
 
 
 def test_resolve_ship_by_display_name() -> None:
     ships = dict(_list_ships(PROJECT_ROOT, "cn360"))
-    display_name = ships["placeholder"]
-    assert _resolve_ship(PROJECT_ROOT, "cn360", None, display_name) == "placeholder"
-    assert _resolve_ship(PROJECT_ROOT, "cn360", None, "placeholder") == "placeholder"
+    display_name = ships["leningrad"]
+    assert display_name == "列宁格勒"
+    assert _resolve_ship(PROJECT_ROOT, "cn360", None, display_name) == "leningrad"
+    assert _resolve_ship(PROJECT_ROOT, "cn360", None, "leningrad") == "leningrad"
 
 
 def test_resolve_ship_unknown_name_lists_candidates() -> None:
@@ -80,4 +81,4 @@ def test_resolve_ship_unknown_name_lists_candidates() -> None:
 def test_main_list_ships_cli() -> None:
     result = _run(["--list-ships"])
     assert result.returncode == 0, result.stderr
-    assert "placeholder" in result.stdout
+    assert "leningrad" in result.stdout

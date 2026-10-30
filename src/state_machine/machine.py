@@ -109,6 +109,7 @@ class StateMachine:
         self._port_phase = "idle"
         self._port_wait_until = 0.0
         self._port_start_attempts = 0
+        self._port_loadout_started = False
         # EXIT 子状态
         self._exit_retried = False
         self._confirm_seen = False
@@ -421,6 +422,7 @@ class StateMachine:
         between = self.deps.session.sample_between_battle_s()
         self._port_wait_until = now + between
         self._port_start_attempts = 0
+        self._port_loadout_started = False
         self.deps.ship_checker.reset()
         self._log_action("state_change", {"to": "PORT", "between_battle_s": round(between, 2)})
 
@@ -436,8 +438,33 @@ class StateMachine:
                 return []
             if now < self._port_wait_until:
                 return []
-            self._port_phase = "verify"
+            sequence = self.config.profile.ship_check_sequence
+            self._port_phase = "loadout" if (sequence and self.deps.ship_checker.verify_each_battle) else "verify"
             return []
+        if phase == "loadout":
+            # 装备页信号旗校验：切到装备页 → 等待“信号旗 0/8”空槽特征 → 切回港口页
+            sequence = self.config.profile.ship_check_sequence
+            if not sequence:
+                self._port_phase = "verify"
+                return []
+            if not self._port_loadout_started:
+                self._port_loadout_started = True
+                try:
+                    self.deps.steps.start(sequence, label="loadout_check")
+                except Exception as exc:
+                    self._port_phase = "verify"
+                    self._logger.warning("装备校验序列启动失败: %s", exc)
+                    return []
+            status, actions = self._advance_steps(observation, now)
+            if status is StepStatus.DONE:
+                self._port_phase = "verify"
+                self._log_action("loadout_verify", {"result": "ok", "signal_flags": 0})
+            elif status is StepStatus.FAILED:
+                reason = getattr(self.deps.steps, "last_error", None)
+                detail = f"信号旗未清空或装备页不可达: {reason}"
+                self._exit_error = str(detail)
+                self.request_pause("loadout_check_failed", detail)
+            return actions
         if phase == "verify":
             if not self.deps.ship_checker.verify_each_battle:
                 self._port_phase = "start"

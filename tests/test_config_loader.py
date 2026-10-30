@@ -17,6 +17,7 @@ from src.config.loader import (
     load_ship,
     probe_png_size,
 )
+from src.config.validate import validate_app
 
 from tests.fixtures.configs import builder as fx
 
@@ -38,7 +39,7 @@ def test_load_global_real_config(project_root: Path) -> None:
     assert config.runtime.capture_hz == 2.0
     assert config.paths.data_dir == (project_root / "data").resolve()
     assert config.paths.maps_dir == (project_root / "maps").resolve()
-    assert config.ship.ship_id == "placeholder"
+    assert config.ship.ship_id == "leningrad"
 
 
 def test_load_global_new_fields_from_review(project_root: Path) -> None:
@@ -104,19 +105,13 @@ def test_load_profile_real_cn360(project_root: Path) -> None:
     assert profile.client_id == "cn360"
     assert profile.display_name
     assert profile.reference_resolution == (2559, 1599)
-    assert len(profile.features) == 17
-    # 2026-10-30 实机截图已提取 13 个界面模板；剩余 4 个退出相关模板待标定
-    loaded = {fid for fid, feature in profile.features.items() if feature.template_path is not None}
-    assert len(loaded) == 13
-    assert {
-        "exit_menu_panel",
-        "exit_menu_return_port",
-        "exit_confirm_dialog",
-        "exit_confirm_yes",
-    } == set(profile.features) - loaded
+    assert len(profile.features) == 18
+    # 2026-10-30 实机截图已全部提取（含退出菜单/确认框/装备页/标签页）
+    assert all(feature.template_path is not None for feature in profile.features.values())
     assert profile.battle_hud.spectator_features == ()
     assert profile.popup_features == ()
     assert profile.state_features["LOADING"] == ()
+    assert profile.state_features["EXIT_MENU_OPEN"] == ("exit_menu_return_port",)
     feature = profile.feature("port_battle_button")
     assert feature is not None
     assert feature.template == "features/port_battle_button.png"
@@ -127,11 +122,13 @@ def test_load_profile_real_cn360(project_root: Path) -> None:
     assert profile.minimap.marker_hsv_lower == (0, 0, 200)
     assert profile.battle_hud.hp_fill_zero_ratio == 0.05
     assert profile.exit.menu_key == "escape"
+    assert profile.exit.confirm_feature == "exit_confirm_yes"
     assert len(profile.start_sequence) == 4
     assert len(profile.start_sequence_full) == 3
     assert len(profile.result_sequence) == 2
     assert profile.ship_selection_sequence == ()
-    assert profile.loadout_verify_features == ("loadout_signal_flags",)
+    assert len(profile.ship_check_sequence) == 3
+    assert profile.loadout_verify_features == ()
     assert profile.state_features["PORT"][0] == "port_indicator"
     assert profile.profile_dir == project_root / "profiles" / "cn360"
 
@@ -156,16 +153,16 @@ def test_load_keymap_missing_file_recorded(tmp_path: Path) -> None:
 
 
 def test_load_ship_real(project_root: Path) -> None:
-    path = project_root / "profiles" / "cn360" / "ships" / "placeholder" / "ship.yaml"
+    path = project_root / "profiles" / "cn360" / "ships" / "leningrad" / "ship.yaml"
     ship = load_ship(path)
-    assert ship.ship_id == "placeholder"
-    assert ship.display_name
+    assert ship.ship_id == "leningrad"
+    assert ship.display_name == "列宁格勒"
     assert ship.card_template == "card.png"
-    assert ship.card_path is None  # 待标定
+    assert ship.card_path == path.parent / "card.png"  # 已从实机截图提取
     assert ship.scroll_direction == "down"
+    assert ship.scroll_clicks == 2
     assert ship.max_scrolls == 20
-    assert [slot.slot_id for slot in ship.loadout_slots] == ["signal_flags"]
-    assert ship.loadout_slots[0].empty_template == "loadout/signal_flags_empty.png"
+    assert ship.loadout_slots == ()  # 信号旗校验改由 profile.ship_check_sequence 完成
     assert ship.ship_dir == path.parent
 
 
@@ -180,7 +177,7 @@ def test_load_project_repo_lenient(project_root: Path) -> None:
     assert loaded.issues == []
     config = loaded.config
     assert config.profile.client_id == "cn360"
-    assert config.ship.ship_id == "placeholder"
+    assert config.ship.ship_id == "leningrad"
     assert config.maps == {}
     assert config.project_root == project_root
     assert len(config.config_hash) == 16
@@ -189,23 +186,18 @@ def test_load_project_repo_lenient(project_root: Path) -> None:
     assert config.sources["runtime.loop_hz"] == "config.yaml"
     assert config.sources["profile.features.port_indicator"] == "profiles/cn360/profile.yaml"
     assert config.sources["keys.actions.escape"] == "profiles/cn360/keys.yaml"
-    assert config.sources["ship.ship_id"] == "profiles/cn360/ships/placeholder/ship.yaml"
+    assert config.sources["ship.ship_id"] == "profiles/cn360/ships/leningrad/ship.yaml"
 
 
-def test_load_app_repo_raises_with_calibration_errors(project_root: Path) -> None:
-    with pytest.raises(ConfigError) as exc_info:
-        load_app(project_root, "cn360")
-    errors = exc_info.value.errors
-    warnings = exc_info.value.warnings
-    # 2026-10-30 已从实机截图提取 13 个界面模板；当前仓库剩 4 个退出模板 + 船卡 + 空信号旗槽
-    # 共 6 个“待标定” error。标定推进后数量会变化，这里只断言这一类错误存在。
-    assert len(errors) >= 4
-    codes = [issue.code for issue in errors]
-    assert codes.count("file_missing") >= 4
-    assert all("待实机标定" in issue.message for issue in errors if issue.code == "file_missing")
-    # autopilot 模式：空地图包不是必需项，应为 warning 而非 error
-    warning_codes = [issue.code for issue in warnings]
-    assert "empty" in warning_codes
+def test_load_app_repo_succeeds_after_calibration(project_root: Path) -> None:
+    """12 张实机截图提取完成后，真实仓库配置应无 error（warning 可接受）。"""
+    app = load_app(project_root, "cn360")
+    assert app.profile.client_id == "cn360"
+    assert app.ship.ship_id == "leningrad"
+    assert app.ship.card_path is not None
+    issues = validate_app(app)
+    errors = [issue for issue in issues if issue.is_error]
+    assert errors == [], "\n".join(issue.format() for issue in errors)
 
 
 # ---------------------------------------------------------------------------
