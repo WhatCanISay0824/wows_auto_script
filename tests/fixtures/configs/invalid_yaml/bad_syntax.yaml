@@ -1,0 +1,3 @@
+# 故意写坏的 YAML：用于测试解析失败时给出清晰 error 而不是崩溃
+runtime:
+  loop_hz: [10

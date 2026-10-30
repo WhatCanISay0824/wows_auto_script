@@ -1,0 +1,599 @@
+"""感知引擎：把单帧画面转换成结构化 Observation（详细设计 5.1 / B.1）。
+
+职责边界（详细设计 2.3）：
+- 只回答“画面上有什么”，不做状态决策；
+- 不直接调用键鼠，不直接写数据库；
+- 地图识别、舰船定位、死亡投票在这里组合成一次 Observation；
+- 世界坐标换算只在本模块把 ``BattleCalibration`` 套到舰船位置上，坐标数学在 common.coords。
+
+所有重量级识别都有节流：截屏约 2 Hz（复用最近一帧），地图识别按 map_refresh_s 刷新，
+死亡信号复用本帧的特征结果。
+"""
+
+from __future__ import annotations
+
+import logging
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+
+import cv2
+import numpy as np
+
+from ..common.clock import Clock, SystemClock
+from ..common.coords import BattleCalibration, CalibrationMode, expected_minimap_scale
+from ..common.errors import CaptureUnavailable, WindowUnavailable
+from ..common.types import (
+    DeathSignals,
+    MapMatch,
+    MatchResult,
+    Observation,
+    Rect,
+    ShipPosition,
+    State,
+    WindowInfo,
+)
+from ..config.models import AppConfig, ClientProfile, MapPack, PerceptionConfig
+from .capture import Frame, GdiCapture
+from .death import DeathDetector
+from .features import FeatureMatcher
+from .map_identify import MapIdentifier
+from .ship_locate import ShipLocator
+from .state_features import merge_state_features
+
+logger = logging.getLogger(__name__)
+
+# 恢复流程 detect_state 的判定顺序：模态窗口优先，港口最后（详细设计 5.4）
+_DETECT_PRIORITY: tuple[State, ...] = (
+    State.POST_EXIT_INTERFACE,
+    State.EXIT_CONFIRMING,
+    State.EXIT_MENU_OPEN,
+    State.DEAD_PENDING_EXIT,
+    State.BATTLE_FINISHED,
+    State.BATTLE_ACTIVE,
+    State.LOADING,
+    State.QUEUEING,
+    State.PORT,
+)
+
+# 战斗内每帧需要额外检查的死亡/结算特征（详细设计 5.9 / 5.10）
+_BATTLE_EXTRA_FEATURES: tuple[str, ...] = (
+    "hp_bar_present",
+    "death_banner",
+    "battle_results",
+    "result_panel",
+    "spectator_indicator",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class PerceptionStats:
+    """感知耗时统计（详细设计 5.11）。"""
+
+    capture_count: int
+    capture_ms_avg: float
+    frames: int
+    last_frame_id: int
+    map_identify_count: int
+
+
+class PerceptionEngine:
+    """感知引擎门面。"""
+
+    def __init__(
+        self,
+        config: AppConfig,
+        capture: GdiCapture | None,
+        clock: Clock | None = None,
+        *,
+        feature_matcher: FeatureMatcher | None = None,
+        map_identifier: MapIdentifier | None = None,
+        ship_locator: ShipLocator | None = None,
+        logger_: logging.Logger | None = None,
+    ) -> None:
+        self.config = config
+        self.profile: ClientProfile = config.profile
+        self.perception_config: PerceptionConfig = config.global_config.perception
+        self._clock = clock or SystemClock()
+        self._capture = capture
+        self._logger = logger_ or logger
+        self._feature_matcher = feature_matcher or FeatureMatcher.from_profile(
+            self.profile,
+            self.perception_config,
+            project_root=config.project_root,
+        )
+        self._map_identifier = map_identifier or MapIdentifier(config.maps, self.perception_config)
+        self._ship_locator = ship_locator or ShipLocator(
+            self.profile,
+            self.perception_config,
+            project_root=config.project_root,
+        )
+        self._state_features = merge_state_features(self.profile.state_features)
+        self._state: State = State.INIT
+        self._last_frame: Frame | None = None
+        self._last_window: WindowInfo | None = None
+        self._last_capture_error: str | None = None
+        self._calibration: BattleCalibration | None = None
+        self._last_map_match: MapMatch | None = None
+        self._last_map_check = float("-inf")
+        self._last_map_id: str | None = None
+        self._death_detector: DeathDetector | None = None
+        self._last_death: DeathSignals | None = None
+        self._last_ship: ShipPosition | None = None
+        self._battle_started_at: float | None = None
+        self._capture_interval_s = 1.0 / max(0.5, float(config.global_config.runtime.capture_hz))
+        self._capture_count = 0
+        self._map_identify_count = 0
+        self._minimap_expected_scale = config.global_config.map.expected_minimap_scale
+
+    # ------------------------------------------------------------------
+    # 生命周期与状态
+    # ------------------------------------------------------------------
+    def set_state(self, state: State) -> None:
+        self._state = state
+
+    @property
+    def state(self) -> State:
+        return self._state
+
+    @property
+    def calibration(self) -> BattleCalibration | None:
+        return self._calibration
+
+    @property
+    def last_map_match(self) -> MapMatch | None:
+        return self._last_map_match
+
+    @property
+    def last_frame(self) -> Frame | None:
+        return self._last_frame
+
+    @property
+    def feature_matcher(self) -> FeatureMatcher:
+        return self._feature_matcher
+
+    def set_calibration(self, calibration: BattleCalibration | None) -> None:
+        self._calibration = calibration
+
+    def begin_battle(self, now: float) -> None:
+        """进入战斗：重置死亡投票与舰船跟踪（详细设计 6.3）。"""
+        self._battle_started_at = float(now)
+        self._death_detector = DeathDetector(self.perception_config.death, float(now))
+        self._last_death = None
+        self._ship_locator.reset()
+        self._calibration = None
+        self._last_map_match = None
+        self._last_map_check = float("-inf")
+        self._last_map_id = None
+
+    def end_battle(self) -> None:
+        self._death_detector = None
+        self._last_death = None
+        self._battle_started_at = None
+        self._calibration = None
+        self._last_map_match = None
+        self._ship_locator.reset()
+
+    def close(self) -> None:
+        if self._capture is not None:
+            self._capture.close()
+
+    # ------------------------------------------------------------------
+    # 截屏与特征
+    # ------------------------------------------------------------------
+    def _capture_frame(self, now: float) -> Frame:
+        if self._capture is None:
+            raise CaptureUnavailable("未配置截屏源")
+        frame = self._capture.capture()
+        self._capture_count += 1
+        self._last_frame = frame
+        self._last_window = WindowInfo(
+            hwnd=0,
+            title="",
+            process_name="",
+            client_rect=frame.window_rect,
+            foreground=True,
+            minimized=False,
+            valid=True,
+        )
+        self._last_capture_error = None
+        return frame
+
+    def latest_frame(self, now: float | None = None, *, force: bool = False) -> Frame | None:
+        """返回最近一帧；超过截屏间隔时重新截屏（详细设计 5.2）。"""
+        now = self._clock.now() if now is None else float(now)
+        if not force and self._last_frame is not None and now - self._last_frame.timestamp < self._capture_interval_s:
+            return self._last_frame
+        try:
+            return self._capture_frame(now)
+        except (CaptureUnavailable, WindowUnavailable) as exc:
+            self._last_capture_error = str(exc)
+            self._logger.debug("截屏失败: %s", exc)
+            return None
+
+    def match_feature(
+        self,
+        feature_id: str,
+        frame: Frame | None = None,
+        now: float | None = None,
+    ) -> MatchResult:
+        frame = frame or self.latest_frame(now)
+        if frame is None:
+            raise CaptureUnavailable(self._last_capture_error or "没有可用画面")
+        return self._feature_matcher.match(feature_id, frame)
+
+    def match_features(
+        self,
+        feature_ids: Sequence[str],
+        frame: Frame | None = None,
+        now: float | None = None,
+    ) -> dict[str, MatchResult]:
+        frame = frame or self.latest_frame(now)
+        if frame is None:
+            raise CaptureUnavailable(self._last_capture_error or "没有可用画面")
+        return self._feature_matcher.match_many(feature_ids, frame)
+
+    def register_feature(
+        self,
+        feature_id: str,
+        template_path: str,
+        region=None,
+        threshold: float = 0.85,
+    ) -> None:
+        """运行时注册模板特征（ship_card / loadout_*，详细设计 6.8）。"""
+        self._feature_matcher.template_matcher.register_feature(
+            feature_id,
+            template_path,
+            region=region,
+            threshold=threshold,
+        )
+
+    def has_feature(self, feature_id: str) -> bool:
+        return self._feature_matcher.has_feature(feature_id)
+
+    # ------------------------------------------------------------------
+    # 小地图
+    # ------------------------------------------------------------------
+    def minimap_content_rect(self, frame: Frame | None = None) -> Rect | None:
+        """按客户端配置得到小地图内容区（窗口像素坐标，已裁掉边框）。"""
+        frame = frame or self._last_frame
+        minimap = self.profile.minimap
+        if frame is None or minimap is None:
+            return None
+        region = minimap.rect.to_pixels(frame.window_rect.w, frame.window_rect.h)
+        border = max(0, int(minimap.border_px))
+        width = region.w - border * 2
+        height = region.h - border * 2
+        if width <= 8 or height <= 8:
+            return None
+        return Rect(region.x + border, region.y + border, width, height)
+
+    def minimap_image(self, frame: Frame | None = None) -> tuple[np.ndarray, Rect] | None:
+        frame = frame or self._last_frame
+        rect = self.minimap_content_rect(frame)
+        if frame is None or rect is None:
+            return None
+        image = frame.crop(rect)
+        if image is None or image.size == 0:
+            return None
+        return image, rect
+
+    def _expected_scale(self, content_rect: Rect) -> float | None:
+        if self._minimap_expected_scale is not None:
+            return float(self._minimap_expected_scale)
+        # 只有唯一地图（或强制指定）时才能推导期望缩放
+        if self.config.global_config.map.forced_map_id:
+            pack = self.config.maps.get(self.config.global_config.map.forced_map_id)
+        elif len(self.config.maps) == 1:
+            pack = next(iter(self.config.maps.values()))
+        else:
+            pack = None
+        if pack is None:
+            return None
+        return expected_minimap_scale(content_rect, pack.transform())
+
+    # ------------------------------------------------------------------
+    # 地图识别
+    # ------------------------------------------------------------------
+    def identify_map(
+        self,
+        now: float | None = None,
+        frame: Frame | None = None,
+        *,
+        force: bool = False,
+    ) -> MapMatch | None:
+        """识别当前地图并刷新标定；失败返回 None（详细设计 5.5）。"""
+        now = self._clock.now() if now is None else float(now)
+        refresh_s = float(self.perception_config.map_refresh_s)
+        if not force and self._last_map_match is not None and now - self._last_map_check < refresh_s:
+            return self._last_map_match
+        frame = frame or self.latest_frame(now)
+        if frame is None:
+            return None
+        mini = self.minimap_image(frame)
+        if mini is None:
+            self._logger.debug("无法裁剪小地图，跳过地图识别")
+            return None
+        minimap_image, content_rect = mini
+        expected = self._expected_scale(content_rect)
+        match = self._map_identifier.identify(minimap_image, expected_scale=expected, timestamp=now)
+        self._last_map_check = now
+        self._map_identify_count += 1
+        if match is None:
+            if self._last_map_match is not None:
+                self._logger.warning("地图识别失败，保留上一帧结果 %s", self._last_map_match.map_id)
+            else:
+                self._logger.warning("地图识别失败：小地图 %dx%d", content_rect.w, content_rect.h)
+            return self._last_map_match
+        previous = self._last_map_match
+        if previous is not None and not force and not self._map_identifier.should_refresh(previous, match):
+            # 刷新滞回：新结果没有明显优于旧结果时保留旧标定，避免导航点击跳变
+            self._logger.debug("地图识别刷新被滞回拒绝：旧 %s / 新 %s", previous.map_id, match.map_id)
+            return previous
+        if self._last_map_id is not None and self._last_map_id != match.map_id:
+            self._logger.warning("地图识别结果变化：%s -> %s", self._last_map_id, match.map_id)
+        pack = self.config.maps.get(match.map_id)
+        if pack is not None:
+            self._check_declared_orientation(pack, match)
+        self._last_map_match = match
+        self._last_map_id = match.map_id
+        self._calibration = self._build_calibration(frame, content_rect, match)
+        return match
+
+    def _check_declared_orientation(self, pack: MapPack, match: MapMatch) -> None:
+        """校验识别方向与 map.yaml 声明方向（只告警，不覆盖声明方向）。"""
+        try:
+            from .map_identify import detected_orientation
+
+            detected = detected_orientation(match)
+        except Exception:  # pragma: no cover - 兼容旧实现
+            return
+        if detected is not None and detected != pack.image_orientation:
+            self._logger.warning(
+                "地图 %s 的识别方向 %s 与 map.yaml 声明 %s 不一致，请重新标定（以声明方向参与坐标换算）",
+                pack.map_id,
+                detected.value,
+                pack.image_orientation.value,
+            )
+
+    def _build_calibration(self, frame: Frame, content_rect: Rect, match: MapMatch) -> BattleCalibration | None:
+        pack: MapPack | None = self.config.maps.get(match.map_id)
+        if pack is None:
+            return None
+        mode = _calibration_mode(self.config)
+        if mode is CalibrationMode.FULL_MAP:
+            calibration = BattleCalibration(
+                world_image=pack.transform(),
+                minimap_rect=content_rect,
+                mode=CalibrationMode.FULL_MAP,
+                window_rect=frame.window_rect,
+            )
+        else:
+            calibration = BattleCalibration(
+                world_image=pack.transform(),
+                minimap_rect=content_rect,
+                mode=CalibrationMode.MATCH,
+                window_rect=frame.window_rect,
+                image_to_minimap_matrix=match.affine,  # type: ignore[arg-type]
+            )
+        # 舰船定位的速度单位换算：世界宽度 / 小地图内容区宽度（米/像素）
+        world_width = float(pack.world_bounds[2] - pack.world_bounds[0])
+        if content_rect.w > 0 and world_width > 0:
+            try:
+                self._ship_locator.set_meters_per_pixel(world_width / float(content_rect.w))
+            except AttributeError:  # pragma: no cover - 兼容旧定位器
+                pass
+        return calibration
+
+    def force_map(self, map_id: str, now: float | None = None) -> MapMatch | None:
+        """调试/标定用：强制指定地图并构建整图模式标定，跳过 ORB 识别。"""
+        now = self._clock.now() if now is None else float(now)
+        pack = self.config.maps.get(map_id)
+        if pack is None:
+            return None
+        frame = self.latest_frame(now)
+        content_rect = self.minimap_content_rect(frame)
+        if frame is None or content_rect is None:
+            return None
+        self._calibration = BattleCalibration(
+            world_image=pack.transform(),
+            minimap_rect=content_rect,
+            mode=CalibrationMode.FULL_MAP,
+            window_rect=frame.window_rect,
+        )
+        match = MapMatch(
+            map_id=map_id,
+            inliers=0,
+            score=1.0,
+            affine=(0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+            reprojection_error=0.0,
+            timestamp=now,
+        )
+        world_width = float(pack.world_bounds[2] - pack.world_bounds[0])
+        if content_rect.w > 0 and world_width > 0:
+            try:
+                self._ship_locator.set_meters_per_pixel(world_width / float(content_rect.w))
+            except AttributeError:  # pragma: no cover
+                pass
+        self._last_map_match = match
+        self._last_map_id = map_id
+        self._last_map_check = now
+        return match
+
+    # ------------------------------------------------------------------
+    # 舰船定位
+    # ------------------------------------------------------------------
+    def locate_own_ship(self, now: float | None = None, frame: Frame | None = None) -> ShipPosition | None:
+        """定位自身舰船；世界坐标由当前标定换算（详细设计 5.7）。"""
+        now = self._clock.now() if now is None else float(now)
+        frame = frame or self.latest_frame(now)
+        if frame is None:
+            return None
+        mini = self.minimap_image(frame)
+        if mini is None:
+            return None
+        minimap_image, content_rect = mini
+        position = self._ship_locator.locate(minimap_image, now)
+        if position is None:
+            self._last_ship = None
+            return None
+        world_xy = position.world_xy
+        if world_xy is None and self._calibration is not None:
+            window_px = (content_rect.x + position.minimap_px[0], content_rect.y + position.minimap_px[1])
+            try:
+                world_xy = self._calibration.minimap_to_world(*window_px)
+            except ValueError:
+                world_xy = None
+        if world_xy is None and self._calibration is None:
+            self._last_ship = position
+            return position
+        result = ShipPosition(
+            minimap_px=position.minimap_px,
+            world_xy=world_xy,
+            heading_deg=position.heading_deg,
+            speed_mps=position.speed_mps,
+            confidence=position.confidence,
+            source=position.source,
+        )
+        self._last_ship = result
+        return result
+
+    # ------------------------------------------------------------------
+    # 死亡判定
+    # ------------------------------------------------------------------
+    def _hp_zero_ratio(self, frame: Frame) -> float | None:
+        """血条填充比例（详细设计 5.9）：按 battle_hud 区域与 HSV 阈值估算。"""
+        hud = self.profile.battle_hud
+        if hud.hp_bar_region is None or hud.hp_fill_hsv_lower is None or hud.hp_fill_hsv_upper is None:
+            return None
+        region = hud.hp_bar_region.to_pixels(frame.window_rect.w, frame.window_rect.h)
+        image = frame.crop(region)
+        if image is None or image.size == 0:
+            return None
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        lower = np.array(hud.hp_fill_hsv_lower, dtype=np.uint8)
+        upper = np.array(hud.hp_fill_hsv_upper, dtype=np.uint8)
+        mask = cv2.inRange(hsv, lower, upper)
+        ratio = float(np.count_nonzero(mask)) / float(mask.size)
+        return ratio
+
+    def check_death(
+        self,
+        now: float | None = None,
+        frame: Frame | None = None,
+        features: Mapping[str, MatchResult] | None = None,
+        ship: ShipPosition | None = None,
+    ) -> DeathSignals:
+        """汇总死亡信号并交给投票器（详细设计 5.9）。"""
+        now = self._clock.now() if now is None else float(now)
+        empty = DeathSignals(False, False, False, False, False, score=0.0, stable_ms=0, timestamp=now)
+        if self._death_detector is None:
+            return empty
+        frame = frame or self._last_frame
+        if features is None:
+            ids = self._battle_feature_ids(set())
+            features = self._feature_matcher.match_many(ids, frame) if frame is not None else {}
+        hud = self.profile.battle_hud
+        hp_bar_feature = "hp_bar_present" in self.profile.features
+        hp_bar_found = bool(features.get("hp_bar_present") and features["hp_bar_present"].found)
+        hp_bar_absent = hp_bar_feature and not hp_bar_found
+        hp_zero = False
+        if not hp_bar_absent and frame is not None:
+            ratio = self._hp_zero_ratio(frame)
+            if ratio is not None:
+                hp_zero = ratio < float(hud.hp_fill_zero_ratio)
+        banner = bool(features.get(hud.death_banner_feature) and features[hud.death_banner_feature].found)
+        spectator = any(
+            bool(features.get(feature_id) and features[feature_id].found) for feature_id in hud.spectator_features
+        )
+        if ship is None:
+            ship = self._last_ship
+        marker_lost = ship is None or ship.source == "lost"
+        votes = {
+            "hp_bar_absent": hp_bar_absent,
+            "hp_zero": hp_zero,
+            "banner": banner,
+            "marker_lost": marker_lost,
+            "spectator_ui": spectator,
+        }
+        signals = self._death_detector.update(votes, now)
+        self._last_death = signals
+        return signals
+
+    # ------------------------------------------------------------------
+    # 状态识别
+    # ------------------------------------------------------------------
+    def detect_state(self, now: float | None = None, frame: Frame | None = None) -> State | None:
+        """恢复流程用：按优先级识别当前界面（详细设计 5.4 / 6.4）。"""
+        now = self._clock.now() if now is None else float(now)
+        frame = frame or self.latest_frame(now)
+        if frame is None:
+            return None
+        return self._feature_matcher.detect_state(frame, priority=_DETECT_PRIORITY)
+
+    # ------------------------------------------------------------------
+    # 观察结果
+    # ------------------------------------------------------------------
+    def _feature_ids_for(self, state: State) -> tuple[str, ...]:
+        ids = tuple(self._state_features.get(state.value, ()))
+        if state.is_battle:
+            ids = tuple(dict.fromkeys(ids + _BATTLE_EXTRA_FEATURES))
+        return ids
+
+    def _battle_feature_ids(self, _unused: set[str]) -> tuple[str, ...]:
+        return tuple(dict.fromkeys(_BATTLE_EXTRA_FEATURES))
+
+    def observe(self, state: State | None = None, now: float | None = None) -> Observation:
+        """产生一帧 Observation；截屏失败时返回 window_missing/capture_error。"""
+        now = self._clock.now() if now is None else float(now)
+        current = state or self._state
+        frame = self.latest_frame(now)
+        if frame is None:
+            window_rect = self._last_window.client_rect.to_tuple() if self._last_window else (0, 0, 0, 0)
+            return Observation(
+                timestamp=now,
+                window_rect=window_rect,
+                window_missing=True,
+                capture_error=self._last_capture_error,
+                frame_id=self._last_frame.frame_id if self._last_frame else 0,
+                frame_timestamp=self._last_frame.timestamp if self._last_frame else 0.0,
+            )
+        self._feature_matcher.set_frame(frame)
+        ids = self._feature_ids_for(current)
+        features = self._feature_matcher.match_many(ids, frame) if ids else {}
+        # 死亡/结算特征即使当前状态表没列也一并匹配，保证 BATTLE_ACTIVE 判定完整
+        extra = [feature_id for feature_id in _BATTLE_EXTRA_FEATURES if feature_id not in features]
+        if extra and current.is_battle:
+            features.update(self._feature_matcher.match_many(extra, frame))
+        ship = self.locate_own_ship(now, frame)
+        death = self.check_death(now, frame, features, ship) if self._death_detector is not None else None
+        return Observation(
+            timestamp=now,
+            window_rect=frame.window_rect.to_tuple(),
+            features=features,
+            state_guess=None,
+            map_match=self._last_map_match,
+            ship=ship,
+            death=death,
+            window_missing=False,
+            capture_error=None,
+            frame_id=frame.frame_id,
+            frame_timestamp=frame.timestamp,
+        )
+
+    # ------------------------------------------------------------------
+    def stats(self) -> PerceptionStats:
+        stats = self._capture.stats() if self._capture is not None else None
+        capture_ms = float(getattr(stats, "avg_ms", 0.0)) if stats is not None else 0.0
+        frame_id = self._last_frame.frame_id if self._last_frame else 0
+        return PerceptionStats(
+            capture_count=self._capture_count,
+            capture_ms_avg=capture_ms,
+            frames=frame_id,
+            last_frame_id=frame_id,
+            map_identify_count=self._map_identify_count,
+        )
+
+
+def _calibration_mode(config: AppConfig) -> CalibrationMode:
+    value = str(getattr(config.global_config.navigation, "calibration_mode", "match") or "match").lower()
+    return CalibrationMode.FULL_MAP if value == "full_map" else CalibrationMode.MATCH

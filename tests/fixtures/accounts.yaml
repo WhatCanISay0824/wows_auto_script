@@ -1,0 +1,33 @@
+# =============================================================================
+# 测试用账号档案（T1/T7 测试 fixture）
+#
+# 与仓库根目录 accounts.yaml 结构一致；只允许本地别名与配置覆盖，
+# 禁止任何真实账号、密码、令牌字段（CLAUDE.md 安全约定）。
+# 测试工程 builder 会把它复制到临时工程根目录。
+# =============================================================================
+
+rotation:
+  enabled: false
+  mode: round_robin
+  max_battles_per_account: 3
+
+accounts:
+  - alias: alt1
+    display_name: 测试小号一号
+    profile: testclient
+    ship_id: test_ship
+    daily_battle_cap: 8
+    allowed_hours: null
+    max_battles_per_session: 2
+    enabled: true
+    notes: 测试档案一（只含本地别名）
+
+  - alias: alt2
+    display_name: 测试小号二号
+    profile: testclient
+    ship_id: test_ship
+    daily_battle_cap: 6
+    allowed_hours: ["09:00", "22:00"]
+    max_battles_per_session: 2
+    enabled: false
+    notes: 测试档案二（只含本地别名）

@@ -1,0 +1,544 @@
+"""程序入口（详细设计 2.1 / B.1）。
+
+用法::
+
+    python -m src.main --profile cn360                    # 使用全局 ship.ship_id
+    python -m src.main --profile cn360 --ship <ship_id>
+    python -m src.main --account alt1                     # 指定本地账号档案
+    python -m src.main --rotate                           # 按 accounts.yaml 轮换账号
+    python -m src.main --dry-run                          # 只校验配置，不启动
+
+安全口径（用户扩展需求）：
+- 账号只使用本地别名（accounts.yaml），不保存真实账号/密码/令牌，不自动登录；
+- 轮换到下一个账号时脚本停下来提示使用者手动切号并登录，按回车后继续；
+- 同一时间只运行一个账号、一个游戏窗口。
+"""
+
+from __future__ import annotations
+
+import argparse
+import inspect
+import logging
+import random
+import sys
+import time
+from dataclasses import dataclass, replace
+from datetime import date
+from pathlib import Path
+from typing import Any
+
+from .behavior.scheduler import BehaviorScheduler
+from .common.clock import Clock, SystemClock
+from .common.errors import ConfigError
+from .common.types import Observation, Rect, WindowInfo
+from .common.window import WindowLocator, set_dpi_awareness
+from .config.loader import load_app, load_project
+from .config.models import AccountsConfig, AppConfig
+from .config.validate import validate_app
+from .execution.queue import InputExecutor
+from .execution.safety import SafetyMonitor, SafetyWatchdog, Win32KeyStateSource
+from .execution.winput import make_backend
+from .navigation.autopilot import AutoPilotNavigator
+from .navigation.navigator import Navigator
+from .perception.capture import GdiCapture
+from .perception.engine import PerceptionEngine
+from .state_machine.accounts import AccountRotator
+from .state_machine.machine import MachineDeps, StateMachine
+from .state_machine.session import SessionController
+from .state_machine.ship_check import ShipChecker
+from .state_machine.steps import StepResult, StepSequenceExecutor
+from .storage.event_log import EventSink, configure_text_logging
+from .storage.screenshots import ScreenshotManager
+
+logger = logging.getLogger(__name__)
+
+EXIT_OK = 0
+EXIT_CONFIG_ERROR = 2
+EXIT_RUNTIME_ERROR = 1
+
+
+# ---------------------------------------------------------------------------
+# 运行时装配
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Runtime:
+    """一次会话需要的全部对象。"""
+
+    app: AppConfig
+    clock: Clock
+    window_locator: WindowLocator
+    capture: GdiCapture
+    engine: PerceptionEngine
+    events: EventSink
+    screenshots: ScreenshotManager
+    executor: InputExecutor
+    steps: StepSequenceExecutor
+    navigator: Navigator
+    behavior: BehaviorScheduler
+    session: SessionController
+    ship_checker: ShipChecker
+    machine: StateMachine
+    safety: SafetyMonitor
+    watchdog: SafetyWatchdog
+    bridge: Any
+    logger: logging.Logger
+
+
+class _EventBridge:
+    """把导航/行为/步骤回调桥接到日志线程，并维护当前战斗编号。"""
+
+    def __init__(self, events: EventSink) -> None:
+        self.events = events
+        self.battle_id: int | None = None
+
+    def _log(self, action_type: str, detail: Any) -> None:
+        payload = dict(detail) if isinstance(detail, dict) else {"detail": detail}
+        try:
+            self.events.log_action(self.battle_id, action_type, payload)
+        except Exception:  # 日志失败不阻塞运行
+            pass
+
+    def on_nav(self, event: str, detail: Any = None, **extra: Any) -> None:
+        payload: dict[str, Any] = dict(detail) if isinstance(detail, dict) else {}
+        payload.update(extra)
+        self._log(event, payload)
+
+    def on_behavior(self, event: str, detail: Any = None, **extra: Any) -> None:
+        self.on_nav(event, detail, **extra)
+
+    def on_step(self, result: StepResult) -> None:
+        self._log("exit_step", result.to_dict())
+
+    def on_session(self, event: str, detail: Any = None) -> None:
+        payload: dict[str, Any] = dict(detail) if isinstance(detail, dict) else {"detail": detail}
+        self._log(f"session_{event}", payload)
+
+    def to_screen(self, wx: int, wy: int) -> tuple[int, int]:
+        # 步骤执行器的客户区像素 -> 屏幕像素；由主循环更新窗口矩形
+        rect = self._window_rect
+        return rect.x + int(wx), rect.y + int(wy)
+
+    _window_rect: Rect = Rect(0, 0, 0, 0)
+
+    def update_window_rect(self, rect: Rect) -> None:
+        self._window_rect = rect
+
+
+def _build_runtime(app: AppConfig) -> Runtime:
+    config = app.global_config
+    clock: Clock = SystemClock()
+    text_logger = configure_text_logging(
+        app.project_root / config.paths.log_dir,
+        level=config.runtime.log_level,
+        max_bytes=config.logging.log_max_bytes,
+        backup_count=config.logging.log_backup_count,
+    )
+    dpi_mode = set_dpi_awareness()
+    text_logger.info("DPI 感知模式: %s（当前不是游戏运行环境属正常）", dpi_mode)
+
+    locator = WindowLocator(app.profile.window.process_names, app.profile.window.title_patterns)
+    capture = GdiCapture(
+        locator,
+        clock=clock,
+        require_foreground=app.profile.window.require_foreground,
+        capture_budget_ms=config.timeouts.capture_ms,
+    )
+    engine = PerceptionEngine(app, capture, clock)
+    events = EventSink(
+        app.project_root / config.paths.data_dir / "wows_script.db",
+        logger=text_logger,
+        fallback_log=app.project_root / config.logging.db_fallback_log,
+    )
+    events.start()
+    screenshots = ScreenshotManager.from_config(app.project_root, config, clock=clock, logger=text_logger)
+    executor = InputExecutor(make_backend(config.input), config.input, clock=clock)
+    executor.start()
+
+    bridge = _EventBridge(events)
+    navigator = Navigator(config.navigation, on_event=bridge.on_nav)
+    autopilot = AutoPilotNavigator(
+        config.navigation,
+        app.profile,
+        rng=random.Random(),
+        on_event=bridge.on_nav,
+        logger_=text_logger,
+    )
+    behavior = BehaviorScheduler(config.behavior, app.keymap, on_event=bridge.on_behavior)
+    steps = StepSequenceExecutor(app.keymap, to_screen=bridge.to_screen, on_step=bridge.on_step)
+    alias = app.account_alias
+
+    def _count_today(day: date) -> int | None:
+        try:
+            parameters = inspect.signature(events.count_battles_on).parameters
+        except (TypeError, ValueError):  # pragma: no cover
+            parameters = {}
+        if alias and "account_alias" in parameters:
+            return events.count_battles_on(day, account_alias=alias)  # type: ignore[call-arg]
+        return events.count_battles_on(day)
+
+    session = SessionController(
+        config.session,
+        config.safety,
+        clock,
+        count_battles_on=_count_today,
+        rng=random.Random(),
+        on_event=bridge.on_session,
+    )
+    ship_checker = ShipChecker(app, engine, steps, logger_=text_logger)
+    safety = SafetyMonitor.from_config(config.safety, Win32KeyStateSource(), clock=clock)
+    watchdog = SafetyWatchdog(safety)
+    machine = StateMachine(
+        MachineDeps(
+            config=app,
+            clock=clock,
+            perception=engine,
+            executor=executor,
+            events=events,
+            steps=steps,
+            navigator=navigator,
+            behavior=behavior,
+            session=session,
+            screenshots=screenshots,
+            ship_checker=ship_checker,
+            autopilot=autopilot,
+            window_info_provider=None,
+            rng=random.Random(),
+            logger_=text_logger,
+        )
+    )
+    return Runtime(
+        app=app,
+        clock=clock,
+        window_locator=locator,
+        capture=capture,
+        engine=engine,
+        events=events,
+        screenshots=screenshots,
+        executor=executor,
+        steps=steps,
+        navigator=navigator,
+        behavior=behavior,
+        session=session,
+        ship_checker=ship_checker,
+        machine=machine,
+        safety=safety,
+        watchdog=watchdog,
+        bridge=bridge,
+        logger=text_logger,
+    )
+
+
+_LAST_WINDOW: list[WindowInfo | None] = [None]
+
+
+def _teardown(runtime: Runtime) -> None:
+    logger = runtime.logger
+    try:
+        runtime.watchdog.stop()
+    except Exception:
+        pass
+    try:
+        if runtime.executor.is_running:
+            runtime.executor.stop(drain=True)
+    except Exception as exc:
+        logger.warning("停止输入线程失败: %s", exc)
+    try:
+        runtime.screenshots.cleanup_session()
+    except Exception:
+        pass
+    try:
+        runtime.events.stop(drain=True)
+    except Exception as exc:
+        logger.warning("停止日志线程失败: %s", exc)
+    try:
+        runtime.engine.close()
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# 单账号会话主循环
+# ---------------------------------------------------------------------------
+
+
+def _run_session(runtime: Runtime, *, max_battles: int | None = None) -> tuple[str, int]:
+    """运行一个账号的一次会话，返回 (停止原因, 完成场次)。"""
+    machine = runtime.machine
+    clock = runtime.clock
+    engine = runtime.engine
+    executor = runtime.executor
+    monitor = runtime.safety
+    watchdog = runtime.watchdog
+    logger_ = runtime.logger
+    loop_hz = max(1, int(runtime.app.global_config.runtime.loop_hz))
+    tick_s = 1.0 / loop_hz
+    if max_battles is not None and max_battles > 0:
+        machine.set_rotation_limit(max_battles)
+    else:
+        machine.set_rotation_limit(None)
+
+    machine.start(clock.now())
+    watchdog.start()
+    _LAST_WINDOW[0] = runtime.window_locator.find()
+    last_window_at = 0.0
+    was_paused = False
+    next_tick = clock.now()
+    try:
+        while not machine.finished:
+            now = clock.now()
+            monitor.heartbeat(now)
+            controller = monitor.controller()
+            stop_request = controller.stop_request
+            if stop_request is not None and machine.state.value != "STOPPING":
+                machine.request_stop(str(stop_request.reason), stop_request.detail)
+            if controller.paused:
+                was_paused = True
+            elif was_paused:
+                was_paused = False
+                machine.request_resume()
+
+            if now - last_window_at >= 1.0:
+                last_window_at = now
+                info = runtime.window_locator.find()
+                _LAST_WINDOW[0] = info
+                machine.update_window_info(info)
+                if info is None:
+                    machine.request_pause("window_lost", "找不到游戏窗口")
+                elif info.foreground:
+                    _LAST_WINDOW[0] = info
+
+            info = _LAST_WINDOW[0]
+            if info is not None:
+                observation = engine.observe(state=machine.state, now=now)
+                if observation.window_rect[2] > 0:
+                    runtime.bridge.update_window_rect(Rect(*observation.window_rect))
+                actions = machine.step(observation, now)
+                if actions:
+                    executor.submit(actions)
+            else:
+                observation = Observation(
+                    timestamp=now,
+                    window_rect=(0, 0, 0, 0),
+                    window_missing=True,
+                    capture_error="游戏窗口不存在",
+                )
+                machine.step(observation, now)
+
+            next_tick += tick_s
+            sleep_s = next_tick - clock.now()
+            if sleep_s > 0:
+                time.sleep(sleep_s)
+            else:
+                next_tick = clock.now()
+    except KeyboardInterrupt:
+        logger_.warning("收到 Ctrl+C，停止会话")
+        machine.request_stop("manual", "KeyboardInterrupt")
+    finally:
+        try:
+            watchdog.stop()
+        except Exception:
+            pass
+    stop_reason = "unknown"
+    if machine.stop_request is not None:
+        stop_reason = str(machine.stop_request.reason)
+    return stop_reason, machine.battles_completed
+
+
+# ---------------------------------------------------------------------------
+# 配置/账号加载
+# ---------------------------------------------------------------------------
+
+
+def _load_app(root: Path, profile: str, ship: str | None, alias: str | None) -> AppConfig:
+    kwargs: dict[str, Any] = {"ship_id": ship}
+    parameters = inspect.signature(load_app).parameters
+    if alias:
+        if "account" not in parameters:
+            raise ConfigError(
+                [
+                    _issue(
+                        "账号功能尚未就绪：src/config/loader.py 的 load_app 还没有 account 参数。"
+                        "请等待账号支持任务（T7）完成，或先不使用 --account/--rotate。"
+                    )
+                ]
+            )
+        kwargs["account"] = alias
+    return load_app(root, profile, **kwargs)
+
+
+def _issue(message: str):  # 延迟导入，避免顶层循环依赖
+    from .common.errors import Severity, ValidationIssue
+
+    return ValidationIssue(Severity.ERROR, "account_unsupported", "src.main", message)
+
+
+def _load_accounts(root: Path) -> AccountsConfig | None:
+    try:
+        from .config.loader import load_accounts
+    except ImportError:
+        return None
+    try:
+        return load_accounts(root)
+    except TypeError:
+        return None
+
+
+def _print_issues(issues: list[Any]) -> None:
+    for issue in issues:
+        print(issue.format(), file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="python -m src.main",
+        description="战舰世界联合作战（PvE）本地托管脚本（截屏+模拟键鼠，仅本地技术研究）",
+    )
+    parser.add_argument("--root", default=".", help="项目根目录（默认当前目录）")
+    parser.add_argument("--profile", default="cn360", help="客户端配置 id（默认 cn360）")
+    parser.add_argument("--ship", default=None, help="会话固定船只 id（默认用 config.yaml 的 ship.ship_id）")
+    parser.add_argument("--account", default=None, help="账号档案别名（accounts.yaml 中的 alias）")
+    parser.add_argument("--rotate", action="store_true", help="按 accounts.yaml 轮换启用账号（需手动切号）")
+    parser.add_argument("--max-battles", type=int, default=None, help="单账号本次会话最多场次（覆盖配置）")
+    parser.add_argument("--dry-run", action="store_true", help="只校验配置并打印摘要，不启动脚本")
+    parser.add_argument("--log-level", default=None, help="覆盖文本日志级别，例如 DEBUG")
+    parser.add_argument("--version", action="version", version="wows_script 0.1.0")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    root = Path(args.root).expanduser().resolve()
+    if not (root / "config.yaml").is_file():
+        print(f"找不到配置文件: {root / 'config.yaml'}", file=sys.stderr)
+        return EXIT_CONFIG_ERROR
+
+    # 账号档案
+    accounts = _load_accounts(root) if (args.rotate or args.account) else None
+    rotator: AccountRotator | None = None
+    aliases: list[str | None]
+    if args.rotate:
+        if accounts is None:
+            print("当前版本暂不支持 --rotate（账号支持任务尚未完成）", file=sys.stderr)
+            return EXIT_CONFIG_ERROR
+        rotator = AccountRotator(accounts)
+        if not rotator.enabled:
+            print(
+                "accounts.yaml 中没有启用的账号：请至少将一个 accounts[].enabled 设为 true，"
+                "并把 rotation.enabled 设为 true",
+                file=sys.stderr,
+            )
+            return EXIT_CONFIG_ERROR
+        aliases = [account.alias for account in rotator.plan()]
+    elif args.account:
+        if accounts is None:
+            print("当前版本暂不支持 --account（账号支持任务尚未完成）", file=sys.stderr)
+            return EXIT_CONFIG_ERROR
+        if accounts.get(args.account) is None:
+            print(f"accounts.yaml 中找不到账号别名: {args.account}", file=sys.stderr)
+            return EXIT_CONFIG_ERROR
+        aliases = [args.account]
+    else:
+        aliases = [None]
+
+    # 校验（以第一个账号/默认 profile 为基准；后续每个账号运行前会再校验一次）
+    try:
+        loaded = load_project(root, args.profile, ship_id=args.ship)
+    except ConfigError as exc:
+        _print_issues(exc.errors + exc.warnings)
+        return EXIT_CONFIG_ERROR
+    issues = list(loaded.issues)
+    try:
+        app0 = _load_app(root, args.profile, args.ship, aliases[0])
+    except ConfigError as exc:
+        _print_issues(exc.errors + exc.warnings)
+        return EXIT_CONFIG_ERROR
+    issues.extend(validate_app(app0))
+    errors = [issue for issue in issues if issue.is_error]
+    warnings = [issue for issue in issues if not issue.is_error]
+    _print_issues(errors)
+    if warnings:
+        print(f"校验警告 {len(warnings)} 条：", file=sys.stderr)
+        _print_issues(warnings)
+    if errors:
+        print(f"配置校验失败：{len(errors)} 个错误，{len(warnings)} 个警告（退出码 2）", file=sys.stderr)
+        return EXIT_CONFIG_ERROR
+    print(
+        f"配置校验通过：profile={app0.profile.client_id} ship={app0.ship.ship_id or '(未配置)'} "
+        f"maps={len(app0.maps)} 账号={app0.account_alias or '(未指定)'}"
+    )
+    if args.dry_run:
+        print("--dry-run：未启动脚本。")
+        return EXIT_OK
+
+    # 逐账号运行
+    rotating = bool(rotator is not None and len(aliases) > 1)
+    no_battle_streak = 0
+    try:
+        while True:
+            alias = rotator.current.alias if rotator is not None else aliases[0] if len(aliases) == 1 else None
+            app = _load_app(root, args.profile, args.ship, alias)
+            problems = validate_app(app)
+            fatal = [issue for issue in problems if issue.is_error]
+            if fatal:
+                _print_issues(fatal)
+                print(f"账号 {alias or '(默认)'} 的配置校验失败，停止", file=sys.stderr)
+                return EXIT_CONFIG_ERROR
+            if args.log_level:
+                app = replace(
+                    app,
+                    global_config=replace(
+                        app.global_config,
+                        runtime=replace(app.global_config.runtime, log_level=args.log_level),
+                    ),
+                )
+            _LAST_WINDOW[0] = None
+            runtime = _build_runtime(app)
+            if app.account is not None:
+                runtime.logger.info("当前账号档案: %s", app.account.alias)
+            limit = args.max_battles
+            if limit is None and rotator is not None:
+                limit = rotator.current_limit()
+            reason, battles = _run_session(runtime, max_battles=limit)
+            _teardown(runtime)
+            print(f"账号 {alias or '(默认)'} 会话结束：原因={reason} 场次={battles}")
+            if rotator is not None:
+                rotator.record_battle(alias)
+            if not rotating:
+                return EXIT_OK if reason not in ("game_crash", "runtime_error") else EXIT_RUNTIME_ERROR
+            if reason in ("emergency_stop", "manual"):
+                return EXIT_OK
+            if battles == 0:
+                no_battle_streak += 1
+                if no_battle_streak >= max(1, len(aliases)):
+                    print("所有账号本次都无法开始战斗（可能已达每日上限/不在允许时段），退出。")
+                    return EXIT_OK
+            else:
+                no_battle_streak = 0
+            rotator.advance()
+            next_alias = rotator.current.alias
+            print()
+            print("=" * 72)
+            print(f"请手动切换到账号「{next_alias}」：")
+            print("  1. 在游戏客户端退出当前账号并登录目标账号（脚本不会代登录、不保存密码）；")
+            print("  2. 确认已回到港口界面、船只与空装备符合配置；")
+            print("  3. 回到本控制台按回车继续。")
+            print("=" * 72)
+            try:
+                input("切换完成后按回车继续（Ctrl+C 退出）...")
+            except EOFError:
+                return EXIT_OK
+    except KeyboardInterrupt:
+        print("用户中断，退出。")
+        return EXIT_OK
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())

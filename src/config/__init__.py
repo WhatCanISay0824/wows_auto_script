@@ -1,6 +1,8 @@
 """配置与地图包加载、校验。"""
 
 from .models import (
+    AccountConfig,
+    AccountsConfig,
     AppConfig,
     BattleHudConfig,
     BehaviorConfig,
@@ -32,6 +34,8 @@ from .models import (
 )
 
 __all__ = [
+    "AccountConfig",
+    "AccountsConfig",
     "AppConfig",
     "BattleHudConfig",
     "BehaviorConfig",

@@ -16,4 +16,5 @@ src = ["src", "tests"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
-ignore = ["E501"]
+# SIM105：清理/收尾路径大量使用 try/except/pass 是有意为之，不强制改 contextlib.suppress
+ignore = ["E501", "SIM105"]

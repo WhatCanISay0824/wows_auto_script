@@ -1,0 +1,39 @@
+# =============================================================================
+# 账号档案（本地别名 + 每账号独立配置 + 会话间轮换）
+#
+# 安全约定（必须遵守）：
+# - 本文件只允许保存**本地别名**（alias）与配置覆盖，禁止填写真实账号、密码、
+#   令牌、验证码或任何登录凭据；脚本不会自动登录、不会代替你在客户端输入密码。
+# - 真实登录与切号由你在游戏客户端手动完成；脚本只负责按别名隔离统计与调度，
+#   并在需要换号时暂停提示你手动切换。
+#
+# 用法：
+#   python -m src.main --account alt1            # 只跑指定账号档案
+#   python -m src.main --rotate                  # 按 rotation 配置轮换运行
+# =============================================================================
+
+rotation:
+  enabled: false          # 是否启用会话间账号轮换
+  mode: round_robin       # v1 仅支持 round_robin
+  max_battles_per_account: 6   # 每个账号在一个轮换周期内最多打几场
+
+accounts:
+  - alias: alt1
+    display_name: 小号一号（本地别名）
+    profile: cn360              # 客户端配置，可留空使用命令行 --profile
+    ship_id: placeholder        # 会话固定船只，留空使用全局 ship.ship_id
+    daily_battle_cap: 30        # 覆盖 session.daily_battle_cap
+    allowed_hours: null         # 覆盖 session.allowed_hours，null 表示继承
+    max_battles_per_session: 6  # 本账号单次会话最多场次
+    enabled: false              # 示例档案默认关闭，配置好后改为 true
+    notes: 示例档案。真实账号登录请在客户端手动完成，本文件不保存任何凭据。
+
+  - alias: alt2
+    display_name: 小号二号（本地别名）
+    profile: cn360
+    ship_id: placeholder
+    daily_battle_cap: 20
+    allowed_hours: ["09:00", "22:00"]
+    max_battles_per_session: 4
+    enabled: false
+    notes: 示例档案，默认关闭。

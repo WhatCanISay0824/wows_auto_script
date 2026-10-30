@@ -344,6 +344,14 @@ class NavigationConfig:
     """
 
     surface: str = "minimap"  # v1 只实现 minimap；full_map 未实现，校验器拒绝
+    # 导航模式（用户简化需求）：autopilot = 开局点小地图敌区后交给游戏自动驾驶，不碰 WASD；
+    # waypoints = 使用地图包出生点/航线逐点导航（需要地图识别与标定）
+    mode: str = "autopilot"
+    # 敌区目标：center 或 symmetric（我方出生点关于地图中心的对称点，x 固定到中线）
+    autopilot_target: str = "symmetric"
+    autopilot_reclick_s: tuple[float, float] = (60.0, 120.0)  # 重发航点间隔（到达/卡住自动重发）
+    autopilot_overshoot: float = 0.6  # waypoints 旧模式预留；autopilot 不使用
+    autopilot_offset: tuple[float, float] = (0.0, 0.0)  # 目标相对归一化坐标的微调
     arrival_m: float = 400.0
     overshoot_m: float = 800.0
     overshoot_cos_threshold: float = -0.5
@@ -521,6 +529,45 @@ class PerceptionConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class AccountConfig:
+    """一个本地账号档案（用户新增需求：多账号选择与轮换）。
+
+    安全口径：只保存使用者自定义的**本地别名**与配置覆盖，不保存真实登录账号、
+    密码、令牌，也不包含任何代登录信息；真实登录与切号仍由使用者在客户端手动完成。
+    """
+
+    alias: str
+    display_name: str = ""
+    profile: str | None = None  # 客户端配置 id，None 表示用命令行/全局默认
+    ship_id: str | None = None  # 会话固定船只，None 表示用全局 ship.ship_id
+    daily_battle_cap: int | None = None  # 覆盖 session.daily_battle_cap
+    allowed_hours: tuple[str, str] | None = None  # 覆盖 session.allowed_hours
+    max_battles_per_session: int | None = None  # 本账号单次会话最多场次
+    enabled: bool = True
+    notes: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class AccountsConfig:
+    """账号档案集合与轮换策略。"""
+
+    accounts: tuple[AccountConfig, ...] = ()
+    rotation_enabled: bool = False
+    rotation_mode: str = "round_robin"  # v1 仅 round_robin
+    max_battles_per_account: int = 6  # 每个账号在一个轮换周期内最多打几场
+    accounts_file: str = "accounts.yaml"
+
+    def get(self, alias: str) -> AccountConfig | None:
+        for account in self.accounts:
+            if account.alias == alias:
+                return account
+        return None
+
+    def enabled_accounts(self) -> tuple[AccountConfig, ...]:
+        return tuple(account for account in self.accounts if account.enabled)
+
+
+@dataclass(frozen=True, slots=True)
 class GlobalConfig:
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     paths: PathsConfig = field(default_factory=PathsConfig)
@@ -534,6 +581,7 @@ class GlobalConfig:
     input: InputConfig = field(default_factory=InputConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     perception: PerceptionConfig = field(default_factory=PerceptionConfig)
+    accounts: AccountsConfig = field(default_factory=AccountsConfig)
     project_root: Path | None = None
     config_path: Path | None = None
 
@@ -550,12 +598,17 @@ class AppConfig:
     project_root: Path
     config_hash: str
     sources: Mapping[str, str] = field(default_factory=dict)
+    account: AccountConfig | None = None
 
     def map_pack(self, map_id: str) -> MapPack:
         try:
             return self.maps[map_id]
         except KeyError as exc:
             raise KeyError(f"未加载地图包: {map_id}") from exc
+
+    @property
+    def account_alias(self) -> str | None:
+        return self.account.alias if self.account else None
 
     @property
     def current_map(self) -> MapPack | None:

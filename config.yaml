@@ -30,31 +30,40 @@ ship:
   verify_each_battle: true     # 每场开始前重新确认船只与空装备
 
 map:
-  auto_identify: true          # 运行时自动识别地图
-  forced_map_id: null          # 非空时强制使用该地图（调试用）
+  auto_identify: false         # autopilot 模式不需要识别地图；waypoints 模式才需要
+  forced_map_id: null          # 非空时强制使用该地图（waypoints 调试用）
   spawn_tolerance_m: 500       # 出生点识别容差（米），与验收指标 14.3/14.5 对齐
   default_spawn_id: null       # 出生点识别失败时的回退出生点，null 表示无
   expected_minimap_scale: null # 期望小地图缩放比例，null 表示按底图与小地图尺寸自动推导
 
 navigation:
-  surface: minimap             # v1 只实现 minimap；full_map 未实现，校验器拒绝
-  arrival_m: 400               # 到达航点判定距离（世界米，仅作上限）
-  overshoot_m: 800             # 越点判定距离
+  # ===== 导航模式（用户简化需求）=====
+  # autopilot：开局在小地图上点“我方出生点关于地图中心的对称区域”，交给游戏自动驾驶，
+  #            之后不碰 WASD，也不识别地图/航线；只需要客户端小地图标定与自身标记模板。
+  # waypoints：传统模式，需要地图包、地图识别、出生点与航线标定（保留可选）。
+  mode: autopilot
+  autopilot_target: symmetric  # center=小地图中心；symmetric=对称敌区且横坐标固定到中线
+  autopilot_reclick_s: [60, 120]  # 周期重发航点间隔（到达/卡住后自动重发，避免停船）
+  autopilot_overshoot: 0.6     # waypoints 旧模式预留，autopilot 不使用
+  autopilot_offset: [0.0, 0.0] # 目标点相对归一化坐标微调（[dx, dy]，0 为不偏移）
+  surface: minimap             # 点击面：minimap（v1 只支持）
+  arrival_m: 400               # waypoints 模式到达判定距离（世界米，仅作上限）
+  overshoot_m: 800             # waypoints 模式越点判定距离
   overshoot_cos_threshold: -0.5  # 越点判定的方向余弦阈值
-  click_retry: 2               # 点击后未移动的重试次数
-  click_confirm_first_s: 8     # 首次点击后的移动确认窗口
-  click_confirm_s: 5           # 后续点击后的移动确认窗口
-  move_confirm_px: 3           # 确认已移动的最小位移（小地图像素，约 120 米）
-  click_min_interval_s: 4      # 两次导航点击的最小间隔
-  retry_interval_s: 4          # 重试点击间隔
-  stuck_window_s: 20           # 卡住判定观察窗口（2Hz 下约 40 帧）
-  stuck_distance_px: 3         # 观察窗口内允许的最小位移（小地图像素）
-  max_skipped: 3               # 连续跳过航点上限，超过后放弃导航
+  click_retry: 2               # waypoints 模式点击重试次数
+  click_confirm_first_s: 8     # waypoints 模式首次点击后的移动确认窗口
+  click_confirm_s: 5           # waypoints 模式后续点击后的移动确认窗口
+  move_confirm_px: 3           # waypoints 模式确认已移动的最小位移（小地图像素，约 120 米）
+  click_min_interval_s: 4      # waypoints 模式两次导航点击的最小间隔
+  retry_interval_s: 4          # waypoints 模式重试点击间隔
+  stuck_window_s: 20           # waypoints 模式卡住判定观察窗口
+  stuck_distance_px: 3         # waypoints 模式观察窗口内允许的最小位移
+  max_skipped: 3               # waypoints 模式连续跳过航点上限
   ship_speed_window_s: 4       # 速度估计窗口
   ship_speed_samples: 9        # 速度估计最少位置样本
   ship_lost_degrade_s: 3       # 自身位置丢失后进入降级模式的时间
   ship_lost_abandon_s: 10      # 自身位置丢失后放弃导航的时间
-  route_end_action: wait       # 航线结束后行为：v1 仅支持 wait
+  route_end_action: wait       # waypoints 模式航线结束后行为：v1 仅支持 wait
   full_map_rect: null          # 全屏地图归一化区域（v1 未实现）
   full_map_toggle_key: full_map  # 全屏地图开关，对应 keys.yaml 动作名
 
@@ -177,3 +186,9 @@ logging:
   diagnostics_max_mb: 100              # 诊断截图总大小上限（MB）
   disk_warn_gb: 2                      # 磁盘剩余低于该值时只写文本日志、不存截图
   disk_pause_gb: 0.5                   # 磁盘剩余低于该值时进入暂停
+
+accounts:
+  rotation_enabled: false              # 是否启用会话间账号轮换（--rotate 可覆盖）
+  rotation_mode: round_robin           # v1 仅支持 round_robin
+  max_battles_per_account: 6           # 每个账号在一个轮换周期内最多场次
+  accounts_file: accounts.yaml         # 账号档案文件（只存本地别名，不存凭据）

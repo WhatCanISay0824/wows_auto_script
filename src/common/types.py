@@ -47,6 +47,7 @@ class ActionKind(StrEnum):
     """输入动作类型（详细设计 9.1）。"""
 
     CLICK_ABS = "click_abs"
+    MOVE_ABS = "move_abs"
     MOVE_REL = "move_rel"
     KEY_DOWN = "key_down"
     KEY_UP = "key_up"
@@ -88,6 +89,11 @@ class Action:
     @classmethod
     def click_abs(cls, x: int, y: int, label: str = "", priority: int = 10) -> Action:
         return cls(ActionKind.CLICK_ABS, x=int(x), y=int(y), label=label, priority=priority)
+
+    @classmethod
+    def move_abs(cls, x: int, y: int, label: str = "", priority: int = 10) -> Action:
+        """绝对移动到 (x, y)，不按下鼠标（用于先把光标移到滚动/点击区域）。"""
+        return cls(ActionKind.MOVE_ABS, x=int(x), y=int(y), label=label, priority=priority)
 
     @classmethod
     def move_rel(cls, dx: int, dy: int, label: str = "") -> Action:
