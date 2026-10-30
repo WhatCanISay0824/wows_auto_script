@@ -53,6 +53,19 @@ python -m pip install -r requirements.txt
 python -m pip install pytest ruff
 ```
 
+> **注意（本机）**：有的 Windows 环境里 `python` 是应用商店占位符，执行无输出或提示找不到；
+> 本项目统一用 `py -3.14`，或仓库根目录的快捷脚本：
+>
+> ```powershell
+> .\wows.cmd --dry-run
+> .\wows.cmd --ship-name 铁公爵
+> .\wows-tool.cmd validate --root .
+> .\wows-tool.cmd calibrate_ship --root . --ship-id iron_duke --display-name 铁公爵 --screenshot "screenshots\铁公爵港口.png"
+> ```
+>
+> 等价完整命令为 `py -3.14 -m src.main ...`、`py -3.14 -m src.tools.<工具> ...`。
+> 如果中文输出乱码，先在 PowerShell/cmd 执行 `chcp 65001`（快捷脚本已自动切换代码页）。
+
 ## 导航模式：简化 autopilot（当前默认）
 
 使用者确认的简化方案：**不做地图识别、不标定航线**。
@@ -100,18 +113,19 @@ python -m src.main --ship-name 列宁格勒  # 按船名选择固定船只（脚
 ```
 
 > 每次托管的船可以不同：用 `--ship-name` 输入船名即可，脚本会在底部船只轮播条里滚轮查找并点击选中。
-> 每艘**新船**首次使用前需要做一次约 10 秒的标定（生成该船卡片），已有 `profiles/cn360/ships/leningrad/`
-> 可直接用。以换成“铁公爵”为例：
+> 每艘**新船**首次使用前需要做一次约 10 秒的标定（生成该船卡片）。当前已有两艘可直接用：
+> `profiles/cn360/ships/leningrad/`（列宁格勒）、`profiles/cn360/ships/iron_duke/`（铁公爵）。
+> 以新增“某新船”为例：
 >
 > ```powershell
-> # 1) 在港口截图（底部轮播条里能看到铁公爵卡片，最好选中它）
-> # 2) 生成新船档案（GUI 里确认显示名“铁公爵”，框选卡片：只框船体剪影+船名，避开 +50%/等级徽章与选中边框）
-> python -m src.tools.calibrate_ship --root . --ship-id iron_duke --display-name 铁公爵 --screenshot screenshots/铁公爵港口.png
+> # 1) 在港口截图（底部轮播条里能看到该船卡片，最好选中它）
+> # 2) 生成新船档案（GUI 里确认显示名，框选卡片：只框船体剪影+船名，避开 +50%/等级徽章与选中边框）
+> .\wows-tool.cmd calibrate_ship --root . --ship-id <新船id> --display-name <船名> --screenshot "screenshots\<截图>.png"
 > # 3) 之后启动时直接输入船名，脚本自动找船并选中
-> python -m src.main --ship-name 铁公爵
+> .\wows.cmd --ship-name <船名>
 > ```
 >
-> 可选：把该船战斗画面左下角血条截图裁成 `ships/iron_duke/hp_bar.png`（`hp_bar_template: hp_bar.png`），
+> 可选：把该船战斗画面左下角血条截图裁成 `ships/<新船id>/hp_bar.png`（`hp_bar_template: hp_bar.png`），
 > 用于“血条消失”死亡信号；不提供也能跑，死亡判定改用死亡提示/结算界面兜底。
 
 轮换流程：当前账号达到 `max_battles_per_session`（或每日上限/允许时段）后，脚本停止会话并在
