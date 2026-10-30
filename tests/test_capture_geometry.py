@@ -400,6 +400,20 @@ def test_capture_uses_print_window_fallback() -> None:
     assert capture.stats.successes == 1
 
 
+def test_capture_remembers_print_window_mode_after_fallback() -> None:
+    black = np.zeros((CLIENT_RECT.h, CLIENT_RECT.w, 3), dtype=np.uint8)
+    recovered = _noise(CLIENT_RECT.w, CLIENT_RECT.h, seed=11)
+    source = FakeSource(black, print_image=recovered)
+    capture = _make_capture(FakeLocator(_window_info()), source)
+    first = capture.capture()
+    second = capture.capture()
+    assert first.image is recovered
+    assert second.image is recovered
+    # 第二次不再先尝试黑屏的 GDI，直接走 PrintWindow
+    assert source.grab_calls == [(HWND, CLIENT_RECT)]
+    assert len(source.print_calls) == 2
+
+
 def test_capture_rejects_black_fallback_result() -> None:
     black = np.zeros((CLIENT_RECT.h, CLIENT_RECT.w, 3), dtype=np.uint8)
     source = FakeSource(black, print_image=black.copy())

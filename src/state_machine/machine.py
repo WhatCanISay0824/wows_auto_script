@@ -109,6 +109,7 @@ class StateMachine:
         self._port_phase = "idle"
         self._port_wait_until = 0.0
         self._port_start_attempts = 0
+        self._port_visits = 0
         self._port_loadout_started = False
         # EXIT 子状态
         self._exit_retried = False
@@ -419,7 +420,9 @@ class StateMachine:
         self._exit_method = "none"
         self._exit_error = None
         self._port_phase = "idle"
-        between = self.deps.session.sample_between_battle_s()
+        self._port_visits += 1
+        # 会话开始后第一次进港口不需要“两场之间”的等待，直接做校验/开局；之后按随机间隔冷却
+        between = 0.0 if self._port_visits <= 1 else self.deps.session.sample_between_battle_s()
         self._port_wait_until = now + between
         self._port_start_attempts = 0
         self._port_loadout_started = False
@@ -1084,6 +1087,13 @@ class StateMachine:
             self._resume_requested = False
             self._logger.info("收到恢复指令，重新识别界面")
             self._transition(State.INIT, "user_resume")
+            return []
+        # 因窗口失去焦点/暂不可用而暂停时，窗口恢复后自动回到 INIT（不需要再按 F11）
+        if self._pause_reason in ("window_lost", "window_unfocused", "window_unavailable"):
+            info = self._window_info
+            if info is not None and info.available and info.foreground and not observation.window_missing:
+                self._logger.info("游戏窗口已回到前台，自动恢复")
+                self._transition(State.INIT, "window_focus_restored")
         return []
 
     def _enter_stopping(self, now: float, reason: str) -> None:

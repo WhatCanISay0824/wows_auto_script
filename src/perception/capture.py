@@ -573,6 +573,10 @@ class GdiCapture:
         self._successes = 0
         self._failures = 0
         self._slow_frames = 0
+        # 有些游戏（如战舰世界）窗口 BitBlt 始终黑屏，只有 PrintWindow 可用：
+        # 首次兜底成功后固定使用 PrintWindow，避免每帧先黑屏再兜底（省一半耗时、不刷日志）
+        self._print_window_only = False
+        self._print_window_notice_logged = False
 
     # --- 查询 ---------------------------------------------------------
     @property
@@ -632,8 +636,11 @@ class GdiCapture:
 
     def _capture_once(self) -> Frame:
         hwnd, rect = self._resolve_window()
-        image = self._source.grab(hwnd, rect)
-        image = self._validate_image(image, hwnd, rect)
+        if self._print_window_only:
+            image = self._grab_print_window(hwnd, rect)
+        else:
+            image = self._source.grab(hwnd, rect)
+            image = self._validate_image(image, hwnd, rect)
         self._frame_id += 1
         frame = Frame(
             image=image,
@@ -643,6 +650,24 @@ class GdiCapture:
         )
         self._last_frame = frame
         return frame
+
+    def _grab_print_window(self, hwnd: int, rect: Rect) -> np.ndarray:
+        """PrintWindow 固定模式：直接取图并校验，失败抛 CaptureUnavailable。"""
+        fallback = getattr(self._source, "grab_print_window", None) if self._enable_print_window else None
+        if not callable(fallback):
+            raise CaptureUnavailable("当前截屏源不支持 PrintWindow")
+        recovered = fallback(hwnd, rect)
+        expected = (rect.h, rect.w, 3)
+        if not isinstance(recovered, np.ndarray) or recovered.shape != expected:
+            raise CaptureUnavailable("PrintWindow 返回的数据尺寸异常")
+        reason = frame_invalid_reason(
+            recovered,
+            mean_threshold=self._black_mean_threshold,
+            std_threshold=self._black_std_threshold,
+        )
+        if reason is not None:
+            raise CaptureUnavailable(f"PrintWindow 画面不可用: {reason}")
+        return recovered
 
     def _resolve_window(self) -> tuple[int, Rect]:
         info = self._locate()
@@ -693,7 +718,11 @@ class GdiCapture:
         )
         if reason is None:
             return image
-        _log.warning("截屏画面不可用（%s），尝试 PrintWindow 兜底", reason)
+        if self._print_window_notice_logged:
+            _log.debug("GDI 截屏仍不可用（%s），继续使用 PrintWindow", reason)
+        else:
+            _log.info("GDI 截屏不可用（%s），改用 PrintWindow 截屏模式", reason)
+            self._print_window_notice_logged = True
         fallback = getattr(self._source, "grab_print_window", None) if self._enable_print_window else None
         if not callable(fallback):
             raise CaptureUnavailable(f"截屏画面不可用: {reason}")
@@ -714,18 +743,22 @@ class GdiCapture:
         )
         if reason2 is not None:
             raise CaptureUnavailable(f"截屏画面不可用（{reason}），PrintWindow 兜底仍不可用（{reason2}）")
-        _log.warning("PrintWindow 兜底成功，当前帧改由 PrintWindow 获取")
+        self._print_window_only = True
+        _log.info("PrintWindow 截屏可用，后续固定使用 PrintWindow 模式")
         return recovered
 
     def _record_duration(self, duration_ms: float) -> None:
         self._durations.append(float(duration_ms))
         if duration_ms > self._capture_budget_ms:
             self._slow_frames += 1
-            _log.warning(
-                "截屏耗时 %.1f ms 超过预算 %.1f ms",
-                duration_ms,
-                self._capture_budget_ms,
-            )
+            # PrintWindow 单帧约 100ms，超预算是常态；仅首次与每 60 帧提示一次，避免刷屏
+            if self._slow_frames == 1 or self._slow_frames % 60 == 0:
+                _log.info(
+                    "截屏耗时 %.1f ms 超过预算 %.1f ms（累计 %d 帧）",
+                    duration_ms,
+                    self._capture_budget_ms,
+                    self._slow_frames,
+                )
 
     # --- 生命周期 -----------------------------------------------------
     def close(self) -> None:

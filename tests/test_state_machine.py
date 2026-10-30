@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from src.common.clock import FakeClock
 from src.common.errors import StopRequest
 from src.common.types import (
@@ -714,3 +715,36 @@ def test_account_rotator_disabled() -> None:
     assert rotator.current_limit() is None
     assert not rotator.needs_rotation()
     assert rotator.next_alias() is None
+
+
+def test_first_port_visit_skips_between_battle_wait(tmp_path: Path) -> None:
+    """会话开始后首次进港口不再等 15~60s 随机间隔；第二场之间才等待。"""
+    h = Harness(tmp_path)
+    h.session.sample_between_battle_s = lambda: 30.0  # type: ignore[method-assign]
+    h.machine.start()
+    h.perception.detected = State.PORT
+    h.step()
+    assert h.machine.state is State.PORT
+    assert h.machine._port_wait_until == pytest.approx(h.clock.now())
+    h.clock.advance(1.0)
+    h.machine._enter_port(h.clock.now(), "test_second_visit")
+    assert h.machine._port_wait_until == pytest.approx(h.clock.now() + 30.0)
+
+
+def test_paused_window_unavailable_auto_resumes_when_window_returns(tmp_path: Path) -> None:
+    h = Harness(tmp_path)
+    h.machine.start()
+    broken = WindowInfo(
+        hwnd=1, title="game", process_name="game.exe", client_rect=Rect(0, 0, 2560, 1600),
+        foreground=True, minimized=False, valid=False,
+    )
+    h.machine.update_window_info(broken)
+    h.step()
+    assert h.machine.state is State.PAUSED
+    restored = WindowInfo(
+        hwnd=1, title="game", process_name="game.exe", client_rect=Rect(0, 0, 2560, 1600),
+        foreground=True, minimized=False, valid=True,
+    )
+    h.machine.update_window_info(restored)
+    h.step()
+    assert h.machine.state is State.INIT

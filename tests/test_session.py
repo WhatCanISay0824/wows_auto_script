@@ -124,6 +124,28 @@ def test_daily_battle_cap_uses_database_callback() -> None:
     assert controller.count_battles_today() == 5
 
 
+def test_daily_count_is_cached_and_invalidated_after_battle() -> None:
+    calls: list[date] = []
+
+    def count(day: date) -> int:
+        calls.append(day)
+        return 2
+
+    session = SessionConfig(daily_battle_cap=5)
+    controller, clock, _ = make_controller(session=session, count_battles_on=count)
+    controller.start()
+    for _ in range(5):
+        assert controller.check_stop() is None
+    assert len(calls) == 1  # 5 次检查（每 tick 一次）只查一次数据库
+    clock.advance(6.0)
+    controller.check_stop()
+    assert len(calls) == 2  # 缓存过期后重新查询
+    controller.begin_battle()
+    controller.end_battle("victory")
+    controller.check_stop()
+    assert len(calls) == 3  # 战斗结束使缓存失效
+
+
 def test_daily_battle_cap_not_reached() -> None:
     session = SessionConfig(daily_battle_cap=5)
     controller, _, _ = make_controller(session=session, count_battles_on=lambda day: 4)

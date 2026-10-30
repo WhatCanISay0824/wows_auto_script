@@ -96,6 +96,8 @@ class SessionController:
         self._last_battle_duration_s: float | None = None
         self._consecutive_start_failures = 0
         self._stop_request: StopRequest | None = None
+        # 每日场次查询走 SQLite，主循环每 0.1s 调 check_stop()，缓存几秒避免刷爆数据库
+        self._daily_count_cache: tuple[float, Any, int | None] | None = None
         self._allowed_hours = self._parse_allowed_hours(session.allowed_hours)
         if self._rng is None:
             import random
@@ -165,6 +167,7 @@ class SessionController:
         self._battle_started_at = None
         self._battles_completed += 1
         self._last_battle_duration_s = duration
+        self._daily_count_cache = None  # 场次已变化，下次 check_stop 重新查询
         self._emit(
             "battle_end",
             {
@@ -207,15 +210,24 @@ class SessionController:
         return None
 
     def count_battles_today(self) -> int | None:
-        """查询今日已完成场次；未注入回调时返回 None（跳过检查）。"""
+        """查询今日已完成场次；未注入回调时返回 None（跳过检查）。
+
+        结果缓存若干秒（默认 5s），因为 check_stop() 在主循环里每 tick 都会调用。
+        """
         if self._count_battles_on is None:
             return None
+        now = self._clock.now()
         today = self._clock.wall_now().date()
+        cached = self._daily_count_cache
+        if cached is not None and cached[1] == today and now - cached[0] < 5.0:
+            return cached[2]
         try:
-            return int(self._count_battles_on(today))
+            count = int(self._count_battles_on(today))
         except Exception as exc:  # 存储失败不应中断会话，降级为跳过每日上限检查
             self._emit("session_count_error", {"error": repr(exc)})
             return None
+        self._daily_count_cache = (now, today, count)
+        return count
 
     # ------------------------------------------------------------------
     # 允许时段
