@@ -194,7 +194,7 @@ session:
 timeouts:
   queue_s: 600                         # 匹配排队
   loading_s: 300                       # 战斗加载
-  exit_menu_s: 5                       # 打开退出菜单
+  exit_menu_s: 8                       # 打开退出菜单（2026-10-31：死亡镜头期间 ESC 可能被吞，放宽到 8s）
   exit_confirm_s: 5                    # 退出确认框
   exit_s: 180                          # 退出到港口
   port_s: 180                          # 回港确认

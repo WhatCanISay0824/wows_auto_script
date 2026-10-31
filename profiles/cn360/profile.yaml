@@ -155,11 +155,11 @@ features:
   exit_menu_return_port:
     template: features/exit_menu_return_port.png      # ESC 菜单里的“离开战斗”按钮
     region: [0.40, 0.36, 0.60, 0.44]
-    threshold: 0.85
+    threshold: 0.78   # 2026-10-31 下调：菜单淡入期间匹配分数偏低，避免误判未打开而重复按 ESC
   exit_confirm_yes:
     template: features/exit_confirm_yes.png           # “离开战斗?” 确认框里的“是”按钮
     region: [0.34, 0.45, 0.48, 0.53]
-    threshold: 0.85
+    threshold: 0.78   # 与退出菜单同步下调
   # ---- 实测港口标签页 / 装备页信号旗（210924 / 214644）----
   port_equip_tab:
     template: features/port_equip_tab.png             # 顶部“装备”标签（实机画面提取，未选中态）

@@ -11,7 +11,7 @@
 - 实现补充与裁决：`design/详细设计评审与实现补充.md`（与详细设计冲突时以该文件为准；第 10 节为 2026-10-31 ISS-001～010 修复口径）
 - 实机问题与修复记录：`docs/实机问题记录.md`
 - GUI 详细设计（设计稿，未实施）：`design/GUI界面设计文档.md`
-- 代码：M0/M1 已实现；离线测试 `pytest` 755 项全过、`ruff` 通过、`validate` 0 error / 4 warning、`main --dry-run` 退出码 0
+- 代码：M0/M1 已实现；离线测试 `pytest` 757 项全过、`ruff` 通过、`validate` 0 error / 4 warning、`main --dry-run` 退出码 0
 - 实机：已进入联调（港口/装备页/选船/排队/战斗 HUD/F12/F11 已验证）；ISS-001～010 的实机回归、autopilot 航行、开火/消耗品、死亡退出/结算、连续多场仍待验证
 - 下一步：按 `docs/实机问题记录.md` 的验收标准做实机回归；按 GUI 设计 M0～M3 实施 GUI
 

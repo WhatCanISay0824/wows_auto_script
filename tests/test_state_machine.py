@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from src.common.clock import FakeClock
@@ -574,6 +575,45 @@ def test_port_start_sequence_flow(tmp_path: Path) -> None:
     h.step()
     assert h.machine.state is State.BATTLE_ACTIVE
     assert h.perception.begin_battle_calls == 1
+
+
+def test_death_esc_opens_confirm_dialog_directly(tmp_path: Path) -> None:
+    """2026-10-31 实机回归：死亡后 ESC 直接弹“确认离开战斗?”，不等菜单也要能退出。"""
+    h = Harness(tmp_path)
+    drive_to_battle_active(h)
+    h.perception.death = _death_signals(h.clock.now())
+    h.step()
+    assert h.machine.state is State.DEAD_PENDING_EXIT
+    h.clock.advance(2.5)
+    h.perception.death = _death_signals(h.clock.now())
+    h.step()
+    assert h.machine.state is State.EXIT_MENU_OPEN
+    # ESC 后直接出现确认框（没有“菜单→离开战斗”按钮）
+    h.perception.features["exit_confirm"] = _match("exit_confirm")
+    h.step()
+    assert h.machine.state is State.EXIT_CONFIRMING
+    h.step()
+    assert h.machine.state is State.EXITING
+    assert "exit_requested" in h.events.battle_marks
+
+
+def test_exit_menu_timeout_saves_diagnostic(tmp_path: Path) -> None:
+    """退出菜单超时要保存诊断截图，便于定位是没开菜单还是模板失配。"""
+    h = Harness(tmp_path)
+    drive_to_battle_active(h)
+    h.perception.death = _death_signals(h.clock.now())
+    h.step()
+    h.clock.advance(2.5)
+    h.perception.death = _death_signals(h.clock.now())
+    h.step()
+    assert h.machine.state is State.EXIT_MENU_OPEN
+    h.perception.last_frame = SimpleNamespace(image=object())  # 让诊断截图有帧可存
+    h.clock.advance(9.0)
+    h.step()  # 超时前先触发一次 ESC 重试（并保存 retry 诊断）
+    assert "exit_menu_retry" in h.screenshots.diagnostics
+    h.step()  # 超过 exit_menu_s -> ERROR_RECOVERY
+    assert h.machine.state is State.ERROR_RECOVERY
+    assert "exit_menu_timeout" in h.screenshots.diagnostics
 
 
 def test_dead_exit_flow_to_port(tmp_path: Path) -> None:

@@ -937,6 +937,10 @@ class StateMachine:
                 return [_click_action(match, observation, "result_return_port")]
         # 按钮尚未出现（结算动画/网络延迟）：短暂重试，避免误入异常恢复
         if now >= self._result_choice_until:
+            self._save_diagnostic("result_buttons_missing", now)
+            self._log_action(
+                "result_step", {"step": "buttons_missing", "timeout_s": 20.0}
+            )
             self._transition(State.ERROR_RECOVERY, "result_buttons_missing")
         return []
 
@@ -1000,6 +1004,16 @@ class StateMachine:
             self._mark_exit_requested()
             self._transition(State.EXITING, "direct_exit")
             return actions + [_click_action(direct, observation, "exit_direct")]
+        # 2026-10-31 实机：死亡后按 ESC 可能直接弹出“确认离开战斗?”（死亡界面提示 ESC=离开战斗），
+        # 不经过“菜单→离开战斗”按钮；先识别确认框，避免误判为菜单未打开而重复按 ESC 把确认框关掉。
+        confirm = self._match_feature(exit_cfg.confirm_feature)
+        if confirm is not None and confirm.found:
+            self._confirm_seen = True
+            self._exit_method = "confirm"
+            self._mark_exit_requested()
+            self._log_action("exit_step", {"step": "confirm_dialog_direct"})
+            self._transition(State.EXIT_CONFIRMING, "confirm_dialog_direct")
+            return actions
         menu = self._match_feature(exit_cfg.menu_open_feature)
         if menu is not None and menu.found:
             target = self._match_feature(exit_cfg.return_port_feature)
@@ -1013,13 +1027,18 @@ class StateMachine:
                 self._transition(State.ERROR_RECOVERY, "return_port_missing")
             return actions
         elapsed = now - self._entered_at
-        if not self._exit_retried and elapsed > 1.2:
+        # 重试延迟放宽到 2.5s：死亡镜头/结算动画期间 ESC 可能被吞掉，过早重试会把已打开的
+        # 菜单/确认框关掉（实机 2026-10-31 17:13 死亡退出失败即此风险）
+        if not self._exit_retried and elapsed > 2.5:
             self._exit_retried = True
+            self._save_diagnostic("exit_menu_retry", now)
             key = self.deps.config.keymap.resolve(exit_cfg.menu_key)
             self._log_action("exit_step", {"step": "retry_menu_key", "elapsed_s": round(elapsed, 2)})
             return actions + [Action.key_down(key, label="exit_menu_retry"), Action.key_up(key, label="exit_menu_retry")]
         timeout = float(self.config.global_config.timeouts.exit_menu_s)
         if elapsed > timeout:
+            self._save_diagnostic("exit_menu_timeout", now)
+            self._log_action("exit_step", {"step": "exit_menu_timeout", "elapsed_s": round(elapsed, 2)})
             self._transition(State.ERROR_RECOVERY, "exit_menu_timeout")
         return actions
 
@@ -1039,6 +1058,14 @@ class StateMachine:
             self._exit_method = "confirm"
             self._transition(State.EXITING, "confirm_click")
             return [_click_action(confirm, observation, "exit_confirm")]
+        # 反向兜底：先出现的是“菜单”而不是确认框时，先点菜单里的“离开战斗”再等确认框
+        menu = self._match_feature(exit_cfg.menu_open_feature)
+        if menu is not None and menu.found:
+            target = self._match_feature(exit_cfg.return_port_feature)
+            if target is not None and target.found:
+                self._exit_method = "menu"
+                self._log_action("exit_step", {"step": "confirm_menu_fallback"})
+                return [_click_action(target, observation, "exit_return_port_fallback")]
         timeout = float(self.config.global_config.timeouts.exit_confirm_s)
         if now - self._entered_at > timeout:
             # 没有确认框：按“点击返回港口后直接退出”处理（详细设计 6.6）
