@@ -3,15 +3,34 @@
 # - card.png：港口底部轮播条卡片右半（船体剪影 + 船名“铁公爵”），避开左侧徽章/+50% 与选中边框
 # - 每艘新船首次使用前用 calibrate_ship 框选一次卡片即可；hp_bar.png 可选（未提供时死亡判定
 #   不用“血条消失”信号，改用死亡提示/结算界面兜底）
+# - selected.png：目标船“已选中状态”模板（ISS-007），待实机补标定；缺失时运行时保守失败。
 
 ship_id: iron_duke
 display_name: 铁公爵
 card_template: card.png
 card_search_region: [0.0, 0.80, 1.0, 1.0]   # 港口底部船只轮播条（实测 UI）
 hp_bar_template: hp_bar.png   # 从实机战斗截图提取的“V 铁公爵”血条文字（每船一份）
-max_scrolls: 20               # 轮播条最多滚动次数（鼠标滚轮滚动，不用拖动滚动条）
+# --- 已选中证据（ISS-007）：不能把“目标船卡片可见”当作“已选中” ---
+# selected.png：目标船卡片处于选中状态（含选中高亮/边框）的截图，由标定工具生成；
+# 模板必须同时包含该船的身份特征（船名/船体），不能只截通用的选中边框，否则任何船选中都会误匹配。
+# 尚未标定：文件暂不存在，validate 给 warning，运行时会保守失败并提示补标定（不猜选）。
+selected_feature: selected.png
+selected_region: [0.0, 0.80, 1.0, 1.0]   # 选中态模板搜索区域（缺省回退 card_search_region）
+selected_threshold: 0.85
+# --- 选船查找参数（ISS-007）：滚动预算/端点/确认全部由配置驱动，不写死在代码里 ---
+max_scrolls: 20               # 扫描阶段最多滚动次数（空 ship_selection_sequence 也使用该预算）
 scroll_direction: down        # 轮播条滚动方向：down=向下滚（待实机确认）
 scroll_clicks: 2              # 每次滚动格数（MOUSE_WHEEL 1 格 = WHEEL_DELTA）
+cover_list_start: true        # 先反向滚到可确认的列表起点再扫描，覆盖目标在初始位置两侧
+max_position_scrolls: 10      # 起点定位阶段最大滚动次数
+scroll_settle_s: 0.4          # 每次滚动后等待新画面/稳定时间
+confirm_frames: 2             # 点击目标卡后至少等待的新帧数，再查询已选中证据
+confirm_timeout_s: 3.0        # 点击后等待新帧并确认已选中的超时
+max_click_attempts: 2         # 同一目标重复点击上限
+endpoint_stable_scrolls: 2    # 连续“滚动后画面不再变化”次数判定列表端点
+endpoint_diff_ratio: 0.02     # 画面采样平均差异低于该比例视为没有变化
+candidate_merge_px: 8         # 候选中心距离小于该像素视为同一张卡
+selection_timeout_s: 60.0     # 整个选船查找（定位+扫描+确认）总超时
 
 loadout_slots: []             # 信号旗校验由 profile.ship_check_sequence 在装备页完成
 

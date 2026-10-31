@@ -30,13 +30,20 @@ from typing import Any
 from .behavior.scheduler import BehaviorScheduler
 from .common.clock import Clock, SystemClock
 from .common.errors import ConfigError
+from .common.single_instance import SingleInstanceLock
 from .common.types import Observation, Rect, State, WindowInfo
 from .common.window import WindowLocator, set_dpi_awareness
 from .config.loader import load_app, load_project, load_ship
 from .config.models import AccountsConfig, AppConfig
 from .config.validate import validate_app
 from .execution.queue import InputExecutor
-from .execution.safety import SafetyMonitor, SafetyWatchdog, StopController, Win32KeyStateSource
+from .execution.safety import (
+    SafetyEventKind,
+    SafetyMonitor,
+    SafetyWatchdog,
+    StopController,
+    Win32KeyStateSource,
+)
 from .execution.winput import make_backend
 from .navigation.autopilot import AutoPilotNavigator
 from .navigation.navigator import Navigator
@@ -55,6 +62,8 @@ logger = logging.getLogger(__name__)
 EXIT_OK = 0
 EXIT_CONFIG_ERROR = 2
 EXIT_RUNTIME_ERROR = 1
+#: 已有另一个脚本实例在运行（ISS-003）
+EXIT_INSTANCE_RUNNING = 3
 
 
 # ---------------------------------------------------------------------------
@@ -82,6 +91,7 @@ class Runtime:
     machine: StateMachine
     safety: SafetyMonitor
     watchdog: SafetyWatchdog
+    controller: StopController
     bridge: Any
     logger: logging.Logger
 
@@ -92,6 +102,10 @@ class _EventBridge:
     def __init__(self, events: EventSink) -> None:
         self.events = events
         self.battle_id: int | None = None
+
+    def set_battle_id(self, battle_id: int | None) -> None:
+        """ISS-010：状态机创建/结束/中断战斗时更新场次上下文。"""
+        self.battle_id = battle_id
 
     def _log(self, action_type: str, detail: Any) -> None:
         payload = dict(detail) if isinstance(detail, dict) else {"detail": detail}
@@ -126,6 +140,38 @@ class _EventBridge:
         self._window_rect = rect
 
 
+def _make_safety_event_handler(executor: InputExecutor, logger_: logging.Logger):
+    """ISS-005：安全事件的独立输入门禁回调（在监控线程内执行，不等待主循环）。
+
+    F12 紧急停止与心跳超时都必须在监控线程内立即关闭业务输入门禁并请求输入线程释放，
+    否则主循环卡在截屏/识别/数据库等待时仍可能继续执行排队的键鼠动作。
+    该回调只入队释放动作（非阻塞），状态机转移与日志收尾仍由运行线程负责。
+    """
+
+    def _on_safety_event(event: Any) -> None:
+        if event.kind not in (SafetyEventKind.EMERGENCY_STOP, SafetyEventKind.HEARTBEAT_TIMEOUT):
+            return
+        try:
+            executor.close_gate_and_release(f"safety:{event.kind.value}")
+        except Exception as exc:
+            logger_.warning("安全事件关闭输入门禁失败: %s", exc)
+        logger_.warning("安全事件 %s：已关闭输入门禁并请求释放键鼠", event.kind.value)
+
+    return _on_safety_event
+
+
+def _cleanup_partial_runtime(started: list[tuple[str, Any]], logger_: logging.Logger) -> None:
+    """ISS-008：运行时装配中途失败时回收已创建的资源（幂等、不抛异常）。"""
+    for kind, resource in reversed(started):
+        try:
+            if kind in ("executor", "events"):
+                resource.stop(drain=True)
+            elif kind == "engine":
+                resource.close()
+        except Exception as exc:  # 单个资源回收失败不影响其它资源
+            logger_.warning("装配失败回收 %s 时出错: %s", kind, exc)
+
+
 def _build_runtime(app: AppConfig) -> Runtime:
     config = app.global_config
     clock: Clock = SystemClock()
@@ -135,101 +181,121 @@ def _build_runtime(app: AppConfig) -> Runtime:
         max_bytes=config.logging.log_max_bytes,
         backup_count=config.logging.log_backup_count,
     )
-    dpi_mode = set_dpi_awareness()
-    text_logger.info("DPI 感知模式: %s（当前不是游戏运行环境属正常）", dpi_mode)
+    started: list[tuple[str, Any]] = []
+    try:
+        dpi_mode = set_dpi_awareness()
+        text_logger.info("DPI 感知模式: %s（当前不是游戏运行环境属正常）", dpi_mode)
 
-    locator = WindowLocator(app.profile.window.process_names, app.profile.window.title_patterns)
-    capture = GdiCapture(
-        locator,
-        clock=clock,
-        require_foreground=app.profile.window.require_foreground,
-        capture_budget_ms=config.timeouts.capture_ms,
-    )
-    engine = PerceptionEngine(app, capture, clock)
-    # 每船独立血条模板：换船后血条面板上的舰名不同，必须用当前船的模板，否则会误判“血条消失”
-    engine.configure_ship_hp_bar(app.ship)
-    events = EventSink(
-        app.project_root / config.paths.data_dir / "wows_script.db",
-        logger=text_logger,
-        fallback_log=app.project_root / config.logging.db_fallback_log,
-    )
-    events.start()
-    screenshots = ScreenshotManager.from_config(app.project_root, config, clock=clock, logger=text_logger)
-    executor = InputExecutor(make_backend(config.input), config.input, clock=clock)
-    executor.start()
-
-    bridge = _EventBridge(events)
-    navigator = Navigator(config.navigation, on_event=bridge.on_nav)
-    autopilot = AutoPilotNavigator(
-        config.navigation,
-        app.profile,
-        rng=random.Random(),
-        on_event=bridge.on_nav,
-        logger_=text_logger,
-    )
-    behavior = BehaviorScheduler(config.behavior, app.keymap, on_event=bridge.on_behavior)
-    steps = StepSequenceExecutor(app.keymap, to_screen=bridge.to_screen, on_step=bridge.on_step)
-    alias = app.account_alias
-
-    def _count_today(day: date) -> int | None:
-        try:
-            parameters = inspect.signature(events.count_battles_on).parameters
-        except (TypeError, ValueError):  # pragma: no cover
-            parameters = {}
-        if alias and "account_alias" in parameters:
-            return events.count_battles_on(day, account_alias=alias)  # type: ignore[call-arg]
-        return events.count_battles_on(day)
-
-    session = SessionController(
-        config.session,
-        config.safety,
-        clock,
-        count_battles_on=_count_today,
-        rng=random.Random(),
-        on_event=bridge.on_session,
-    )
-    ship_checker = ShipChecker(app, engine, steps, logger_=text_logger)
-    safety = SafetyMonitor.from_config(config.safety, Win32KeyStateSource(), clock=clock)
-    watchdog = SafetyWatchdog(safety)
-    machine = StateMachine(
-        MachineDeps(
-            config=app,
+        locator = WindowLocator(app.profile.window.process_names, app.profile.window.title_patterns)
+        capture = GdiCapture(
+            locator,
             clock=clock,
-            perception=engine,
-            executor=executor,
+            require_foreground=app.profile.window.require_foreground,
+            capture_budget_ms=config.timeouts.capture_ms,
+        )
+        engine = PerceptionEngine(app, capture, clock)
+        started.append(("engine", engine))
+        # 每船独立血条模板：换船后血条面板上的舰名不同，必须用当前船的模板，否则会误判“血条消失”
+        engine.configure_ship_hp_bar(app.ship)
+        events = EventSink(
+            app.project_root / config.paths.data_dir / "wows_script.db",
+            logger=text_logger,
+            fallback_log=app.project_root / config.logging.db_fallback_log,
+        )
+        events.start()
+        started.append(("events", events))
+        screenshots = ScreenshotManager.from_config(app.project_root, config, clock=clock, logger=text_logger)
+        executor = InputExecutor(make_backend(config.input), config.input, clock=clock)
+        executor.start()
+        started.append(("executor", executor))
+
+        bridge = _EventBridge(events)
+        navigator = Navigator(config.navigation, on_event=bridge.on_nav)
+        autopilot = AutoPilotNavigator(
+            config.navigation,
+            app.profile,
+            rng=random.Random(),
+            on_event=bridge.on_nav,
+            logger_=text_logger,
+            keymap=app.keymap,
+        )
+        behavior = BehaviorScheduler(config.behavior, app.keymap, on_event=bridge.on_behavior)
+        steps = StepSequenceExecutor(app.keymap, to_screen=bridge.to_screen, on_step=bridge.on_step)
+        alias = app.account_alias
+
+        def _count_today(day: date) -> int | None:
+            try:
+                parameters = inspect.signature(events.count_battles_on).parameters
+            except (TypeError, ValueError):  # pragma: no cover
+                parameters = {}
+            if alias and "account_alias" in parameters:
+                return events.count_battles_on(day, account_alias=alias)  # type: ignore[call-arg]
+            return events.count_battles_on(day)
+
+        session = SessionController(
+            config.session,
+            config.safety,
+            clock,
+            count_battles_on=_count_today,
+            rng=random.Random(),
+            on_event=bridge.on_session,
+        )
+        ship_checker = ShipChecker(app, engine, steps, logger_=text_logger)
+        # ISS-006：安全监控与状态机共用同一个 StopController，F11/暂停状态保持同步
+        controller = StopController()
+        safety = SafetyMonitor.from_config(
+            config.safety, Win32KeyStateSource(), controller=controller, clock=clock
+        )
+
+        # ISS-005：安全事件在监控线程内直接关闭输入门禁并请求释放，不再等待主循环同步
+        _on_safety_event = _make_safety_event_handler(executor, text_logger)
+        watchdog = SafetyWatchdog(safety, on_event=_on_safety_event)
+        machine = StateMachine(
+            MachineDeps(
+                config=app,
+                clock=clock,
+                perception=engine,
+                executor=executor,
+                events=events,
+                steps=steps,
+                navigator=navigator,
+                behavior=behavior,
+                session=session,
+                screenshots=screenshots,
+                ship_checker=ship_checker,
+                autopilot=autopilot,
+                controller=controller,
+                on_battle_context=bridge.set_battle_id,
+                window_info_provider=None,
+                rng=random.Random(),
+                logger_=text_logger,
+            )
+        )
+        return Runtime(
+            app=app,
+            clock=clock,
+            window_locator=locator,
+            capture=capture,
+            engine=engine,
             events=events,
+            screenshots=screenshots,
+            executor=executor,
             steps=steps,
             navigator=navigator,
             behavior=behavior,
             session=session,
-            screenshots=screenshots,
             ship_checker=ship_checker,
-            autopilot=autopilot,
-            window_info_provider=None,
-            rng=random.Random(),
-            logger_=text_logger,
+            machine=machine,
+            safety=safety,
+            watchdog=watchdog,
+            controller=controller,
+            bridge=bridge,
+            logger=text_logger,
         )
-    )
-    return Runtime(
-        app=app,
-        clock=clock,
-        window_locator=locator,
-        capture=capture,
-        engine=engine,
-        events=events,
-        screenshots=screenshots,
-        executor=executor,
-        steps=steps,
-        navigator=navigator,
-        behavior=behavior,
-        session=session,
-        ship_checker=ship_checker,
-        machine=machine,
-        safety=safety,
-        watchdog=watchdog,
-        bridge=bridge,
-        logger=text_logger,
-    )
+    except BaseException:
+        # ISS-008：装配失败也要回收已创建的输入线程/日志线程/截屏资源
+        _cleanup_partial_runtime(started, text_logger)
+        raise
 
 
 _LAST_WINDOW: list[WindowInfo | None] = [None]
@@ -278,6 +344,22 @@ def _sync_safety_controller(machine: Any, controller: StopController) -> bool:
     if pause_request is not None:
         machine.request_pause(str(pause_request.reason), pause_request.detail)
     return controller.paused
+
+
+def _reset_input_after_failure(runtime: Runtime) -> bool:
+    """ISS-009：输入后端连续失败后，恢复前必须显式重置失败状态并重新打开门禁。"""
+    executor = runtime.executor
+    reset = getattr(executor, "reset_after_failure", None)
+    if not callable(reset):
+        return True
+    try:
+        ok = bool(reset())
+    except Exception as exc:
+        runtime.logger.warning("重置输入后端失败: %s", exc)
+        return False
+    if ok:
+        runtime.logger.warning("输入后端失败状态已重置（门禁重新打开），继续会话")
+    return ok
 
 
 def _ensure_game_foreground(runtime: Runtime) -> bool:
@@ -338,7 +420,18 @@ def _run_session(runtime: Runtime, *, max_battles: int | None = None) -> tuple[s
                 was_paused = True
             elif was_paused:
                 was_paused = False
-                machine.request_resume()
+                # ISS-009：输入后端失败导致的暂停必须先显式重置，恢复成功后才能真正继续
+                if machine.pause_reason == "input_failed":
+                    if _reset_input_after_failure(runtime):
+                        machine.request_resume()
+                    else:
+                        machine.request_pause("input_failed", "输入后端失败，恢复前请排查驱动/权限")
+                else:
+                    machine.request_resume()
+
+            # ISS-009：输入线程连续失败后，运行线程负责转入 PAUSED 并在日志/事件中暴露原因
+            if executor.failed and machine.state not in (State.PAUSED, State.STOPPING):
+                machine.request_pause("input_failed", str(executor.last_error or "输入后端连续失败"))
 
             if now - last_window_at >= 1.0:
                 last_window_at = now
@@ -382,6 +475,14 @@ def _run_session(runtime: Runtime, *, max_battles: int | None = None) -> tuple[s
     except KeyboardInterrupt:
         logger_.warning("收到 Ctrl+C，停止会话")
         machine.request_stop("manual", "KeyboardInterrupt")
+    except Exception as exc:
+        # ISS-008：运行期异常先走 STOPPING 收尾（结束战斗/会话记录、释放输入），再向上抛给 finally 清理
+        logger_.exception("会话运行异常，终止会话: %s", exc)
+        try:
+            machine.request_stop("runtime_error", str(exc))
+        except Exception as stop_exc:
+            logger_.warning("异常终止时收尾失败: %s", stop_exc)
+        raise
     finally:
         try:
             watchdog.stop()
@@ -498,6 +599,100 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _run_accounts(
+    args: argparse.Namespace,
+    root: Path,
+    aliases: list[str | None],
+    rotator: AccountRotator | None,
+) -> int:
+    """逐账号运行；每个账号的运行时构建/会话/清理由 try/finally 绑定（ISS-008）。"""
+    rotating = bool(rotator is not None and len(aliases) > 1)
+    no_battle_streak = 0
+    try:
+        while True:
+            alias = rotator.current.alias if rotator is not None else aliases[0] if len(aliases) == 1 else None
+            app = _load_app(root, args.profile, args.ship, alias)
+            problems = validate_app(app)
+            fatal = [issue for issue in problems if issue.is_error]
+            if fatal:
+                _print_issues(fatal)
+                print(f"账号 {alias or '(默认)'} 的配置校验失败，停止", file=sys.stderr)
+                return EXIT_CONFIG_ERROR
+            if args.log_level:
+                app = replace(
+                    app,
+                    global_config=replace(
+                        app.global_config,
+                        runtime=replace(app.global_config.runtime, log_level=args.log_level),
+                    ),
+                )
+            _LAST_WINDOW[0] = None
+            runtime: Runtime | None = None
+            reason, battles = "runtime_error", 0
+            try:
+                runtime = _build_runtime(app)
+                if app.account is not None:
+                    runtime.logger.info("当前账号档案: %s", app.account.alias)
+                limit = args.max_battles
+                if limit is None and rotator is not None:
+                    limit = rotator.current_limit()
+                reason, battles = _run_session(runtime, max_battles=limit)
+            except KeyboardInterrupt:
+                raise
+            except Exception as exc:
+                # ISS-008：异常原因交给调用方显示，finally 保证统一清理完成
+                logging.getLogger(__name__).exception("会话异常终止: %s", exc)
+                print(f"会话异常终止：{exc}", file=sys.stderr)
+                reason, battles = "runtime_error", 0
+            finally:
+                if runtime is not None:
+                    _teardown(runtime)
+            print(f"账号 {alias or '(默认)'} 会话结束：原因={reason} 场次={battles}")
+            if rotator is not None:
+                rotator.record_battle(alias)
+            if not rotating:
+                return EXIT_OK if reason not in ("game_crash", "runtime_error") else EXIT_RUNTIME_ERROR
+            if reason in ("emergency_stop", "manual"):
+                return EXIT_OK
+            if battles == 0:
+                no_battle_streak += 1
+                if no_battle_streak >= max(1, len(aliases)):
+                    print("所有账号本次都无法开始战斗（可能已达每日上限/不在允许时段），退出。")
+                    return EXIT_OK
+            else:
+                no_battle_streak = 0
+            rotator.advance()
+            next_alias = rotator.current.alias
+            print()
+            print("=" * 72)
+            print(f"请手动切换到账号「{next_alias}」：")
+            print("  1. 在游戏客户端退出当前账号并登录目标账号（脚本不会代登录、不保存密码）；")
+            print("  2. 确认已回到港口界面、船只与空装备符合配置；")
+            print("  3. 回到本控制台按回车继续。")
+            print("=" * 72)
+            try:
+                input("切换完成后按回车继续（Ctrl+C 退出）...")
+            except EOFError:
+                return EXIT_OK
+    except KeyboardInterrupt:
+        print("用户中断，退出。")
+        return EXIT_OK
+
+
+def _print_instance_holder(holder: dict[str, Any] | None) -> None:
+    holder = holder or {}
+    print(
+        f"已有另一个脚本实例在运行（PID={holder.get('pid', '未知')}，"
+        f"启动于 {holder.get('started_at', '未知')}），本次不启动游戏控制。",
+        file=sys.stderr,
+    )
+    print(
+        "如确认没有实例，请在任务管理器结束残留的 python/src.main 进程；"
+        "命令行可用：taskkill /PID <pid> /T /F（结束进程树，避免只杀 py 启动器）。",
+        file=sys.stderr,
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -581,66 +776,15 @@ def main(argv: list[str] | None = None) -> int:
         print("--dry-run：未启动脚本。")
         return EXIT_OK
 
-    # 逐账号运行
-    rotating = bool(rotator is not None and len(aliases) > 1)
-    no_battle_streak = 0
+    # ISS-003：跨进程单实例锁（命令行与 GUI 共用），防止两个实例同时发送键鼠
+    lock = SingleInstanceLock(root / app0.global_config.paths.data_dir)
+    if not lock.acquire():
+        _print_instance_holder(lock.holder)
+        return EXIT_INSTANCE_RUNNING
     try:
-        while True:
-            alias = rotator.current.alias if rotator is not None else aliases[0] if len(aliases) == 1 else None
-            app = _load_app(root, args.profile, args.ship, alias)
-            problems = validate_app(app)
-            fatal = [issue for issue in problems if issue.is_error]
-            if fatal:
-                _print_issues(fatal)
-                print(f"账号 {alias or '(默认)'} 的配置校验失败，停止", file=sys.stderr)
-                return EXIT_CONFIG_ERROR
-            if args.log_level:
-                app = replace(
-                    app,
-                    global_config=replace(
-                        app.global_config,
-                        runtime=replace(app.global_config.runtime, log_level=args.log_level),
-                    ),
-                )
-            _LAST_WINDOW[0] = None
-            runtime = _build_runtime(app)
-            if app.account is not None:
-                runtime.logger.info("当前账号档案: %s", app.account.alias)
-            limit = args.max_battles
-            if limit is None and rotator is not None:
-                limit = rotator.current_limit()
-            reason, battles = _run_session(runtime, max_battles=limit)
-            _teardown(runtime)
-            print(f"账号 {alias or '(默认)'} 会话结束：原因={reason} 场次={battles}")
-            if rotator is not None:
-                rotator.record_battle(alias)
-            if not rotating:
-                return EXIT_OK if reason not in ("game_crash", "runtime_error") else EXIT_RUNTIME_ERROR
-            if reason in ("emergency_stop", "manual"):
-                return EXIT_OK
-            if battles == 0:
-                no_battle_streak += 1
-                if no_battle_streak >= max(1, len(aliases)):
-                    print("所有账号本次都无法开始战斗（可能已达每日上限/不在允许时段），退出。")
-                    return EXIT_OK
-            else:
-                no_battle_streak = 0
-            rotator.advance()
-            next_alias = rotator.current.alias
-            print()
-            print("=" * 72)
-            print(f"请手动切换到账号「{next_alias}」：")
-            print("  1. 在游戏客户端退出当前账号并登录目标账号（脚本不会代登录、不保存密码）；")
-            print("  2. 确认已回到港口界面、船只与空装备符合配置；")
-            print("  3. 回到本控制台按回车继续。")
-            print("=" * 72)
-            try:
-                input("切换完成后按回车继续（Ctrl+C 退出）...")
-            except EOFError:
-                return EXIT_OK
-    except KeyboardInterrupt:
-        print("用户中断，退出。")
-        return EXIT_OK
+        return _run_accounts(args, root, aliases, rotator)
+    finally:
+        lock.release()
 
 
 if __name__ == "__main__":  # pragma: no cover

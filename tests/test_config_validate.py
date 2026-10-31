@@ -122,10 +122,27 @@ def test_invalid_global_ranges(project: fx.TestProject, tmp_path: Path) -> None:
 
 
 def test_unsupported_navigation_options(project: fx.TestProject, tmp_path: Path) -> None:
-    fx.edit_yaml_file(tmp_path / "config.yaml", "navigation.surface", "full_map")
+    # ISS-001 后 full_map 已是受支持的点击面；这里验证未知 surface 与不支持的 route_end_action。
+    fx.edit_yaml_file(tmp_path / "config.yaml", "navigation.surface", "bad_surface")
     fx.edit_yaml_file(tmp_path / "config.yaml", "navigation.route_end_action", "return")
     report = _report(tmp_path, project)
-    assert _codes(report.errors).count("unsupported") == 2
+    assert any(issue.code == "enum" and "navigation.surface" in issue.location for issue in report.errors)
+    assert any(issue.code == "unsupported" and "route_end_action" in issue.location for issue in report.errors)
+
+
+def test_full_map_surface_requires_rect(project: fx.TestProject, tmp_path: Path) -> None:
+    """ISS-001：autopilot 的 full_map 点击面必须配置全屏地图内容区矩形。"""
+    fx.edit_yaml_file(tmp_path / "config.yaml", "navigation.surface", "full_map")
+    report = _report(tmp_path, project)
+    assert any(issue.code == "missing" and "navigation.full_map_rect" in issue.location for issue in report.errors)
+
+
+def test_full_map_surface_with_rect_is_accepted(project: fx.TestProject, tmp_path: Path) -> None:
+    fx.edit_yaml_file(tmp_path / "config.yaml", "navigation.surface", "full_map")
+    fx.edit_yaml_file(tmp_path / "config.yaml", "navigation.full_map_rect", [0.2, 0.1, 0.8, 0.9])
+    report = _report(tmp_path, project)
+    assert not [issue for issue in report.errors if "navigation.surface" in issue.location]
+    assert not [issue for issue in report.errors if "navigation.full_map_rect" in issue.location]
 
 
 def test_invalid_allowed_hours(project: fx.TestProject, tmp_path: Path) -> None:

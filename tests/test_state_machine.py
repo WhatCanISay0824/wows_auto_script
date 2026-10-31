@@ -31,6 +31,7 @@ from src.config.models import (
     StepDef,
     WindowConfig,
 )
+from src.execution.safety import StopController
 from src.state_machine.accounts import AccountRotator
 from src.state_machine.machine import MachineDeps, StateMachine
 from src.state_machine.ship_check import ShipCheckStatus
@@ -159,12 +160,25 @@ class FakeExecutor:
         self.submitted: list[Action] = []
         self.stopped = False
         self.released = 0
+        self.gate_open = True
 
     def submit(self, actions) -> None:
         self.submitted.extend(actions)
 
     def release_all(self) -> None:
         self.released += 1
+
+    def close_gate_and_release(self, reason: str = "", *, wait: bool = False, timeout: float = 2.0) -> int:
+        self.gate_open = False
+        self.released += 1
+        return 1
+
+    def open_gate(self, reason: str = "") -> bool:
+        self.gate_open = True
+        return True
+
+    def reset_after_failure(self) -> bool:
+        return True
 
     def stop(self, drain: bool = True) -> None:
         self.stopped = True
@@ -417,6 +431,8 @@ class Harness:
         self.session = FakeSession()
         self.screenshots = FakeScreenshots()
         self.ship_checker = ship_checker or FakeShipChecker()
+        self.controller = StopController()
+        self.battle_contexts: list[int | None] = []
         self.machine = StateMachine(
             MachineDeps(
                 config=self.app,
@@ -431,6 +447,8 @@ class Harness:
                 screenshots=self.screenshots,  # type: ignore[arg-type]
                 ship_checker=self.ship_checker,  # type: ignore[arg-type]
                 autopilot=self.autopilot,
+                controller=self.controller,
+                on_battle_context=self.battle_contexts.append,
             )
         )
         self.machine.update_window_info(
@@ -457,6 +475,24 @@ class Harness:
 
 def _match(feature_id: str, found: bool = True) -> MatchResult:
     return MatchResult(feature_id, found, 0.95, center=(100, 100), rect=(90, 90, 20, 20), scale=1.0)
+
+
+def _death_signals(now: float, *, authorized: bool = True) -> DeathSignals:
+    """构造一帧死亡信号；ISS-002 后退出只认 exit_authorized（血条确认归零证据）。"""
+    return DeathSignals(
+        hp_bar_absent=False,
+        hp_zero=authorized,
+        banner=False,
+        marker_lost=False,
+        spectator_ui=False,
+        score=0.0,
+        stable_ms=1500,
+        timestamp=now,
+        hp_fill_ratio=0.0 if authorized else 0.5,
+        hp_evidence="zero" if authorized else "unknown",
+        exit_authorized=authorized,
+        evidence_at=now if authorized else 0.0,
+    )
 
 
 def drive_to_battle_active(h: Harness) -> None:
@@ -539,13 +575,14 @@ def test_port_start_sequence_flow(tmp_path: Path) -> None:
 def test_dead_exit_flow_to_port(tmp_path: Path) -> None:
     h = Harness(tmp_path)
     drive_to_battle_active(h)
-    # 死亡
-    h.perception.death = DeathSignals(True, False, True, False, False, score=0.85, stable_ms=1200, timestamp=h.clock.now())
+    # 死亡：只有“血条确认归零”证据（exit_authorized）才允许提前退出
+    h.perception.death = _death_signals(h.clock.now())
     h.step()
     assert h.machine.state is State.DEAD_PENDING_EXIT
     assert "death" in h.events.battle_marks
-    # 等待 0.8~2.0s 后进入退出菜单
+    # 等待 0.8~2.0s 后进入退出菜单（每帧重新给出新鲜证据）
     h.clock.advance(2.5)
+    h.perception.death = _death_signals(h.clock.now())
     h.step()
     assert h.machine.state is State.EXIT_MENU_OPEN
     # 菜单打开 + 返回港口按钮 -> EXIT_CONFIRMING
@@ -608,11 +645,69 @@ def test_autopilot_mode_starts_without_map_recognition(tmp_path: Path) -> None:
 def test_result_priority_over_death(tmp_path: Path) -> None:
     h = Harness(tmp_path)
     drive_to_battle_active(h)
-    h.perception.death = DeathSignals(True, False, True, False, False, score=0.9, stable_ms=1500, timestamp=h.clock.now())
+    h.perception.death = _death_signals(h.clock.now())
     h.perception.features["battle_results"] = _match("battle_results")
     h.step()
     assert h.machine.state is State.BATTLE_FINISHED
     assert h.machine.battle is not None
+
+
+def test_banner_or_missing_hp_bar_does_not_authorize_exit(tmp_path: Path) -> None:
+    """ISS-002：死亡提示/血条名称消失不得单独授权提前退出。"""
+    h = Harness(tmp_path)
+    drive_to_battle_active(h)
+    h.perception.death = DeathSignals(
+        hp_bar_absent=True,
+        hp_zero=False,
+        banner=True,
+        marker_lost=True,
+        spectator_ui=False,
+        score=0.9,
+        stable_ms=5000,
+        timestamp=h.clock.now(),
+        hp_fill_ratio=None,
+        hp_evidence="unavailable",
+        exit_authorized=False,
+        evidence_at=0.0,
+    )
+    for _ in range(3):
+        h.clock.advance(0.6)
+        h.step()
+    assert h.machine.state is State.BATTLE_ACTIVE
+    assert "death" not in h.events.battle_marks
+
+
+def test_exit_revoked_when_zero_evidence_lost(tmp_path: Path) -> None:
+    """ISS-002：等待退出期间出现存活/未知证据时撤销尚未执行的退出。"""
+    h = Harness(tmp_path)
+    drive_to_battle_active(h)
+    h.perception.death = _death_signals(h.clock.now())
+    h.step()
+    assert h.machine.state is State.DEAD_PENDING_EXIT
+    # 等待期内证据转为未知（例如模板/帧异常）：不应进入退出菜单
+    h.clock.advance(2.5)
+    h.perception.death = _death_signals(h.clock.now(), authorized=False)
+    h.step()
+    assert h.machine.state is State.BATTLE_ACTIVE
+    assert "exit_requested" not in h.events.battle_marks
+    # 再次确认归零（新鲜证据）后可以重新发起退出
+    h.perception.death = _death_signals(h.clock.now())
+    h.step()
+    assert h.machine.state is State.DEAD_PENDING_EXIT
+
+
+def test_battle_error_recovery_does_not_send_escape(tmp_path: Path) -> None:
+    """ISS-002：战斗内未知画面不得自动发送 ESC（退出菜单键只用于已授权退出）。"""
+    h = Harness(tmp_path)
+    drive_to_battle_active(h)
+    h.perception.detected = None  # 战斗内无法识别当前界面
+    h.machine._transition(State.ERROR_RECOVERY, "test_unknown")  # noqa: SLF001 - 测试直接构造场景
+    for _ in range(3):
+        h.clock.advance(0.5)
+        h.step()
+    assert h.machine.state is State.PAUSED
+    assert h.machine.pause_reason == "battle_unknown_interface"
+    assert not any(action.label == "recovery_escape" for action in h.executor.submitted)
 
 
 def test_pause_and_resume(tmp_path: Path) -> None:
@@ -621,10 +716,111 @@ def test_pause_and_resume(tmp_path: Path) -> None:
     h.machine.request_pause("window_unfocused")
     assert h.machine.state is State.PAUSED
     assert h.executor.released >= 1
+    assert h.executor.gate_open is False
+    # ISS-006：状态机暂停同步到共享 StopController，F11 恢复后主循环能看到同一状态
+    assert h.controller.paused
+    assert h.controller.resume()
     h.machine.request_resume()
     h.clock.advance(0.1)
     h.step()
     assert h.machine.state is State.INIT
+    assert h.executor.gate_open is True
+    assert not h.controller.paused
+
+
+def test_battle_pause_resume_keeps_battle_context(tmp_path: Path) -> None:
+    """ISS-006：战斗内暂停恢复保留场次编号/战斗上下文，不当作全新进程接管。"""
+    h = Harness(tmp_path)
+    drive_to_battle_active(h)
+    battle_id = h.machine.battle_id
+    assert battle_id is not None
+    autopilot_starts = h.autopilot.started
+    h.machine.request_pause("heartbeat_timeout")
+    assert h.machine.state is State.PAUSED
+    assert h.executor.gate_open is False
+    # 画面仍是战斗 HUD：恢复后回到 BATTLE_ACTIVE 并重新启动自动驾驶/行为
+    h.perception.detected = State.BATTLE_ACTIVE
+    h.controller.resume()
+    h.machine.request_resume()
+    h.step()
+    assert h.machine.state is State.BATTLE_ACTIVE
+    assert h.machine.battle_id == battle_id
+    assert h.autopilot.started > autopilot_starts
+    assert h.executor.gate_open is True
+    # 恢复时不重复创建随机档案
+    saved = len(h.events.saved_profiles)
+    h.step()
+    assert len(h.events.saved_profiles) == saved
+
+
+def test_resume_refuses_new_process_mid_battle(tmp_path: Path) -> None:
+    """新进程在战斗中：F11 不接管已有战斗，保持暂停并给出原因。"""
+    h = Harness(tmp_path)
+    h.machine.start()
+    h.perception.detected = State.BATTLE_ACTIVE
+    h.step()
+    assert h.machine.state is State.PAUSED
+    h.perception.detected = State.BATTLE_ACTIVE
+    h.machine.request_resume()
+    h.step()
+    assert h.machine.state is State.PAUSED
+    assert h.machine.pause_reason == "restart_mid_battle"
+    assert h.executor.gate_open is False
+    # 恢复失败后控制器重新写回暂停，避免主循环看到“无人暂停”却无法自动恢复
+    assert h.controller.paused
+
+
+def test_resume_to_port_aborts_unfinished_battle(tmp_path: Path) -> None:
+    """ISS-006：战斗上下文被暂停后回港，必须显式写中断记录，不能静默清空场次。"""
+    h = Harness(tmp_path)
+    drive_to_battle_active(h)
+    battle_id = h.machine.battle_id
+    assert battle_id is not None
+    h.machine.request_pause("window_lost")
+    h.perception.detected = State.PORT
+    h.controller.resume()
+    h.machine.request_resume()
+    h.step()
+    assert h.machine.state is State.PORT
+    assert h.machine.battle_id is None
+    assert h.events.battles and h.events.battles[-1][0] == "aborted"
+    assert h.battle_contexts[-1] is None
+
+
+def test_stop_while_in_battle_aborts_record(tmp_path: Path) -> None:
+    h = Harness(tmp_path)
+    drive_to_battle_active(h)
+    battle_id = h.machine.battle_id
+    assert battle_id is not None
+    h.machine.request_stop("emergency_stop", "F12")
+    assert h.machine.state is State.STOPPING
+    assert h.machine.battle_id is None
+    assert h.events.battles and h.events.battles[-1][0] == "aborted"
+    assert h.battle_contexts[-1] is None
+
+
+def test_resume_unknown_interface_keeps_paused(tmp_path: Path) -> None:
+    h = Harness(tmp_path)
+    drive_to_battle_active(h)
+    h.machine.request_pause("heartbeat_timeout")
+    h.perception.detected = None
+    h.controller.resume()
+    h.machine.request_resume()
+    h.step()
+    assert h.machine.state is State.PAUSED
+    assert h.machine.pause_reason == "resume_unknown"
+    assert h.controller.paused
+
+
+def test_battle_context_callback_tracks_battle(tmp_path: Path) -> None:
+    """ISS-010：创建战斗记录/结束/中断都更新回调场次编号。"""
+    h = Harness(tmp_path)
+    drive_to_battle_active(h)
+    battle_id = h.machine.battle_id
+    assert battle_id is not None
+    assert h.battle_contexts[-1] == battle_id
+    h.machine.request_stop("manual", "test")
+    assert h.battle_contexts[-1] is None
 
 
 def test_emergency_stop_finishes_session(tmp_path: Path) -> None:

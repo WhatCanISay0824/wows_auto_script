@@ -16,7 +16,14 @@
 - ``release_all()`` 与 ``stop()`` 不直接调用后端，而是把“释放所有键鼠”作为最高优先级
   控制动作入队，**由输入线程消费后执行**；看门狗等其它线程不要直接调用 SendInput；
 - ``stop()`` 设置停止标志、清空待执行动作、入队释放控制动作并等待输入线程退出；
-- 连续 3 次后端失败（详细设计 9.2）时置 ``failed``，停止执行动作，由上层进入 PAUSED。
+- **统一输入门禁（ISS-004）**：暂停/停止/紧急停止时关闭门禁 —— 拒绝新业务动作、
+  ``epoch+1`` 使在途与排队批次失效、清空待执行业务动作、入队释放控制动作；
+  恢复（``open_gate()``）后只接受重新识别画面生成的新动作。
+  ``release_all()`` 语义为“取消 + 释放”，``close_gate_and_release()`` 供暂停与安全监控
+  线程调用（``wait=False`` 时非阻塞，只入队释放）；
+- 连续 3 次后端失败（详细设计 9.2）时置 ``failed``、关闭门禁、清空队列，并由输入线程
+  **立即释放一次键鼠**（ISS-009）；上层检测到 ``failed`` 后进入 PAUSED，恢复前必须
+  ``reset_after_failure()``。
 """
 
 from __future__ import annotations
@@ -131,6 +138,9 @@ class InputExecutor:
         self._thread: threading.Thread | None = None
         self._shutdown = False
         self._failed = False
+        # 业务输入门禁：关闭后拒绝新动作、旧批次由 epoch 失效；释放仍允许入队执行
+        self._gate_open = True
+        self._gate_reason = ""
         self._epoch = 0
         self._executing = False
         self._next_ready = 0.0
@@ -155,6 +165,10 @@ class InputExecutor:
             if self._thread is not None and self._thread.is_alive():
                 return
             self._shutdown = False
+            self._failed = False
+            self._gate_open = True
+            self._gate_reason = ""
+            self._consecutive_errors = 0
             new_thread = threading.Thread(target=self._run, name=INPUT_THREAD_NAME, daemon=True)
             self._thread = new_thread
         new_thread.start()
@@ -179,6 +193,17 @@ class InputExecutor:
         with self._cond:
             return self._shutdown
 
+    @property
+    def gate_open(self) -> bool:
+        """业务输入门禁是否打开（暂停/停止/失败时为 False）。"""
+        with self._cond:
+            return self._gate_open
+
+    @property
+    def gate_reason(self) -> str:
+        with self._cond:
+            return self._gate_reason
+
     # --- 提交动作 ---------------------------------------------------
     def submit(self, actions: Sequence[Action] | Action) -> None:
         """把一批动作原子入队；输入线程已停止或已失败时忽略。"""
@@ -193,28 +218,95 @@ class InputExecutor:
                 self._stats.rejected += len(items)
                 logger.warning("输入线程已停止/失败，忽略 %d 个动作", len(items))
                 return
+            if not self._gate_open:
+                self._stats.rejected += len(items)
+                logger.debug(
+                    "输入门禁已关闭（原因=%s），忽略 %d 个业务动作",
+                    self._gate_reason or "unknown",
+                    len(items),
+                )
+                return
             batch = _TaskBatch.from_actions(items, epoch=self._epoch)
             self._enqueue_locked(batch)
             self._cond.notify_all()
 
     # --- 释放与停止 -------------------------------------------------
     def release_all(self, *, timeout: float = 2.0) -> None:
-        """请求输入线程释放所有按下的键鼠（暂停/失焦等场景使用）。
+        """取消待执行业务动作 + 关闭门禁 + 请求输入线程释放所有键鼠（暂停/失焦使用）。
 
-        释放动作由输入线程执行并等待其完成；输入线程已退出且未处于停止状态时
-        （异常退出）才在调用线程兜底释放。
+        语义（ISS-004）：先关闭业务输入门禁、使在途/排队批次失效并清空队列，
+        再等待输入线程确认释放。恢复时必须显式 :meth:`open_gate`。
+        """
+        self.close_gate_and_release("release_all", wait=True, timeout=timeout)
+
+    def close_gate_and_release(
+        self, reason: str = "", *, wait: bool = False, timeout: float = 2.0
+    ) -> int:
+        """关闭业务输入门禁并请求释放键鼠（线程安全、可被安全监控线程调用）。
+
+        ``wait=False``（默认）只入队释放控制动作后立即返回，由输入线程执行；
+        ``wait=True`` 等待输入线程确认释放（最多 ``timeout`` 秒）。
+        返回释放请求序号（输入线程未运行时为 0）。
         """
         with self._cond:
+            self._gate_open = False
+            if reason:
+                self._gate_reason = reason
+            self._epoch += 1  # 使在途/排队批次失效
+            dropped = sum(len(batch.actions) for batch in self._queue if not batch.release_all)
+            if dropped:
+                # 只保留控制批次（释放），业务动作全部丢弃
+                self._queue = deque(batch for batch in self._queue if batch.release_all)
+                self._stats.dropped += dropped
             thread = self._thread
             alive = thread is not None and thread.is_alive()
             already_stopped = self._shutdown
-            seq = self._enqueue_release_locked("release_all") if alive else 0
+            seq = self._enqueue_release_locked(reason or "gate_close") if alive else 0
             self._cond.notify_all()
         if not alive:
             if not already_stopped:
                 self._fallback_release("输入线程未运行")
-            return
-        self._wait_release_done(seq, timeout)
+            return 0
+        if wait:
+            self._wait_release_done(seq, timeout)
+        return seq
+
+    def open_gate(self, reason: str = "") -> bool:
+        """重新打开业务输入门禁（暂停恢复后、重新识别画面完成时调用）。"""
+        with self._cond:
+            if self._shutdown or self._failed:
+                return False
+            was_open = self._gate_open
+            self._gate_open = True
+            self._gate_reason = ""
+            self._cond.notify_all()
+        if not was_open:
+            logger.info("输入门禁已重新打开（%s）", reason or "resume")
+        return True
+
+    def reset_after_failure(self) -> bool:
+        """输入线程连续失败后的显式恢复：清失败状态、重置计数、重新打开门禁。
+
+        必须在暂停状态、确认后端问题已排除后调用；输入线程若已退出会重新启动。
+        返回是否恢复成功（停止状态返回 False）。
+        """
+        with self._cond:
+            if self._shutdown:
+                return False
+            was_failed = self._failed
+            self._failed = False
+            self._consecutive_errors = 0
+            self._gate_open = True
+            self._gate_reason = ""
+            self._epoch += 1
+            thread = self._thread
+            alive = thread is not None and thread.is_alive()
+            self._cond.notify_all()
+        if not alive:
+            self.start()
+        if was_failed:
+            logger.warning("输入线程失败状态已重置，门禁重新打开（请确认输入后端可用）")
+        return True
 
     def stop(self, drain: bool = True) -> None:
         """停止输入线程：清空待执行动作，由输入线程释放键鼠后退出。
@@ -226,6 +318,8 @@ class InputExecutor:
         with self._cond:
             already_stopped = self._shutdown
             self._shutdown = True
+            self._gate_open = False
+            self._gate_reason = "stop"
             self._epoch += 1  # 使在途批次剩余动作失效
             dropped = sum(len(batch.actions) for batch in self._queue if not batch.release_all)
             self._queue.clear()
@@ -411,7 +505,12 @@ class InputExecutor:
 
     def _batch_invalid(self, batch: _TaskBatch) -> bool:
         with self._cond:
-            return batch.epoch != self._epoch or self._shutdown or self._failed
+            return (
+                batch.epoch != self._epoch
+                or self._shutdown
+                or self._failed
+                or not self._gate_open
+            )
 
     def _run_batch(self, batch: _TaskBatch) -> None:
         for index, action in enumerate(batch.actions):
@@ -437,6 +536,8 @@ class InputExecutor:
                 self._record_failure(exc)
                 if self._failed:
                     self._drop_remaining(batch, index + 1)
+                    # ISS-009：连续失败后由输入线程立即尝试释放（幂等，只释放已按下状态）
+                    self._release_after_failure()
                     break
                 continue
             with self._cond:
@@ -488,6 +589,9 @@ class InputExecutor:
             reached = self._consecutive_errors >= MAX_CONSECUTIVE_ERRORS
             if reached:
                 self._failed = True
+                # 失败后关闭业务门禁：后续动作一律拒绝，避免继续误发输入
+                self._gate_open = False
+                self._gate_reason = "input_failed"
                 self._stats.rejected += self._pending_actions_locked()
                 self._queue.clear()
             self._cond.notify_all()
@@ -495,9 +599,15 @@ class InputExecutor:
         logger.error("输入后端执行失败（连续 %d 次）: %s", count, exc)
         if reached:
             logger.critical(
-                "连续 %d 次输入失败，停止执行动作；上层应释放输入并进入 PAUSED（详细设计 9.2）",
+                "连续 %d 次输入失败，停止执行动作并关闭输入门禁；"
+                "上层应释放输入并进入 PAUSED（详细设计 9.2 / ISS-009）",
                 count,
             )
+
+    def _release_after_failure(self) -> None:
+        """输入线程内立即尝试释放一次键鼠（连续失败后调用，失败不抛）。"""
+        logger.warning("输入线程连续失败，尝试释放已按下的键鼠")
+        self._process_release(_TaskBatch.release_batch(epoch=self._epoch, seq=0))
 
     def _process_release(self, batch: _TaskBatch) -> None:
         try:

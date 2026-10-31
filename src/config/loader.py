@@ -739,6 +739,48 @@ def load_global(
             collected,
             nav_loc,
         ),
+        full_map_open_wait_s=_float_value(
+            navigation_raw,
+            "full_map_open_wait_s",
+            defaults.navigation.full_map_open_wait_s,
+            collected,
+            nav_loc,
+        ),
+        full_map_close_wait_s=_float_value(
+            navigation_raw,
+            "full_map_close_wait_s",
+            defaults.navigation.full_map_close_wait_s,
+            collected,
+            nav_loc,
+        ),
+        full_map_verify_s=_float_value(
+            navigation_raw,
+            "full_map_verify_s",
+            defaults.navigation.full_map_verify_s,
+            collected,
+            nav_loc,
+        ),
+        full_map_retry=_int_value(
+            navigation_raw,
+            "full_map_retry",
+            defaults.navigation.full_map_retry,
+            collected,
+            nav_loc,
+        ),
+        autopilot_verify_min_move_px=_float_value(
+            navigation_raw,
+            "autopilot_verify_min_move_px",
+            defaults.navigation.autopilot_verify_min_move_px,
+            collected,
+            nav_loc,
+        ),
+        autopilot_verify_min_speed=_float_value(
+            navigation_raw,
+            "autopilot_verify_min_speed",
+            defaults.navigation.autopilot_verify_min_speed,
+            collected,
+            nav_loc,
+        ),
     )
 
     behavior_raw = section("behavior")
@@ -1469,6 +1511,19 @@ def load_profile(
         hp_fill_hsv_lower=_int_triple(battle_hud_raw, "hp_fill_hsv_lower", None, collected, hud_loc),
         hp_fill_hsv_upper=_int_triple(battle_hud_raw, "hp_fill_hsv_upper", None, collected, hud_loc),
         hp_fill_zero_ratio=_float_value(battle_hud_raw, "hp_fill_zero_ratio", 0.03, collected, hud_loc),
+        # ISS-002（评审 10.2）：颜色无关的血条填充列比例判定与退出授权参数
+        hp_bar_empty_max_ratio=_float_value(
+            battle_hud_raw, "hp_bar_empty_max_ratio", 0.02, collected, hud_loc
+        ),
+        hp_bar_alive_min_ratio=_float_value(
+            battle_hud_raw, "hp_bar_alive_min_ratio", 0.10, collected, hud_loc
+        ),
+        hp_bar_confirm_frames=_int_value(
+            battle_hud_raw, "hp_bar_confirm_frames", 2, collected, hud_loc
+        ),
+        hp_bar_evidence_ttl_s=_float_value(
+            battle_hud_raw, "hp_bar_evidence_ttl_s", 1.0, collected, hud_loc
+        ),
         spectator_features=_str_list(battle_hud_raw, "spectator_features", (), collected, hud_loc),
         death_banner_feature=_str_value(
             battle_hud_raw, "death_banner_feature", "death_banner", collected, hud_loc
@@ -1662,6 +1717,14 @@ def load_ship(
     card_path = resolve_path(card_template, ship_dir) if card_template else None
     hp_bar_template = _opt_str(raw, "hp_bar_template", None, collected, label)
     hp_bar_path = resolve_path(hp_bar_template, ship_dir) if hp_bar_template else None
+    card_search_region = _normalized_rect(raw, "card_search_region", None, collected, label)
+    # 已选中证据（ISS-007）：selected_feature 是目标船选中态模板文件名（含选中高亮/边框）；
+    # 搜索区域缺省回退 card_search_region。模板缺失时 selected_path=None，运行期保守失败。
+    selected_feature = _opt_str(raw, "selected_feature", None, collected, label)
+    selected_template_path = resolve_path(selected_feature, ship_dir) if selected_feature else None
+    selected_region = _normalized_rect(raw, "selected_region", None, collected, label)
+    if selected_region is None:
+        selected_region = card_search_region
     loadout_slots_raw = raw.get("loadout_slots")
     slots: list[LoadoutSlotDef] = []
     if loadout_slots_raw is None:
@@ -1700,17 +1763,35 @@ def load_ship(
         ship_id=_str_value(raw, "ship_id", "", collected, label),
         display_name=_str_value(raw, "display_name", "", collected, label),
         card_template=card_template,
-        card_search_region=_normalized_rect(raw, "card_search_region", None, collected, label),
+        card_search_region=card_search_region,
+        selected_feature=selected_feature,
+        selected_region=selected_region,
+        selected_threshold=_float_value(raw, "selected_threshold", 0.85, collected, label),
         hp_bar_template=hp_bar_template,
         loadout_preset_feature=_opt_str(raw, "loadout_preset_feature", None, collected, label),
         loadout_slots=tuple(slots),
         max_scrolls=_int_value(raw, "max_scrolls", 20, collected, label),
         scroll_direction=_str_value(raw, "scroll_direction", "down", collected, label),
         scroll_clicks=_int_value(raw, "scroll_clicks", 1, collected, label),
+        cover_list_start=_bool_value(raw, "cover_list_start", True, collected, label),
+        max_position_scrolls=_int_value(raw, "max_position_scrolls", 10, collected, label),
+        scroll_settle_s=_float_value(raw, "scroll_settle_s", 0.4, collected, label),
+        confirm_frames=_int_value(raw, "confirm_frames", 2, collected, label),
+        confirm_timeout_s=_float_value(raw, "confirm_timeout_s", 3.0, collected, label),
+        max_click_attempts=_int_value(raw, "max_click_attempts", 2, collected, label),
+        endpoint_stable_scrolls=_int_value(raw, "endpoint_stable_scrolls", 2, collected, label),
+        endpoint_diff_ratio=_float_value(raw, "endpoint_diff_ratio", 0.02, collected, label),
+        candidate_merge_px=_int_value(raw, "candidate_merge_px", 8, collected, label),
+        selection_timeout_s=_float_value(raw, "selection_timeout_s", 60.0, collected, label),
         notes=_str_value(raw, "notes", "", collected, label),
         ship_dir=ship_dir,
         card_path=card_path if card_path is not None and card_path.is_file() else None,
         hp_bar_path=hp_bar_path if hp_bar_path is not None and hp_bar_path.is_file() else None,
+        selected_path=(
+            selected_template_path
+            if selected_template_path is not None and selected_template_path.is_file()
+            else None
+        ),
     )
 
 

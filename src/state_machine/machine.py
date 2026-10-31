@@ -74,6 +74,10 @@ class MachineDeps:
     screenshots: ScreenshotManager
     ship_checker: ShipChecker
     autopilot: Any | None = None  # AutoPilotNavigator（简化导航模式，不识别地图/航线）
+    # 共享 StopController（ISS-006）：暂停/恢复与安全监控保持同一来源；鸭子类型，可为 None
+    controller: Any | None = None
+    # 当前战斗编号上下文回调（ISS-010）：导航/行为/步骤事件据此关联场次
+    on_battle_context: Callable[[int | None], None] | None = None
     window_info_provider: Callable[[], WindowInfo | None] | None = None
     rng: random.Random | None = None
     logger_: logging.Logger | None = None
@@ -100,6 +104,7 @@ class StateMachine:
         self._exit_error: str | None = None
         self._battle: _BattleRuntime | None = None
         self._stop_request: Any | None = None
+        self._controller = deps.controller
         self._pause_reason: str = ""
         self._resume_requested = False
         self._finished = False
@@ -164,6 +169,10 @@ class StateMachine:
         return self._stop_request
 
     @property
+    def pause_reason(self) -> str:
+        return self._pause_reason
+
+    @property
     def battles_completed(self) -> int:
         return self._battles_completed
 
@@ -206,6 +215,12 @@ class StateMachine:
         self._now = self.deps.clock.now()
         if self._stop_request is None:
             self._stop_request = self.deps.session.stop(reason, detail)
+        # ISS-006：停止请求统一同步到共享 StopController（与安全监控/GUI 同源）
+        if self._controller is not None and not getattr(self._controller, "stop_requested", True):
+            try:
+                self._controller.request_stop(str(reason), detail, hook="state_machine")
+            except Exception:  # 控制器实现异常不阻塞停止
+                pass
         if self._state not in (State.STOPPING, State.PAUSED):
             self._transition(State.STOPPING, f"stop:{reason}")
 
@@ -214,6 +229,12 @@ class StateMachine:
         if self._state is State.PAUSED or self._state is State.STOPPING:
             return
         self._pause_reason = reason
+        # ISS-006：把暂停同步到共享 StopController，保证 F11/主循环/GUI 能看到同一状态
+        if self._controller is not None:
+            try:
+                self._controller.request_pause(str(reason), detail, hook="state_machine")
+            except Exception:
+                pass
         self._transition(State.PAUSED, f"pause:{reason}:{detail}".rstrip(":"))
 
     def request_resume(self) -> None:
@@ -376,8 +397,8 @@ class StateMachine:
     # ==================================================================
     def _enter_init(self, now: float, reason: str) -> None:
         self._stop_subflows()
-        self._battle = None
-        self._battle_id = None
+        # ISS-006：离开战斗上下文但未走完结算时必须显式收尾，不能静默清空 battle_id
+        self._abort_battle(now, f"enter_init:{reason}")
         self._battle_result = ""
         self._exit_method = "none"
         self._exit_error = None
@@ -413,8 +434,7 @@ class StateMachine:
     # ==================================================================
     def _enter_port(self, now: float, reason: str) -> None:
         self._stop_subflows()
-        self._battle = None
-        self._battle_id = None
+        self._abort_battle(now, f"enter_port:{reason}")
         self._battle_result = ""
         self._exit_method = "none"
         self._exit_error = None
@@ -440,26 +460,29 @@ class StateMachine:
                 return []
             if now < self._port_wait_until:
                 return []
-            sequence = self.config.profile.ship_check_sequence
-            self._port_phase = "loadout" if (sequence and self.deps.ship_checker.verify_each_battle) else "verify"
+            # ISS-007：先确认已选中目标船，再检查该船信号旗，避免用上一艘船的装备页结果开局
+            if self.deps.ship_checker.verify_each_battle:
+                self._port_phase = "verify"
+            else:
+                self._port_phase = "start"
             return []
         if phase == "loadout":
-            # 装备页信号旗校验：切到装备页 → 等待“信号旗 0/8”空槽特征 → 切回港口页
+            # 装备页信号旗校验：切到装备页 → 等待“信号旗 0/8”空槽特征
             sequence = self.config.profile.ship_check_sequence
             if not sequence:
-                self._port_phase = "verify"
+                self._port_phase = "start"
                 return []
             if not self._port_loadout_started:
                 self._port_loadout_started = True
                 try:
                     self.deps.steps.start(sequence, label="loadout_check")
                 except Exception as exc:
-                    self._port_phase = "verify"
+                    self._port_phase = "start"
                     self._logger.warning("装备校验序列启动失败: %s", exc)
                     return []
             status, actions = self._advance_steps(observation, now)
             if status is StepStatus.DONE:
-                self._port_phase = "verify"
+                self._port_phase = "start"
                 self._log_action("loadout_verify", {"result": "ok", "signal_flags": 0})
             elif status is StepStatus.FAILED:
                 reason = getattr(self.deps.steps, "last_error", None)
@@ -473,7 +496,9 @@ class StateMachine:
                 return []
             status, actions = self.deps.ship_checker.tick(now, observation)
             if status is ShipCheckStatus.OK:
-                self._port_phase = "start"
+                # 船已确认选中：之后才检查该船的信号旗
+                self._log_action("ship_verify", {"result": "ok", "ship_id": self.config.ship.ship_id})
+                self._port_phase = "loadout" if self.config.profile.ship_check_sequence else "start"
                 return actions
             if status is ShipCheckStatus.FAILED:
                 self._exit_error = self.deps.ship_checker.failure_reason
@@ -568,12 +593,43 @@ class StateMachine:
     # ==================================================================
     def _enter_battle_active(self, now: float, reason: str) -> None:
         self._stop_subflows()
-        self._battle = _BattleRuntime(started_at=now, seed=self._rng.randrange(2**31))
+        # ISS-006：同一场次内从暂停恢复时保留 _battle/_battle_id，不重建场次上下文
+        resuming = self._battle is not None and self._battle_id is not None
+        if self._battle is None:
+            self._battle = _BattleRuntime(started_at=now, seed=self._rng.randrange(2**31))
+        else:
+            self._battle.nav_started = False
+            self._battle.behavior_started = False
+            if self._autopilot_mode():
+                self._battle.bootstrapped = True
+            else:  # waypoints 恢复需要重新识别地图/出生点
+                self._battle.bootstrapped = False
         try:
+            # 恢复时重置死亡判定：必须重新积累“血条归零”证据才能再次授权退出
             self.deps.perception.begin_battle(now)
         except Exception as exc:
             self._logger.warning("感知引擎 begin_battle 失败: %s", exc)
-        self._log_action("state_change", {"to": "BATTLE_ACTIVE"})
+        self._log_action("state_change", {"to": "BATTLE_ACTIVE", "resumed": resuming})
+        if resuming:
+            self._resume_battle_flows(now)
+
+    def _resume_battle_flows(self, now: float) -> None:
+        """战斗内暂停恢复：重启自动驾驶与随机行为，保留原 battle_id/场次记录。"""
+        battle = self._battle
+        if battle is None:
+            return
+        if self._autopilot_mode():
+            autopilot = self.deps.autopilot
+            if autopilot is not None:
+                try:
+                    autopilot.start(now)
+                    battle.nav_started = True
+                    self._log_action("autopilot_resume", {"mode": "autopilot"})
+                except Exception as exc:
+                    self._logger.warning("autopilot 恢复失败: %s", exc)
+            else:
+                self._logger.warning("autopilot 模式但未注入自动导航器，恢复后导航不启动")
+        self._start_behavior(now, battle, persist=False)
 
     def _handle_battle_active(self, observation: Observation, now: float) -> list[Action]:
         # 结算优先于死亡（评审 P1-5）
@@ -582,15 +638,17 @@ class StateMachine:
             self._stop_subflows()
             self._transition(State.BATTLE_FINISHED, "battle_results")
             return []
-        death = observation.death
-        if death is not None and death.dead:
+        # ISS-002：只有“血条确认归零”的证据才授权提前退出；
+        # 死亡提示/血条名称消失/标记丢失不能单独作为退出授权。
+        if self._exit_authorized(observation, now):
+            death = observation.death
             self._battle_result = "dead"
             if self._battle_id is not None:
                 try:
                     self.deps.events.mark_death(self._battle_id)
                 except Exception:
                     pass
-                self._log_action("death_detected", death.to_dict())
+                self._log_action("death_detected", death.to_dict() if death is not None else {})
             self._save_diagnostic("death", now)
             self._transition(State.DEAD_PENDING_EXIT, "death_detected")
             return []
@@ -601,7 +659,9 @@ class StateMachine:
                 actions.extend(self._safe_tick_autopilot(observation, now))
             else:
                 actions.extend(self._safe_tick_navigator(observation, now))
-        if battle is not None and battle.behavior_started:
+        # ISS-001：autopilot 打开全屏地图点选期间屏蔽随机行为，避免误触其它战斗输入
+        autopilot_blocking = bool(getattr(self.deps.autopilot, "blocks_behavior", False))
+        if battle is not None and battle.behavior_started and not autopilot_blocking:
             actions.extend(self._safe_tick_behavior(observation, now))
         return actions
 
@@ -707,14 +767,18 @@ class StateMachine:
         )
         return []
 
-    def _start_behavior(self, now: float, battle: _BattleRuntime) -> None:
+    def _start_behavior(self, now: float, battle: _BattleRuntime, *, persist: bool = True) -> None:
         from ..behavior.random_profile import RandomProfile
 
         try:
             profile = RandomProfile.generate(self.config.global_config.behavior, seed=battle.seed)
             self.deps.behavior.start(profile, now)
             battle.behavior_started = True
-            if self._battle_id is not None:
+            if (
+                persist
+                and self._battle_id is not None
+                and battle.random_profile_id is None
+            ):
                 try:
                     battle.random_profile_id = self.deps.events.save_random_profile(self._battle_id, profile.to_dict())
                 except Exception as exc:
@@ -849,6 +913,19 @@ class StateMachine:
 
     def _handle_dead_pending_exit(self, observation: Observation, now: float) -> list[Action]:
         if now < self._dead_wait_until:
+            return []
+        # ISS-002：发送退出操作前再次校验“血条确认归零”证据仍在有效期内；
+        # 出现存活/未知证据时撤销尚未执行的退出，回到战斗继续等待自然结算。
+        if not self._exit_authorized(observation, now):
+            if self._result_visible(observation, now):
+                self._battle_result = "finished"
+                self._transition(State.BATTLE_FINISHED, "exit_revoked_result")
+            else:
+                self._log_action(
+                    "exit_revoked",
+                    {"reason": "hp_evidence_not_authorized", "death": observation.death.to_dict() if observation.death else None},
+                )
+                self._transition(State.BATTLE_ACTIVE, "exit_revoked")
             return []
         self._transition(State.EXIT_MENU_OPEN, "dead_wait_done")
         return []
@@ -997,6 +1074,7 @@ class StateMachine:
             pass
         self._battle_id = None
         self._battle = None
+        self._notify_battle_context(None)
         self._transition(State.PORT, "battle_finished_cleanup")
 
     # ==================================================================
@@ -1044,6 +1122,13 @@ class StateMachine:
         if self._recovery_step == 2:
             if now < self._recovery_wait_until:
                 return []
+            # ISS-002：战斗内未知画面不自动发送 ESC（可能是战斗 HUD 被遮挡/加载抖动），
+            # 只重试识别或暂停，避免误开退出菜单。
+            if self._battle_id is not None:
+                self._logger.warning("战斗内未知画面，不发送 ESC，转入暂停等待人工确认")
+                self._log_action("recovery", {"kind": "battle_unknown_interface", "action": "pause"})
+                self.request_pause("battle_unknown_interface", "战斗内未知画面，未自动发送 ESC")
+                return []
             # 第三步：按一次 ESC，等待菜单或状态变化
             key = self.deps.config.keymap.resolve(self.profile.exit.menu_key)
             actions.extend([Action.key_down(key, label="recovery_escape"), Action.key_up(key, label="recovery_escape")])
@@ -1074,26 +1159,117 @@ class StateMachine:
     # ==================================================================
     def _enter_paused(self, now: float, reason: str) -> None:
         self._stop_subflows()
+        # ISS-004：暂停时关闭输入门禁并等待输入线程确认释放，之后不再执行排队动作
+        executor = self.deps.executor
+        close_fn = getattr(executor, "close_gate_and_release", None)
         try:
-            self.deps.executor.release_all()
+            if callable(close_fn):
+                close_fn(f"pause:{reason}", wait=True, timeout=2.0)
+            else:  # 兼容测试 fake
+                executor.release_all()
         except Exception as exc:
             self._logger.warning("暂停时释放输入失败: %s", exc)
         self._save_diagnostic(f"pause_{_slug(reason)}", now)
         self._log_action("state_change", {"to": "PAUSED", "reason": reason})
 
+    def _open_input_gate(self, reason: str) -> None:
+        open_fn = getattr(self.deps.executor, "open_gate", None)
+        if callable(open_fn):
+            try:
+                open_fn(reason)
+            except Exception as exc:
+                self._logger.debug("打开输入门禁失败: %s", exc)
+
     def _handle_paused(self, observation: Observation, now: float) -> list[Action]:
         if self._resume_requested:
             self._resume_requested = False
             self._logger.info("收到恢复指令，重新识别界面")
-            self._transition(State.INIT, "user_resume")
+            self._resume_from_pause(observation, now, source="user")
             return []
-        # 因窗口失去焦点/暂不可用而暂停时，窗口恢复后自动回到 INIT（不需要再按 F11）
+        # 因窗口失去焦点/暂不可用而暂停时，窗口恢复后自动回到原流程（不需要再按 F11）
         if self._pause_reason in ("window_lost", "window_unfocused", "window_unavailable"):
             info = self._window_info
             if info is not None and info.available and info.foreground and not observation.window_missing:
                 self._logger.info("游戏窗口已回到前台，自动恢复")
-                self._transition(State.INIT, "window_focus_restored")
+                self._resume_from_pause(observation, now, source="window")
         return []
+
+    def _resume_from_pause(self, observation: Observation, now: float, *, source: str) -> None:
+        """ISS-006 恢复分流：当前会话战斗保留场次上下文；新进程不接管已有战斗。"""
+        detected = None if observation.window_missing else self._safe_detect_state(now)
+        battle_id = self._battle_id
+        battle_active = battle_id is not None and self._battle is not None and self._battle_result != "finished"
+        if battle_active:
+            if detected in (State.BATTLE_ACTIVE, State.QUEUEING, State.LOADING):
+                self._log_action("resume", {"source": source, "mode": "battle", "detected": detected.value})
+                self._transition(State.BATTLE_ACTIVE, f"resume_battle:{source}")
+                self._open_input_gate("resume_battle")
+                return
+            if detected is State.BATTLE_FINISHED:
+                self._battle_result = "finished"
+                self._transition(State.BATTLE_FINISHED, f"resume_result:{source}")
+                self._open_input_gate("resume_result")
+                return
+            if detected in (
+                State.EXIT_MENU_OPEN,
+                State.EXIT_CONFIRMING,
+                State.EXITING,
+                State.POST_EXIT_INTERFACE,
+                State.DEAD_PENDING_EXIT,
+            ):
+                self._transition(detected, f"resume_exit:{source}")
+                self._open_input_gate("resume_exit")
+                return
+            if detected is State.PORT:
+                self._abort_battle(now, f"resume_port_interrupt:{source}")
+                self._transition(State.PORT, f"resume_port:{source}")
+                self._open_input_gate("resume_port")
+                return
+            self._stay_paused("resume_unknown", f"无法识别当前战斗画面（detected={detected}）", source)
+            return
+        # 无本进程战斗上下文：新进程不接管已开始的战斗
+        if detected is State.PORT:
+            self._transition(State.PORT, f"resume_port:{source}")
+            self._open_input_gate("resume_port")
+            return
+        if detected is State.POST_EXIT_INTERFACE:
+            self._transition(State.POST_EXIT_INTERFACE, f"resume_popup:{source}")
+            self._open_input_gate("resume_popup")
+            return
+        if detected is State.BATTLE_FINISHED:
+            self._battle_result = "finished"
+            self._transition(State.BATTLE_FINISHED, f"resume_result:{source}")
+            self._open_input_gate("resume_result")
+            return
+        if detected in (
+            State.LOADING,
+            State.BATTLE_ACTIVE,
+            State.DEAD_PENDING_EXIT,
+            State.EXIT_MENU_OPEN,
+            State.EXIT_CONFIRMING,
+            State.EXITING,
+        ):
+            self._stay_paused(
+                "restart_mid_battle",
+                "不接管本进程启动前已存在的战斗，等待自然结算或回港后再恢复",
+                source,
+            )
+            return
+        # 其余情况按全新流程从 INIT 重新识别（港口/排队/未知界面）
+        self._transition(State.INIT, f"resume_{source}")
+        self._open_input_gate("resume_init")
+
+    def _stay_paused(self, reason: str, detail: str, source: str) -> None:
+        """恢复尝试无法离开 PAUSED 时保持暂停；用户手动恢复需重新同步控制器暂停状态。"""
+        self._pause_reason = reason
+        if source == "user" and self._controller is not None:
+            # 主循环已清除控制器暂停，若不写回会在本状态“无人暂停”却无法自动恢复
+            try:
+                self._controller.request_pause(reason, detail, hook="state_machine")
+            except Exception:
+                pass
+        self._logger.warning("%s：%s", reason, detail)
+        self._log_action("resume_refused", {"reason": reason, "detail": detail, "source": source})
 
     def _enter_stopping(self, now: float, reason: str) -> None:
         self._stop_subflows()
@@ -1104,13 +1280,7 @@ class StateMachine:
             self.deps.executor.stop(drain=True)
         except Exception as exc:
             self._logger.warning("停止输入线程失败: %s", exc)
-        if self._battle_id is not None:
-            try:
-                self.deps.events.end_battle(self._battle_id, "aborted", self._exit_method, detail or None)
-                self.deps.screenshots.end_battle(self._battle_id)
-            except Exception as exc:
-                self._logger.debug("写异常结束战斗记录失败: %s", exc)
-            self._battle_id = None
+        self._abort_battle(now, f"stop:{reason_text}")
         try:
             if self._session_id is not None:
                 self.deps.events.end_session(self._session_id, reason_text, self._battles_completed)
@@ -1151,11 +1321,55 @@ class StateMachine:
             self._battle_id = self.deps.events.begin_battle(self._session_id, map_id)
             self.deps.screenshots.begin_battle(self._battle_id)
             self.deps.session.begin_battle()
+            self._notify_battle_context(self._battle_id)
             self._log_action("state_change", {"to": "battle_begin", "map_id": map_id})
         except Exception as exc:
             self._logger.warning("创建战斗记录失败: %s", exc)
             self._battle_id = None
         return self._battle_id
+
+    def _abort_battle(self, now: float, reason: str) -> None:
+        """ISS-006：离开战斗上下文但未走完结算时显式结束场次记录（幂等）。"""
+        battle_id = self._battle_id
+        if battle_id is not None:
+            try:
+                self.deps.events.end_battle(battle_id, "aborted", "interrupted", reason)
+                self.deps.screenshots.end_battle(battle_id)
+                self._log_action("battle_aborted", {"reason": reason})
+            except Exception as exc:
+                self._logger.debug("写中断战斗记录失败: %s", exc)
+        self._battle_id = None
+        self._battle = None
+        self._battle_result = ""
+        self._notify_battle_context(None)
+
+    def _notify_battle_context(self, battle_id: int | None) -> None:
+        callback = self.deps.on_battle_context
+        if callback is None:
+            return
+        try:
+            callback(battle_id)
+        except Exception as exc:
+            self._logger.debug("更新战斗上下文失败: %s", exc)
+
+    def _exit_authorized(self, observation: Observation, now: float) -> bool:
+        """ISS-002：判断是否已满足“血条确认归零”的提前退出门禁。
+
+        只认感知层给出的 ``exit_authorized``（基于颜色无关的空条证据 + 连续帧 + TTL）；
+        死亡提示、血条名称模板消失、小地图标记丢失都不能单独授权。
+        """
+        death = observation.death
+        if death is None:
+            return False
+        if not bool(getattr(death, "exit_authorized", False)):
+            return False
+        # evidence_at 是单调时钟秒；0.0 也是合法证据时间（FakeClock 从 0 起步的测试），
+        # “从未确认”由 exit_authorized=False 表达，这里只校验新鲜度。
+        evidence_at = float(getattr(death, "evidence_at", 0.0))
+        if evidence_at < 0:
+            return False
+        ttl = float(getattr(self.profile.battle_hud, "hp_bar_evidence_ttl_s", 1.0) or 0.0)
+        return now - evidence_at <= max(ttl, 0.0) + 0.5
 
     def _port_visible(self, observation: Observation, now: float) -> bool:
         feature = self.profile.exit.port_feature or "port_indicator"

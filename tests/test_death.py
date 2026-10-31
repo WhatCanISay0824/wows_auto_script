@@ -1,4 +1,4 @@
-"""死亡投票测试（详细设计 5.9；评审 P0-7 修正口径）。
+"""死亡投票测试（详细设计 5.9；评审 P0-7 修正口径 / 评审 10.2 退出授权）。
 
 覆盖：
 - 开局静默窗口（ignore_start_s）内不判定、不计时；
@@ -8,7 +8,9 @@
 - 观战模式后己方血条信号不参与投票、不触发直判；
 - 矛盾只清对应信号，不清空其他信号计时；
 - marker_lost 使用独立的 marker_lost_stable_s；
-- 判定后锁存、reset 清空、votes 字段与额外键容忍。
+- 判定后锁存、reset 清空、votes 字段与额外键容忍；
+- ISS-002 / 评审 10.2：血条归零证据（hp_fill_ratio/hp_evidence）、连续帧确认、
+  证据 TTL、矛盾证据撤销，以及 banner/hp_bar_absent/marker_lost 不能单独授权退出。
 """
 
 from __future__ import annotations
@@ -17,7 +19,7 @@ from dataclasses import replace
 
 import pytest
 from src.common.types import DeathSignals
-from src.config.models import DeathConfig
+from src.config.models import BattleHudConfig, DeathConfig
 from src.perception.death import SIGNAL_NAMES, DeathDetector, death_score_weights_valid
 
 BATTLE_START = 100.0
@@ -355,3 +357,160 @@ def test_weights_helper() -> None:
     assert death_score_weights_valid(DeathConfig()) is True
     assert death_score_weights_valid(_config(weights={"banner": -1.0})) is False
     assert death_score_weights_valid(_config(weights={})) is False
+
+
+# ---------------------------------------------------------------------------
+# ISS-002 / 评审 10.2：血条归零证据（hp_fill_ratio / hp_evidence）与退出授权
+# ---------------------------------------------------------------------------
+
+
+def _hud_detector(
+    *,
+    confirm_frames: int = 2,
+    ttl_s: float = 1.0,
+    config: DeathConfig | None = None,
+    battle_started_at: float = 0.0,
+) -> DeathDetector:
+    return DeathDetector(
+        config or _config(ignore_start_s=0.0),
+        battle_started_at=battle_started_at,
+        hud=BattleHudConfig(
+            hp_bar_confirm_frames=confirm_frames,
+            hp_bar_evidence_ttl_s=ttl_s,
+        ),
+    )
+
+
+def _hp_update(
+    detector: DeathDetector,
+    timestamp: float,
+    *,
+    evidence: str = "zero",
+    ratio: float | None = 0.0,
+    frame_id: int | None = None,
+    votes: dict[str, bool] | None = None,
+):
+    return detector.update(
+        votes or {},
+        timestamp,
+        hp_fill_ratio=ratio,
+        hp_evidence=evidence,
+        frame_id=frame_id,
+    )
+
+
+def test_hp_evidence_requires_consecutive_frames_and_ttl() -> None:
+    """连续 2 个新帧 zero 才授权；同一帧重复消费不刷新证据，TTL 到期失效。"""
+    detector = _hud_detector(confirm_frames=2, ttl_s=1.0)
+    first = _hp_update(detector, 1.0, frame_id=1)
+    assert first.hp_evidence == "zero"
+    assert first.hp_fill_ratio == 0.0
+    assert first.exit_authorized is False
+    assert first.evidence_at == 0.0
+    second = _hp_update(detector, 1.5, frame_id=2)
+    assert second.exit_authorized is True
+    assert second.evidence_at == 1.5
+    # 同一帧（frame_id=2）反复调用：不刷新证据时间戳，1.0s TTL 内仍有效、超时失效。
+    assert _hp_update(detector, 2.4, frame_id=2).exit_authorized is True
+    assert _hp_update(detector, 2.6, frame_id=2).exit_authorized is False
+
+
+def test_banner_and_hp_bar_absent_do_not_authorize_exit() -> None:
+    """banner / hp_bar_absent / marker_lost 不能单独授权提前退出（只能参与投票/日志）。"""
+    detector = _hud_detector()
+    votes = {"hp_bar_absent": True, "banner": True, "marker_lost": True}
+    for timestamp in (1.0, 1.5, 2.0, 3.0, 4.0):
+        signals = detector.update(
+            votes,
+            timestamp,
+            hp_fill_ratio=None,
+            hp_evidence="unavailable",
+            frame_id=int(timestamp * 2),
+        )
+        assert signals.exit_authorized is False
+        assert signals.hp_evidence == "unavailable"
+
+
+def test_unknown_evidence_does_not_authorize_exit() -> None:
+    """空条上限与存活下限之间的 unknown 死区不授权（保守等待自然结算）。"""
+    detector = _hud_detector()
+    for frame_id, timestamp in enumerate((1.0, 1.5, 2.0, 2.5), start=1):
+        signals = _hp_update(detector, timestamp, evidence="unknown", ratio=0.05, frame_id=frame_id)
+        assert signals.exit_authorized is False
+        assert signals.hp_evidence == "unknown"
+
+
+def test_alive_evidence_revokes_exit_authorization() -> None:
+    """授权后出现存活帧：立即撤销授权，evidence_at 清零。"""
+    detector = _hud_detector()
+    _hp_update(detector, 1.0, frame_id=1)
+    authorized = _hp_update(detector, 1.5, frame_id=2)
+    assert authorized.exit_authorized is True
+    revoked = _hp_update(detector, 2.0, evidence="alive", ratio=0.6, frame_id=3)
+    assert revoked.exit_authorized is False
+    assert revoked.hp_evidence == "alive"
+    assert revoked.evidence_at == 0.0
+
+
+def test_spectator_mode_disables_hp_exit_authorization() -> None:
+    """观战模式下看到的不是己方血条：零证据失效、不授权。"""
+    detector = _hud_detector()
+    _hp_update(detector, 1.0, frame_id=1)
+    _hp_update(detector, 1.5, frame_id=2)
+    signals = detector.update(
+        {"spectator_ui": True},
+        2.0,
+        hp_fill_ratio=0.0,
+        hp_evidence="zero",
+        frame_id=3,
+    )
+    assert detector.spectator_mode is True
+    assert signals.hp_evidence == "unavailable"
+    assert signals.hp_fill_ratio is None
+    assert signals.exit_authorized is False
+
+
+def test_ignore_start_window_does_not_authorize_exit() -> None:
+    """战斗开始后 ignore_start_s 内不累计归零证据（如实上报但证据时间戳为 0）。"""
+    detector = _hud_detector(config=_config(ignore_start_s=5.0), battle_started_at=10.0)
+    for frame_id, timestamp in enumerate((10.0, 10.5, 11.0, 12.0), start=1):
+        signals = _hp_update(detector, timestamp, frame_id=frame_id)
+        assert signals.hp_evidence == "zero"
+        assert signals.exit_authorized is False
+        assert signals.evidence_at == 0.0
+    # 静默结束后重新累计连续帧。
+    _hp_update(detector, 15.0, frame_id=10)
+    assert _hp_update(detector, 15.5, frame_id=11).exit_authorized is True
+
+
+def test_hp_evidence_values_are_sanitized() -> None:
+    """非法证据值降为 unknown；zero 没有填充比例也降为 unknown（不凭空授权）。"""
+    detector = _hud_detector()
+    garbage = _hp_update(detector, 1.0, evidence="not-a-level", ratio=0.0, frame_id=1)
+    assert garbage.hp_evidence == "unknown"
+    no_ratio = _hp_update(detector, 1.5, evidence="zero", ratio=None, frame_id=2)
+    assert no_ratio.hp_evidence == "unknown"
+    assert no_ratio.exit_authorized is False
+
+
+def test_legacy_votes_without_hp_evidence_never_authorize() -> None:
+    """未传血条证据的旧调用（只传 votes）可继续投票，但绝不授权提前退出。"""
+    detector = _hud_detector()
+    for timestamp in (1.0, 2.0, 3.0):
+        signals = detector.update(_only("hp_zero"), timestamp)
+        assert signals.exit_authorized is False
+        assert signals.hp_evidence == "unavailable"
+        assert signals.evidence_at == 0.0
+
+
+def test_death_signals_to_dict_contains_hp_evidence_fields() -> None:
+    """DeathSignals 序列化包含 4 个新字段（诊断日志/复盘用）。"""
+    detector = _hud_detector()
+    _hp_update(detector, 1.0, frame_id=1)
+    signals = _hp_update(detector, 1.5, frame_id=2)
+    payload = signals.to_dict()
+    assert payload["hp_evidence"] == "zero"
+    assert payload["hp_fill_ratio"] == 0.0
+    assert payload["exit_authorized"] is True
+    assert payload["evidence_at"] == 1.5
+    assert signals.to_dict()["votes"]["hp_zero"] is True

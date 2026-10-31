@@ -32,7 +32,7 @@ from ..common.types import (
     State,
     WindowInfo,
 )
-from ..config.models import AppConfig, ClientProfile, MapPack, PerceptionConfig
+from ..config.models import AppConfig, BattleHudConfig, ClientProfile, MapPack, PerceptionConfig
 from .capture import Frame, GdiCapture
 from .death import DeathDetector
 from .features import FeatureMatcher
@@ -63,6 +63,26 @@ _BATTLE_EXTRA_FEATURES: tuple[str, ...] = (
     "result_panel",
     "spectator_indicator",
 )
+
+# ---------------------------------------------------------------------------
+# ISS-002 / 评审 10.2：颜色无关的血条填充列比例
+# ---------------------------------------------------------------------------
+# HP 条 UI 用高饱和、高亮度的红/橙/黄/绿渲染（UI 层颜色，不受战场光照影响）；
+# 空血时只剩暗红色的舰体轮廓，亮度明显偏低。判定：HSV 色相只保留红→黄→绿区间，
+# S/V 取高下限；逐列统计填充像素，单列至少 _HP_FILL_COLUMN_MIN_PX 个才计入填充列，
+# 滤掉轮廓/抗锯齿边缘。取值由 2026-10-30 三张实机样本标定（见 tests/test_hp_bar.py）：
+# 满血绿色 fill≈0.70、79.6% 黄色 fill≈0.77、0 血红色空条 fill≈0.007。
+_HP_FILL_SATURATION_MIN = 150
+_HP_FILL_VALUE_MIN = 190
+#: OpenCV 色相：红≈0、橙≈15、黄≈25、绿≈80；青/蓝（>90）不属于 HP 条颜色。
+_HP_FILL_HUE_MAX = 90
+#: 红色跨越 0 度时另一侧的色相。
+_HP_FILL_HUE_RED_MIN = 160
+#: 单列至少多少个填充像素才算“填充列”。
+_HP_FILL_COLUMN_MIN_PX = 3
+#: 血条区域最小尺寸（像素）；过小说明标定异常，按不可用处理。
+_HP_BAR_MIN_REGION_WIDTH = 32
+_HP_BAR_MIN_REGION_HEIGHT = 8
 
 
 def _collect_sequence_features(profile: ClientProfile) -> tuple[str, ...]:
@@ -191,13 +211,23 @@ class PerceptionEngine:
     def feature_matcher(self) -> FeatureMatcher:
         return self._feature_matcher
 
+    @property
+    def last_death(self) -> DeathSignals | None:
+        """最近一帧的死亡/血条证据结果（诊断与测试用）。"""
+        return self._last_death
+
     def set_calibration(self, calibration: BattleCalibration | None) -> None:
         self._calibration = calibration
 
     def begin_battle(self, now: float) -> None:
         """进入战斗：重置死亡投票与舰船跟踪（详细设计 6.3）。"""
         self._battle_started_at = float(now)
-        self._death_detector = DeathDetector(self.perception_config.death, float(now))
+        # 血条归零证据的连续帧/TTL 属于客户端 battle_hud 标定（评审 10.2）。
+        self._death_detector = DeathDetector(
+            self.perception_config.death,
+            float(now),
+            hud=self.profile.battle_hud,
+        )
         self._last_death = None
         self._ship_locator.reset()
         self._calibration = None
@@ -223,9 +253,10 @@ class PerceptionEngine:
     def configure_ship_hp_bar(self, ship) -> None:
         """按当前船只覆盖“己方血条存在”模板。
 
-        - 船只档案提供 ``hp_bar.png`` 时注册为该船专用模板，启用 hp_bar_absent 死亡信号；
-        - 未提供时注销该特征并禁用该信号，死亡判定改用死亡提示/结算界面兜底
-          （避免用别的船的模板误判“血条消失”）。
+        - 船只档案提供 ``hp_bar.png`` 时注册为该船专用模板（每船血条文字不同），
+          该模板同时是“血条区域有效性”的判据（ISS-002 / 评审 10.2）；
+        - 未提供时注销该特征并禁用该信号：血条归零证据变成 ``unavailable``，
+          提前退出**不会**获得授权，只等自然结算/死亡提示（保守兜底）。
         """
         template_matcher = self._feature_matcher.template_matcher
         hp_bar_path = getattr(ship, "hp_bar_path", None)
@@ -536,12 +567,50 @@ class PerceptionEngine:
     # ------------------------------------------------------------------
     # 死亡判定
     # ------------------------------------------------------------------
-    def _hp_zero_ratio(self, frame: Frame) -> float | None:
-        """血条填充比例（详细设计 5.9）：按 battle_hud 区域与 HSV 阈值估算。"""
+    def _hp_bar_region(self, frame: Frame) -> Rect | None:
+        """己方血条区域（整条血条，含空条底色）的窗口像素矩形。"""
         hud = self.profile.battle_hud
-        if hud.hp_bar_region is None or hud.hp_fill_hsv_lower is None or hud.hp_fill_hsv_upper is None:
+        if hud.hp_bar_region is None:
             return None
         region = hud.hp_bar_region.to_pixels(frame.window_rect.w, frame.window_rect.h)
+        if region.w < _HP_BAR_MIN_REGION_WIDTH or region.h < _HP_BAR_MIN_REGION_HEIGHT:
+            return None
+        return region
+
+    def _hp_bar_fill_ratio(self, frame: Frame, region: Rect | None = None) -> float | None:
+        """颜色无关的血条填充列比例（ISS-002 / 评审 10.2）。
+
+        在 ``battle_hud.hp_bar_region``（整条血条区域）内逐列统计“填充像素”：
+        高饱和度、高亮度的红/橙/黄/绿都算填充，深色底与空血暗红轮廓不算；
+        ``fill ratio = 填充列数 / 区域宽度``，与具体血量颜色无关。
+        """
+        region = region or self._hp_bar_region(frame)
+        if region is None:
+            return None
+        image = frame.crop(region)
+        if image is None or image.size == 0:
+            return None
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        hue = hsv[:, :, 0]
+        saturation = hsv[:, :, 1]
+        value = hsv[:, :, 2]
+        hue_ok = (hue <= _HP_FILL_HUE_MAX) | (hue >= _HP_FILL_HUE_RED_MIN)
+        fill = hue_ok & (saturation >= _HP_FILL_SATURATION_MIN) & (value >= _HP_FILL_VALUE_MIN)
+        column_counts = np.count_nonzero(fill, axis=0)
+        width = int(column_counts.size)
+        if width <= 0:
+            return None
+        filled_columns = int(np.count_nonzero(column_counts >= _HP_FILL_COLUMN_MIN_PX))
+        return filled_columns / float(width)
+
+    def _hp_green_ratio(self, frame: Frame, region: Rect | None = None) -> float | None:
+        """旧绿色 HSV 范围降级为辅助证据（只写日志，不再单独代表血量）。"""
+        hud = self.profile.battle_hud
+        if hud.hp_fill_hsv_lower is None or hud.hp_fill_hsv_upper is None:
+            return None
+        region = region or self._hp_bar_region(frame)
+        if region is None:
+            return None
         image = frame.crop(region)
         if image is None or image.size == 0:
             return None
@@ -549,8 +618,43 @@ class PerceptionEngine:
         lower = np.array(hud.hp_fill_hsv_lower, dtype=np.uint8)
         upper = np.array(hud.hp_fill_hsv_upper, dtype=np.uint8)
         mask = cv2.inRange(hsv, lower, upper)
-        ratio = float(np.count_nonzero(mask)) / float(mask.size)
-        return ratio
+        return float(np.count_nonzero(mask)) / float(mask.size)
+
+    def _hp_evidence(
+        self,
+        frame: Frame | None,
+        features: Mapping[str, MatchResult],
+        hud: BattleHudConfig,
+    ) -> tuple[float | None, str, bool]:
+        """汇总血条归零证据：返回 (fill ratio, evidence 等级, hp_bar_present 是否命中)。
+
+        区域有效性判据（评审 10.2）：只认 ``hp_bar_present`` 模板命中（当前船只的
+        ``ships/<id>/hp_bar.png``，由 ``configure_ship_hp_bar`` 注册）。模板缺失/未命中
+        （遮挡、结算界面、观战切换）时一律不给 zero 证据——否则“没看到血条”会被误判
+        成“血条归零”，违反 ISS-002 硬约束。
+        """
+        # 与旧实现保持一致：模板启用且 profile 声明了该特征，才参与血条判读。
+        hp_bar_enabled = bool(self._hp_bar_check_enabled and "hp_bar_present" in self.profile.features)
+        hp_bar_result = features.get("hp_bar_present")
+        if hp_bar_result is None and hp_bar_enabled and frame is not None:
+            # 调用方只传了部分特征时补一次匹配（check_death 也可能被外部单独调用）。
+            hp_bar_result = self._feature_matcher.match("hp_bar_present", frame)
+        hp_bar_found = bool(hp_bar_result and hp_bar_result.found)
+        region = self._hp_bar_region(frame) if (frame is not None and hp_bar_enabled) else None
+        fill_ratio = self._hp_bar_fill_ratio(frame, region) if region is not None else None
+        if fill_ratio is None:
+            return None, "unavailable", hp_bar_found
+        if not hp_bar_found:
+            # 血条区域有像素但无法确认是己方血条（遮挡/其他界面）：不判读，绝不归零。
+            return fill_ratio, "unknown", hp_bar_found
+        empty_max = float(hud.hp_bar_empty_max_ratio)
+        alive_min = float(hud.hp_bar_alive_min_ratio)
+        if fill_ratio <= empty_max:
+            return fill_ratio, "zero", hp_bar_found
+        if fill_ratio >= alive_min:
+            return fill_ratio, "alive", hp_bar_found
+        # 空条上限与存活下限之间：无法可靠判断，保守等待自然结算。
+        return fill_ratio, "unknown", hp_bar_found
 
     def check_death(
         self,
@@ -559,7 +663,7 @@ class PerceptionEngine:
         features: Mapping[str, MatchResult] | None = None,
         ship: ShipPosition | None = None,
     ) -> DeathSignals:
-        """汇总死亡信号并交给投票器（详细设计 5.9）。"""
+        """汇总死亡信号与血条归零证据并交给投票器（详细设计 5.9 / 评审 10.2）。"""
         now = self._clock.now() if now is None else float(now)
         empty = DeathSignals(False, False, False, False, False, score=0.0, stable_ms=0, timestamp=now)
         if self._death_detector is None:
@@ -569,14 +673,9 @@ class PerceptionEngine:
             ids = self._battle_feature_ids(set())
             features = self._feature_matcher.match_many(ids, frame) if frame is not None else {}
         hud = self.profile.battle_hud
-        hp_bar_feature = self._hp_bar_check_enabled and "hp_bar_present" in self.profile.features
-        hp_bar_found = bool(features.get("hp_bar_present") and features["hp_bar_present"].found)
-        hp_bar_absent = hp_bar_feature and not hp_bar_found
-        hp_zero = False
-        if not hp_bar_absent and frame is not None:
-            ratio = self._hp_zero_ratio(frame)
-            if ratio is not None:
-                hp_zero = ratio < float(hud.hp_fill_zero_ratio)
+        hp_fill_ratio, hp_evidence, hp_bar_found = self._hp_evidence(frame, features, hud)
+        hp_bar_feature = bool(self._hp_bar_check_enabled and "hp_bar_present" in self.profile.features)
+        hp_bar_absent = bool(hp_bar_feature and not hp_bar_found)
         banner = bool(features.get(hud.death_banner_feature) and features[hud.death_banner_feature].found)
         spectator = any(
             bool(features.get(feature_id) and features[feature_id].found) for feature_id in hud.spectator_features
@@ -584,14 +683,28 @@ class PerceptionEngine:
         if ship is None:
             ship = self._last_ship
         marker_lost = ship is None or ship.source == "lost"
+        if frame is not None and self._logger.isEnabledFor(logging.DEBUG):
+            self._logger.debug(
+                "血条证据: fill=%s evidence=%s hp_bar_present=%s green_aux=%s",
+                "无" if hp_fill_ratio is None else f"{hp_fill_ratio:.4f}",
+                hp_evidence,
+                hp_bar_found,
+                self._hp_green_ratio(frame),
+            )
         votes = {
             "hp_bar_absent": hp_bar_absent,
-            "hp_zero": hp_zero,
+            "hp_zero": hp_evidence == "zero",
             "banner": banner,
             "marker_lost": marker_lost,
             "spectator_ui": spectator,
         }
-        signals = self._death_detector.update(votes, now)
+        signals = self._death_detector.update(
+            votes,
+            now,
+            hp_fill_ratio=hp_fill_ratio,
+            hp_evidence=hp_evidence,
+            frame_id=frame.frame_id if frame is not None else None,
+        )
         self._last_death = signals
         return signals
 
@@ -626,9 +739,13 @@ class PerceptionEngine:
         frame = self.latest_frame(now)
         if frame is None:
             window_rect = self._last_window.client_rect.to_tuple() if self._last_window else (0, 0, 0, 0)
+            # 帧缺失时血条证据变成 unavailable：必须让投票器撤销尚未执行的退出授权，
+            # 不能沿用上一帧的“确认归零”证据（ISS-002：过期帧不授权）。
+            death = self.check_death(now, None, {}) if self._death_detector is not None else None
             return Observation(
                 timestamp=now,
                 window_rect=window_rect,
+                death=death,
                 window_missing=True,
                 capture_error=self._last_capture_error,
                 frame_id=self._last_frame.frame_id if self._last_frame else 0,

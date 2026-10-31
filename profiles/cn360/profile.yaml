@@ -34,12 +34,22 @@ minimap:
   marker_jump_px: 300
   marker_lost_s: 3
 
-# 战斗 HUD 与死亡判定标定（实测截图）
+# 战斗 HUD 与死亡判定标定（实测截图；ISS-002 / 评审 10.2 口径）
 battle_hud:
-  hp_bar_region: [0.026, 0.731, 0.118, 0.758]   # 己方血条绿色填充区域（左下）
+  # 整条己方血条区域（含空条底色与暗红空血轮廓），归一化到窗口客户区。
+  # 标定依据：2026-10-30 三张实机截图，覆盖铁公爵（宽剪影）与列宁格勒（窄剪影），
+  # 区域需同时包含两种剪影的完整宽度与舰体底部横条（y 约 0.737~0.7665）。
+  hp_bar_region: [0.014, 0.737, 0.130, 0.7665]
+  # 旧绿色 HSV 范围降级为辅助证据（只写调试日志，不再单独代表血量）
   hp_fill_hsv_lower: [68, 150, 150]             # 实测绿色填充 HSV ≈ (80, 190~217, 200~244)
   hp_fill_hsv_upper: [92, 255, 255]
-  hp_fill_zero_ratio: 0.05
+  hp_fill_zero_ratio: 0.05                      # 旧字段：保留兼容，已不再作为判零依据
+  # ISS-002 颜色无关填充列比例判定：fill ratio = 填充列数 / 区域宽度
+  # 实机样本：满血绿≈0.70、79.6% 黄≈0.77、0 血红色空条≈0.007
+  hp_bar_empty_max_ratio: 0.02                  # 低于=空条（确认归零）
+  hp_bar_alive_min_ratio: 0.10                  # 高于=存活；两者之间=无法判断（不授权）
+  hp_bar_confirm_frames: 2                      # 连续 N 个新帧确认归零才授权提前退出
+  hp_bar_evidence_ttl_s: 1.0                    # 归零证据有效期（秒）；超时/矛盾证据撤销授权
   spectator_features: []                        # 用户确认：死亡立刻退出，不需要观战界面
   death_banner_feature: death_banner            # 已提取（“您的战舰已被玩家摧毁”）
   result_feature: battle_results                # 已提取（结算页右侧固定分页栏）

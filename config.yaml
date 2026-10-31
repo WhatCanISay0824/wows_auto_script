@@ -38,16 +38,19 @@ map:
   expected_minimap_scale: null # 期望小地图缩放比例，null 表示按底图与小地图尺寸自动推导
 
 navigation:
-  # ===== 导航模式（用户简化需求）=====
-  # autopilot：开局在小地图上点“我方出生点关于地图中心的对称区域”，交给游戏自动驾驶，
-  #            之后不碰 WASD，也不识别地图/航线；只需要客户端小地图标定与自身标记模板。
+  # ===== 导航模式（用户简化需求 + ISS-001 修复口径）=====
+  # autopilot：按 M 打开全屏战术地图，点选“我方出生点关于地图中心的对称区域”后交给
+  #            游戏自动驾驶，之后不碰 WASD，也不识别地图/航线；只需要客户端小地图标定、
+  #            自身标记模板与下面的全屏地图内容区矩形。
   # waypoints：传统模式，需要地图包、地图识别、出生点与航线标定（保留可选）。
   mode: autopilot
-  autopilot_target: symmetric  # center=小地图中心；symmetric=对称敌区且横坐标固定到中线
+  autopilot_target: symmetric  # center=地图中心；symmetric=对称敌区且横坐标固定到中线
   autopilot_reclick_s: [60, 120]  # 周期重发航点间隔（到达/卡住后自动重发，避免停船）
   autopilot_overshoot: 0.6     # waypoints 旧模式预留，autopilot 不使用
   autopilot_offset: [0.0, 0.0] # 目标点相对归一化坐标微调（[dx, dy]，0 为不偏移）
-  surface: minimap             # 点击面：minimap（v1 只支持）
+  # 点击面（ISS-001，实现补充 10.1）：实机确认“先按 M 开全屏地图再点选”才会设置航向，
+  # 直接点战斗画面小地图无效。full_map=autopilot 默认；minimap=旧交互，仅失败降级/兼容。
+  surface: full_map
   arrival_m: 400               # waypoints 模式到达判定距离（世界米，仅作上限）
   overshoot_m: 800             # waypoints 模式越点判定距离
   overshoot_cos_threshold: -0.5  # 越点判定的方向余弦阈值
@@ -65,8 +68,26 @@ navigation:
   ship_lost_degrade_s: 3       # 自身位置丢失后进入降级模式的时间
   ship_lost_abandon_s: 10      # 自身位置丢失后放弃导航的时间
   route_end_action: wait       # waypoints 模式航线结束后行为：v1 仅支持 wait
-  full_map_rect: null          # 全屏地图归一化区域（v1 未实现）
-  full_map_toggle_key: full_map  # 全屏地图开关，对应 keys.yaml 动作名
+  # 全屏地图内容区（相对窗口客户区的归一化矩形；实现补充 10.1）。
+  # 标定依据：2026-10-30 实机 M 地图截图 211242.png / 211253.png（2559x1599，gitignored），
+  # 用 numpy/OpenCV 检测地图网格外边框：上边 y≈111.5、下边 y≈1399.5、左边 x 从顶部
+  # 656.7 收到底部 608.1、右边 x 从顶部 1902.0 展到底部 1950.5（截图坐标）；
+  # 归一化（按 2559x1599，2560x1600 客户区通用）后取外接矩形，不含网格字母/数字标签、
+  # 右侧教程面板；顶部比分栏是覆盖在地图上的 HUD，不改变内容区边界。
+  # 注意 1（待实机确认）：实机截图中全屏地图是“上窄下宽”的透视梯形，按矩形线性换算在
+  # 纵向有不超过内容区高度约 2%（≈24px）的残差；该假设（整图居中显示、不滚动/缩放）与
+  # 点击是否真的设置航向都必须实机验证，未验证前不得宣称已修复。
+  # 注意 2：顶部比分栏遮挡地图上缘；目标 v=1-own_y 通常 ≥0.05，代码另有边界内缩。
+  full_map_rect: [0.2376, 0.0698, 0.7622, 0.8752]
+  full_map_toggle_key: full_map  # 全屏地图开关，对应 keys.yaml 动作名（已有 full_map: m）
+  # M 全屏地图点选的时序与航向验证参数（默认值为初始假设，待实机确认；均可用配置调整）
+  full_map_open_wait_s: 1.0      # 按 M 后等待地图界面就绪（固定时序假设，非模板判断）
+  full_map_close_wait_s: 0.4     # 点击生效后等待再按 M 关图
+  full_map_verify_s: 8.0         # 关图后验证航向的观察窗口（自身标记位移或船速）
+  full_map_retry: 2              # 验证失败后的全屏地图重试次数（不含首次）
+  autopilot_verify_min_move_px: 3.0   # 验证成功的最小自身标记位移（小地图内容区像素）
+  autopilot_verify_min_speed: 0.5     # 验证成功的最小船速（m/s）
+
 
 behavior:
   camera_interval_s: [3, 15]           # 视角动作间隔范围（秒）
@@ -116,6 +137,12 @@ perception:
   map_refresh_inlier_gain: 0.20        # 刷新时新结果内点数需提升的相对比例
   map_refresh_translation_px: 5.0      # 刷新时新结果允许的平移差上限
   death:
+    # ISS-002（评审 10.2）：hp_zero 由感知层的“颜色无关血条填充列比例”推导
+    # （阈值/连续帧/TTL 在 profiles/<client>/profile.yaml 的 battle_hud 段：
+    #  hp_bar_empty_max_ratio / hp_bar_alive_min_ratio / hp_bar_confirm_frames /
+    #  hp_bar_evidence_ttl_s）。下面的权重/阈值只用于死亡投票与日志，
+    #  banner / hp_bar_absent / marker_lost / spectator_ui 不能单独授权提前退出；
+    #  提前退出的唯一授权是感知层 exit_authorized（血条区域有效+连续帧归零+证据新鲜）。
     weights:                           # 死亡信号权重（详细设计 5.9）
       hp_bar_absent: 0.35
       hp_zero: 0.25
@@ -124,9 +151,9 @@ perception:
       spectator_ui: 0.05
     score_threshold: 0.65              # 综合得分阈值（0.75 在 hp_zero 不可用时不可达）
     stable_s: 1.0                      # 综合判定稳定时间
-    strong_stable_s: 1.5               # 强信号直接判定的稳定时间
+    strong_stable_s: 1.5               # 强信号直接判定的稳定时间（只用于日志/统计）
     marker_lost_stable_s: 3.0          # 自身标记消失信号的稳定时间
-    ignore_start_s: 5.0                # 战斗开始后不判定死亡的时长
+    ignore_start_s: 5.0                # 战斗开始后不判定死亡的时长（也不授权退出）
     banner_latch_s: 5.0                # 死亡提示命中后的锁存时间（提示可能只显示数秒）
 
 input:

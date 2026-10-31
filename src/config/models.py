@@ -96,12 +96,21 @@ class MinimapConfig:
 
 @dataclass(frozen=True, slots=True)
 class BattleHudConfig:
-    """战斗 HUD 与死亡判定相关的界面标定（详细设计 5.9）。"""
+    """战斗 HUD 与死亡判定相关的界面标定（详细设计 5.9 / 评审 10.2）。"""
 
     hp_bar_region: NormalizedRect | None = None
     hp_fill_hsv_lower: tuple[int, int, int] | None = None
     hp_fill_hsv_upper: tuple[int, int, int] | None = None
     hp_fill_zero_ratio: float = 0.03
+    # --- ISS-002（评审 10.2）：颜色无关的血条填充列比例判定 ---------------
+    # hp_fill_zero_ratio / hp_fill_hsv_* 降级为辅助证据（保留兼容，不再单独代表血量）：
+    # 整条血条区域逐列统计“填充像素”，fill ratio = 填充列数 / 有效列数。
+    # 低于 empty_max 视为空条（确认归零），高于 alive_min 视为存活，两者之间无法判断。
+    hp_bar_empty_max_ratio: float = 0.02
+    hp_bar_alive_min_ratio: float = 0.10
+    # 退出授权需要连续 N 帧确认归零，且最近证据在 TTL 内（超时/矛盾证据立即撤销）。
+    hp_bar_confirm_frames: int = 2
+    hp_bar_evidence_ttl_s: float = 1.0
     spectator_features: tuple[str, ...] = ()
     death_banner_feature: str = "death_banner"
     result_feature: str = "battle_results"
@@ -222,24 +231,50 @@ class LoadoutSlotDef:
 
 @dataclass(frozen=True, slots=True)
 class ShipProfile:
-    """船只卡片与空装备标定（详细设计 3.2 / 6.8）。"""
+    """船只卡片、已选中证据与选船查找参数（详细设计 3.2 / 6.8 / 实现补充 10.7）。
+
+    ISS-007 口径：目标船卡片“可见”不等于“已选中”。选中态由 :attr:`selected_feature`
+    （目标船处于选中状态时的模板，由标定工具生成）独立确认；未标定或无法可靠匹配时
+    运行期保守失败并提示补标定，不能把 ``ship_card`` 命中当作当前船正确。
+    """
 
     ship_id: str
     display_name: str
     card_template: str = "card.png"
     card_search_region: NormalizedRect | None = None
+    # --- 已选中证据（ISS-007 / 实现补充 10.7） -------------------------------
+    # 选中态模板文件名（相对 ship.yaml 目录），例如 selected.png。
+    # 模板必须同时包含目标船身份特征（船名/船体）与“已选中”高亮/边框，不能只截通用
+    # 选中边框（否则任何船被选中都会误匹配）；由标定工具生成。
+    # None 或模板文件缺失表示尚未标定：运行期 FAILED 并提示补标定，不做猜测。
+    selected_feature: str | None = None
+    # 选中态模板搜索区域；None 时由 loader 回退为 card_search_region
+    selected_region: NormalizedRect | None = None
+    selected_threshold: float = 0.85
     # 每船独立的“己方血条存在”模板：不同船名/舰种的血条面板文字不同，换船需替换；
     # 未提供时死亡判定不使用“血条消失”信号（改用死亡提示/结算界面兜底）。
     hp_bar_template: str | None = None
     loadout_preset_feature: str | None = None
     loadout_slots: tuple[LoadoutSlotDef, ...] = ()
-    max_scrolls: int = 20
+    # --- 选船查找（ISS-007）：所有参数来自 ship.yaml，不写死在代码里 ---------
+    max_scrolls: int = 20  # 扫描阶段最大滚动次数（空 ship_selection_sequence 也使用该预算）
     scroll_direction: str = "down"  # 船只列表滚动方向：down 或 up（详细设计 6.8）
     scroll_clicks: int = 1  # 每次滚动格数
+    cover_list_start: bool = True  # 先反向滚到可确认的列表起点再扫描，覆盖目标在初始位置两侧
+    max_position_scrolls: int = 10  # 起点定位阶段最大滚动次数
+    scroll_settle_s: float = 0.4  # 每次滚动后等待新画面/稳定的时间
+    confirm_frames: int = 2  # 点击目标卡后至少等待的新帧数，才查询已选中证据
+    confirm_timeout_s: float = 3.0  # 点击后等待新帧并确认已选中的超时
+    max_click_attempts: int = 2  # 同一目标重复点击上限（避免每场都点与无限点击）
+    endpoint_stable_scrolls: int = 2  # 连续“滚动后画面不再变化”次数，用于判定列表端点
+    endpoint_diff_ratio: float = 0.02  # 画面采样平均差异低于该比例视为“没有变化”
+    candidate_merge_px: int = 8  # 候选中心距离小于该像素视为同一张卡，避免重复候选
+    selection_timeout_s: float = 60.0  # 整个选船查找（定位+扫描+确认）的总超时
     notes: str = ""
     ship_dir: Path | None = None
     card_path: Path | None = None
     hp_bar_path: Path | None = None
+    selected_path: Path | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -349,7 +384,10 @@ class NavigationConfig:
     因此移动确认与卡住判定使用 px；arrival_m/overshoot_m 只用世界距离做上限。
     """
 
-    surface: str = "minimap"  # v1 只实现 minimap；full_map 未实现，校验器拒绝
+    # 点击面（ISS-001，实现补充 10.1）：full_map = 按 M 打开全屏地图后点选，是 autopilot 的
+    # 运行默认（项目 config.yaml 取此值）；minimap = 旧“直接点小地图”交互，仅作失败降级/兼容保留。
+    # 模型默认保留 minimap：waypoints 旧模式与不写 navigation 段的测试配置仍走旧行为。
+    surface: str = "minimap"
     # 导航模式（用户简化需求）：autopilot = 开局点小地图敌区后交给游戏自动驾驶，不碰 WASD；
     # waypoints = 使用地图包出生点/航线逐点导航（需要地图识别与标定）
     mode: str = "autopilot"
@@ -377,6 +415,13 @@ class NavigationConfig:
     route_end_action: str = "wait"  # v1 只支持 wait
     full_map_rect: NormalizedRect | None = None
     full_map_toggle_key: str = "full_map"
+    # --- ISS-001：M 全屏地图点选时序与验证（实现补充 10.1；默认值需实机确认）---
+    full_map_open_wait_s: float = 1.0  # 按 M 后等待地图界面就绪（固定时序假设）
+    full_map_close_wait_s: float = 0.4  # 点击生效后等待再按 M 关图
+    full_map_verify_s: float = 8.0  # 关图后验证航向生效的观察窗口
+    full_map_retry: int = 2  # 验证失败后的全屏地图重试次数（不含首次）
+    autopilot_verify_min_move_px: float = 3.0  # 验证成功的最小自身标记位移（minimap_px）
+    autopilot_verify_min_speed: float = 0.5  # 验证成功的最小船速（m/s）
 
 
 @dataclass(frozen=True, slots=True)

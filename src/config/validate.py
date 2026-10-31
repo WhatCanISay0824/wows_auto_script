@@ -279,13 +279,28 @@ def validate_global_config(config: GlobalConfig) -> list[ValidationIssue]:
                     _loc(location, f"navigation.autopilot_offset[{index}]"),
                     "目标偏移应在 -1～1（相对小地图内容区）",
                 )
-    if nav.surface != "minimap":
+    if nav.surface not in ("minimap", "full_map"):
         _error(
             issues,
-            "unsupported",
+            "enum",
             _loc(location, "navigation.surface"),
-            f"v1 只支持 minimap 导航，full_map 未实现（当前 {nav.surface!r}）",
+            f"未知点击面 {nav.surface!r}（minimap / full_map）",
         )
+    elif nav.surface == "full_map":
+        if nav.mode == "waypoints":
+            _error(
+                issues,
+                "dependency",
+                _loc(location, "navigation.surface"),
+                "waypoints 模式只支持 surface=minimap；full_map 仅用于 autopilot（实现补充 10.1）",
+            )
+        if nav.full_map_rect is None:
+            _error(
+                issues,
+                "missing",
+                _loc(location, "navigation.full_map_rect"),
+                "surface=full_map 时必须配置全屏地图内容区矩形 navigation.full_map_rect",
+            )
     if nav.route_end_action != "wait":
         _error(
             issues,
@@ -441,6 +456,23 @@ def _validate_navigation(issues: list[ValidationIssue], nav: NavigationConfig, l
         )
     if not nav.full_map_toggle_key:
         _error(issues, "missing", loc("full_map_toggle_key"), "全屏地图开关动作名不能为空")
+    # ISS-001：M 全屏地图点选时序与验证参数（实现补充 10.1）
+    _check_non_negative(issues, nav.full_map_open_wait_s, loc("full_map_open_wait_s"), "全屏地图开图等待")
+    _check_non_negative(issues, nav.full_map_close_wait_s, loc("full_map_close_wait_s"), "全屏地图关图等待")
+    _check_positive(issues, nav.full_map_verify_s, loc("full_map_verify_s"), "航向验证窗口")
+    _check_int_non_negative(issues, nav.full_map_retry, loc("full_map_retry"), "全屏地图重试次数")
+    _check_positive(
+        issues,
+        nav.autopilot_verify_min_move_px,
+        loc("autopilot_verify_min_move_px"),
+        "航向验证最小位移",
+    )
+    _check_positive(
+        issues,
+        nav.autopilot_verify_min_speed,
+        loc("autopilot_verify_min_speed"),
+        "航向验证最小船速",
+    )
 
 
 def _validate_behavior(issues: list[ValidationIssue], behavior: BehaviorConfig, location: str) -> None:
@@ -880,6 +912,27 @@ def validate_profile(
         _warn(issues, "missing", f"{hud_loc}.hp_bar_region", "未配置己方血条区域，死亡判定缺少血条信号")
     _validate_hsv_pair(issues, hud.hp_fill_hsv_lower, hud.hp_fill_hsv_upper, f"{hud_loc}.hp_fill_hsv", required=False)
     _check_probability(issues, hud.hp_fill_zero_ratio, f"{hud_loc}.hp_fill_zero_ratio", "血条填充比例阈值")
+    # ISS-002（评审 10.2）：颜色无关填充列比例的空条/存活阈值与退出授权参数
+    _check_probability(
+        issues, hud.hp_bar_empty_max_ratio, f"{hud_loc}.hp_bar_empty_max_ratio", "空条填充比例上限"
+    )
+    _check_probability(
+        issues, hud.hp_bar_alive_min_ratio, f"{hud_loc}.hp_bar_alive_min_ratio", "存活填充比例下限"
+    )
+    if hud.hp_bar_empty_max_ratio >= hud.hp_bar_alive_min_ratio:
+        _error(
+            issues,
+            "range",
+            f"{hud_loc}.hp_bar_alive_min_ratio",
+            "存活下限必须大于空条上限："
+            f"{hud.hp_bar_alive_min_ratio} <= {hud.hp_bar_empty_max_ratio}",
+        )
+    _check_int_positive(
+        issues, hud.hp_bar_confirm_frames, f"{hud_loc}.hp_bar_confirm_frames", "血条归零确认帧数"
+    )
+    _check_positive(
+        issues, hud.hp_bar_evidence_ttl_s, f"{hud_loc}.hp_bar_evidence_ttl_s", "血条归零证据有效期"
+    )
     for feature_id in hud.spectator_features:
         if feature_id not in known_features and feature_id not in runtime_features:
             _error(
@@ -987,6 +1040,39 @@ def validate_ship(ship: ShipProfile, *, location: str | None = None) -> list[Val
     _check_int_positive(issues, ship.max_scrolls, _loc(location, "max_scrolls"), "最大滚动次数")
     if ship.scroll_clicks == 0:
         _error(issues, "range", _loc(location, "scroll_clicks"), "每次滚动格数不能为 0")
+    # --- 已选中证据与选船查找参数（ISS-007 / 实现补充 10.7） ---
+    if ship.selected_feature:
+        if ship.ship_dir is not None and not (ship.ship_dir / ship.selected_feature).is_file():
+            _warn(
+                issues,
+                "file_missing",
+                _loc(location, "selected_feature"),
+                "选中态模板缺失（待实机标定）：运行时会保守失败并提示补标定，"
+                "不会把“目标船卡片可见”当作已选中",
+            )
+        _check_probability(
+            issues, ship.selected_threshold, _loc(location, "selected_threshold"), "选中态模板阈值"
+        )
+    _check_int_positive(
+        issues, ship.max_position_scrolls, _loc(location, "max_position_scrolls"), "起点定位最大滚动次数"
+    )
+    _check_non_negative(issues, ship.scroll_settle_s, _loc(location, "scroll_settle_s"), "滚动后等待时间")
+    _check_int_positive(issues, ship.confirm_frames, _loc(location, "confirm_frames"), "点击后确认等待帧数")
+    _check_positive(issues, ship.confirm_timeout_s, _loc(location, "confirm_timeout_s"), "点击后确认超时")
+    _check_int_positive(issues, ship.max_click_attempts, _loc(location, "max_click_attempts"), "重复点击上限")
+    _check_int_positive(
+        issues,
+        ship.endpoint_stable_scrolls,
+        _loc(location, "endpoint_stable_scrolls"),
+        "列表端点判定次数",
+    )
+    _check_probability(
+        issues, ship.endpoint_diff_ratio, _loc(location, "endpoint_diff_ratio"), "端点画面差异比例"
+    )
+    _check_int_non_negative(
+        issues, ship.candidate_merge_px, _loc(location, "candidate_merge_px"), "候选去重距离"
+    )
+    _check_positive(issues, ship.selection_timeout_s, _loc(location, "selection_timeout_s"), "选船查找超时")
     if not ship.loadout_slots:
         _warn(issues, "empty", _loc(location, "loadout_slots"), "未配置空装备槽校验，无法确认未带信号旗/加成卡")
     seen_slots: set[str] = set()

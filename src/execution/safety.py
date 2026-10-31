@@ -8,6 +8,10 @@
   重新识别界面（评审补充 P1-1）；
 - 主循环心跳超时 → PAUSED：看门狗只设置停止标志并产生事件，由主线程负责停止子流程、
   请求输入线程释放键鼠；
+- **ISS-005**：``SafetyWatchdog(on_event=...)`` 的事件回调允许在监控线程内**直接**调用
+  :meth:`InputExecutor.close_gate_and_release`（线程安全、非阻塞）来关闭业务输入门禁并
+  请求释放，不再依赖主循环下一次同步；状态机转移与日志收尾仍由运行线程完成，
+  监控线程不直接发送游戏操作；
 - ``GetAsyncKeyState`` 通过 :class:`KeyStateSource` 协议抽象，单元测试注入
   :class:`FakeKeyStateSource`，不读取真实键盘（详细设计 14.1）。
 
@@ -348,8 +352,11 @@ class SafetyMonitor:
 class SafetyWatchdog:
     """看门狗线程外壳：以 20 Hz 周期调用 :meth:`SafetyMonitor.poll`（详细设计 2.4）。
 
-    只负责“周期轮询 + 分发事件”，不直接操作输入后端；收到事件后由主线程负责
-    停止子流程与请求输入线程释放键鼠。
+    只负责“周期轮询 + 分发事件”；收到事件后：
+    - 主线程负责状态机转移与日志收尾；
+    - ``on_event`` 回调（ISS-005）在监控线程内执行，可安全地调用
+      :meth:`InputExecutor.close_gate_and_release` 立即关闭输入门禁并请求释放；
+    - 监控线程不直接发送游戏操作（SendInput 只允许输入线程调用）。
     """
 
     def __init__(
