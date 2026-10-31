@@ -422,6 +422,9 @@ class NavigationConfig:
     full_map_retry: int = 2  # 验证失败后的全屏地图重试次数（不含首次）
     autopilot_verify_min_move_px: float = 3.0  # 验证成功的最小自身标记位移（minimap_px）
     autopilot_verify_min_speed: float = 0.5  # 验证成功的最小船速（m/s）
+    # ISS-001 实机修复：优先用战斗 HUD 的“M 自动驾驶开启”特征确认航向已生效
+    # （实机中船速估计可能为 0、小地图 8s 位移不足 3px，会导致误判失败并降级）
+    autopilot_verify_feature: str | None = "autopilot_indicator"
 
 
 @dataclass(frozen=True, slots=True)

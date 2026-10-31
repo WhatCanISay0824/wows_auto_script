@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 from src.common.types import (
     ActionKind,
+    MatchResult,
     NormalizedRect,
     Observation,
     Rect,
@@ -66,6 +67,7 @@ def make_config(
     retry: int = 2,
     min_move: float = 3.0,
     min_speed: float = 0.5,
+    verify_feature: str | None = "autopilot_indicator",
 ) -> NavigationConfig:
     return NavigationConfig(
         mode="autopilot",
@@ -80,6 +82,7 @@ def make_config(
         full_map_retry=retry,
         autopilot_verify_min_move_px=min_move,
         autopilot_verify_min_speed=min_speed,
+        autopilot_verify_feature=verify_feature,
     )
 
 
@@ -95,6 +98,7 @@ def make_observation(
     dy: float = 0.0,
     window: Rect = WINDOW,
     window_missing: bool = False,
+    features: dict[str, MatchResult] | None = None,
 ) -> Observation:
     content = MINIMAP_NORM.to_pixels(window.w, window.h)
     ship = None
@@ -107,7 +111,13 @@ def make_observation(
             confidence=0.9,
             source="marker",
         )
-    return Observation(timestamp=0.0, window_rect=window.to_tuple(), ship=ship, window_missing=window_missing)
+    return Observation(
+        timestamp=0.0,
+        window_rect=window.to_tuple(),
+        ship=ship,
+        window_missing=window_missing,
+        features=dict(features or {}),
+    )
 
 
 class _Events:
@@ -257,6 +267,53 @@ def test_full_map_confirms_by_marker_displacement() -> None:
     assert nav.tick(moved, 2.5) == []
     assert nav.phase == "reclick"
     assert nav.blocks_behavior is False
+
+
+def test_full_map_confirms_by_autopilot_indicator_feature() -> None:
+    """ISS-001 实机回归：M 点选后“M 自动驾驶开启”出现即确认，不再误判失败/降级。"""
+    events = _Events()
+    nav = make_nav(make_config(), keymap=make_keymap(), events=events)
+    nav.start(0.0)
+    obs = make_observation((0.5, 0.8))
+    assert nav.tick(obs, 0.0) == []
+    assert nav.tick(obs, 0.1) != []  # 开图
+    assert nav.tick(obs, 1.2) == []  # 等地图就绪
+    assert nav.tick(obs, 1.3) != []  # 点选
+    assert nav.tick(obs, 1.8) != []  # 关图，进入 verify
+    assert nav.phase == "verify"
+    indicator = {
+        "autopilot_indicator": MatchResult(
+            feature_id="autopilot_indicator",
+            found=True,
+            score=0.99,
+            center=(400, 1270),
+        )
+    }
+    # 船速 0、位移 0，仅凭 HUD 特征也应确认成功
+    confirm_obs = make_observation((0.5, 0.8), features=indicator)
+    assert nav.tick(confirm_obs, 2.2) == []
+    assert nav.phase == "reclick"
+    confirmed = events.last("autopilot_confirmed")
+    assert confirmed["confirmed_by"] == "autopilot_indicator"
+    assert nav.blocks_behavior is False
+
+
+def test_full_map_verify_feature_can_be_disabled() -> None:
+    nav = make_nav(make_config(verify_feature=None), keymap=make_keymap())
+    nav.start(0.0)
+    obs = make_observation((0.5, 0.8))
+    nav.tick(obs, 0.0)
+    nav.tick(obs, 0.1)
+    nav.tick(obs, 1.2)
+    nav.tick(obs, 1.3)
+    nav.tick(obs, 1.8)
+    assert nav.phase == "verify"
+    indicator = {
+        "autopilot_indicator": MatchResult(feature_id="autopilot_indicator", found=True, score=0.99)
+    }
+    # 关闭特征验证后，仅凭 HUD 特征不能确认；船速/位移仍为 0
+    nav.tick(make_observation((0.5, 0.8), features=indicator), 2.2)
+    assert nav.phase == "verify"
 
 
 def test_periodic_reclick_opens_map_again_after_confirmed() -> None:

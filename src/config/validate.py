@@ -473,6 +473,8 @@ def _validate_navigation(issues: list[ValidationIssue], nav: NavigationConfig, l
         loc("autopilot_verify_min_speed"),
         "航向验证最小船速",
     )
+    if nav.autopilot_verify_feature is not None and not nav.autopilot_verify_feature.strip():
+        _error(issues, "missing", loc("autopilot_verify_feature"), "航向验证特征名不能为空字符串（null 表示不用特征）")
 
 
 def _validate_behavior(issues: list[ValidationIssue], behavior: BehaviorConfig, location: str) -> None:

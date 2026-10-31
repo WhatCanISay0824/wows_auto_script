@@ -781,6 +781,13 @@ def load_global(
             collected,
             nav_loc,
         ),
+        autopilot_verify_feature=_opt_str(
+            navigation_raw,
+            "autopilot_verify_feature",
+            defaults.navigation.autopilot_verify_feature,
+            collected,
+            nav_loc,
+        ),
     )
 
     behavior_raw = section("behavior")

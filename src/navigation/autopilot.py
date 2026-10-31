@@ -122,6 +122,7 @@ class _VerifyState:
     displacement_px: float = 0.0
     speed_mps: float = 0.0
     confirmed: bool = False
+    confirmed_by: str = ""
 
 
 class AutoPilotNavigator:
@@ -442,22 +443,30 @@ class AutoPilotNavigator:
         verify = self._verify
         if verify is None:
             return
+        # ISS-001 实机修复：优先用战斗 HUD 的“M 自动驾驶开启”特征确认航向已生效。
+        # 实机中船速估计可能为 0、小地图 8s 位移不足 3px，仅靠位移/船速会误判失败并降级。
+        verify_feature = self.config.autopilot_verify_feature
+        if verify_feature and observation.found(verify_feature):
+            verify.confirmed = True
+            verify.confirmed_by = verify_feature
         ship = observation.ship
         if ship is None or ship.source == "lost":
             return
         current = (float(ship.minimap_px[0]), float(ship.minimap_px[1]))
+        verify.speed_mps = abs(float(ship.speed_mps))
         if verify.ref_px is None:
             # 关图时自身标记不可用：用验证窗口内首个可用样本作为参考
             verify.ref_px = current
             return
         displacement = math.dist(current, verify.ref_px)
         verify.displacement_px = max(verify.displacement_px, displacement)
-        verify.speed_mps = abs(float(ship.speed_mps))
         if (
             verify.displacement_px >= float(self.config.autopilot_verify_min_move_px)
             or verify.speed_mps >= float(self.config.autopilot_verify_min_speed)
         ):
             verify.confirmed = True
+            if not verify.confirmed_by:
+                verify.confirmed_by = "movement"
 
     def _confirm(self, now: float) -> None:
         verify = self._verify
@@ -470,12 +479,14 @@ class AutoPilotNavigator:
         detail = {
             "displacement_px": round(verify.displacement_px, 2) if verify else 0.0,
             "speed_mps": round(verify.speed_mps, 3) if verify else 0.0,
+            "confirmed_by": verify.confirmed_by if verify else "",
             "clicks": self._clicks,
         }
         self._emit("autopilot_confirmed", now, **detail)
         self._logger.info(
-            "autopilot 航向确认生效：位移 %.2fpx 或船速 %.2f m/s（阈值 %.2fpx / %.2f m/s），"
+            "autopilot 航向确认生效：依据=%s（位移 %.2fpx、船速 %.2f m/s；阈值 %.2fpx / %.2f m/s），"
             "下一次重发在 %.0fs 后",
+            detail["confirmed_by"] or "movement",
             detail["displacement_px"],
             detail["speed_mps"],
             self.config.autopilot_verify_min_move_px,

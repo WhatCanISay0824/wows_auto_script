@@ -75,7 +75,7 @@ state_features:
   PORT: [port_indicator, port_battle_button, coop_mode_selected, port_equip_tab]
   QUEUEING: [queue_indicator, cancel_queue_button]
   LOADING: []                     # 加载界面模板可缺省：排队结束后直接检测战斗 HUD 进战斗
-  BATTLE_ACTIVE: [battle_hud_indicator, hp_bar_present]
+  BATTLE_ACTIVE: [battle_hud_indicator, hp_bar_present, autopilot_indicator]
   BATTLE_FINISHED: [battle_results, result_panel]
   EXIT_MENU_OPEN: [exit_menu_return_port]
   EXIT_CONFIRMING: [exit_confirm_yes]
@@ -85,7 +85,7 @@ state_features:
 popup_features: []
 
 # 界面特征模板（详细设计 3.2 / 5.4）。region 为归一化搜索区域 [x1,y1,x2,y2]。
-# 已提取：18 个（含 2026-10-30 新补的退出菜单/确认框/装备页/标签页模板）。
+# 已提取：19 个（含 2026-10-30 新补的退出菜单/确认框/装备页/标签页模板）。
 features:
   port_indicator:
     template: features/port_indicator.png          # 顶部“港口”标签（实机画面提取）
@@ -119,6 +119,10 @@ features:
     template: features/battle_hud_indicator.png    # 顶部绿/红队旗图标（实机画面提取，不受天空光照影响）
     region: [0.44, 0.02, 0.58, 0.10]
     threshold: 0.85
+  autopilot_indicator:
+    template: features/autopilot_indicator.png     # 战斗 HUD 左侧“M 自动驾驶开启”（ISS-001 航向验证，2026-10-31 实机帧提取）
+    region: [0.10, 0.74, 0.32, 0.85]
+    threshold: 0.82
   hp_bar_present:
     template: features/hp_bar_present.png          # 左下“VII 列宁格勒”血条文字（静态）
     region: [0.0, 0.72, 0.17, 0.80]
