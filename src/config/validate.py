@@ -544,6 +544,13 @@ def _validate_perception(
         issues, perception.feature_confirm_frames, loc("feature_confirm_frames"), "状态确认帧数"
     )
     _check_positive(issues, perception.state_unknown_timeout_s, loc("state_unknown_timeout_s"), "状态未知超时")
+    if perception.capture_method not in ("auto", "window", "screen"):
+        _error(
+            issues,
+            "enum",
+            loc("capture_method"),
+            f"未知截屏方式 {perception.capture_method!r}（auto / window / screen）",
+        )
     _check_int_positive(issues, perception.orb_features_background, loc("orb_features_background"), "底图特征数")
     _check_int_positive(issues, perception.orb_features_minimap, loc("orb_features_minimap"), "小地图特征数")
     if not 0.0 < perception.orb_ratio_test < 1.0:

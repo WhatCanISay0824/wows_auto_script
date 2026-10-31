@@ -1075,6 +1075,13 @@ def load_global(
             collected,
             per_loc,
         ),
+        capture_method=_str_value(
+            perception_raw,
+            "capture_method",
+            defaults.perception.capture_method,
+            collected,
+            per_loc,
+        ),
         orb_features_background=_int_value(
             perception_raw,
             "orb_features_background",

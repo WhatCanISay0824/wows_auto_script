@@ -593,6 +593,7 @@ def _installed_checks(
     capture = GdiCapture(
         locator,
         require_foreground=config.profile.window.require_foreground,
+        capture_method=config.global_config.perception.capture_method,
     )
     frame = None
     try:

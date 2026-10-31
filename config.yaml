@@ -121,6 +121,10 @@ perception:
   template_scales: [0.95, 1.0, 1.05]   # 模板多尺度匹配的默认缩放
   feature_confirm_frames: 2            # 状态切换需要的连续命中帧数
   state_unknown_timeout_s: 2           # 连续无法识别状态后进入异常恢复的时间
+  # 截屏方式（2026-10-31 实机修复）：auto=无边框全屏且前台时优先桌面 DC 截屏
+  # （战舰世界实测窗口 BitBlt 黑屏、PrintWindow 返回冻结帧，导致装备页切换/战斗画面不更新）；
+  # window=旧行为（窗口 BitBlt → PrintWindow 兜底）；screen=强制桌面截屏（远程/特殊环境）
+  capture_method: auto
   orb_features_background: 2000        # 底图 ORB 特征数量
   orb_features_minimap: 1000           # 小地图 ORB 特征数量
   orb_ratio_test: 0.75                 # KNN Lowe 比例筛选

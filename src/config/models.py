@@ -559,6 +559,9 @@ class PerceptionConfig:
     template_scales: tuple[float, ...] = (0.95, 1.0, 1.05)
     feature_confirm_frames: int = 2
     state_unknown_timeout_s: float = 2.0
+    # 截屏方式（2026-10-31 实机修复）：auto=无边框全屏自动改用桌面 DC 截屏
+    # （部分客户端窗口 BitBlt 黑屏、PrintWindow 返回冻结帧）；window=旧行为；screen=强制桌面截屏
+    capture_method: str = "auto"
     orb_features_background: int = 2000
     orb_features_minimap: int = 1000
     orb_ratio_test: float = 0.75

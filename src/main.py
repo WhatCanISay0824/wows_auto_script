@@ -192,6 +192,7 @@ def _build_runtime(app: AppConfig) -> Runtime:
             clock=clock,
             require_foreground=app.profile.window.require_foreground,
             capture_budget_ms=config.timeouts.capture_ms,
+            capture_method=config.perception.capture_method,
         )
         engine = PerceptionEngine(app, capture, clock)
         started.append(("engine", engine))
