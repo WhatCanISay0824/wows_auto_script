@@ -908,10 +908,15 @@ class StateMachine:
         return actions
 
     def _choose_result_button(self, observation: Observation, now: float) -> list[Action]:
-        """结算页：有“继续战斗！”直接点击（下一局），否则点“回到港口”（2026-10-31）。"""
+        """结算页：有“继续战斗！”直接点击（下一局），否则点“回到港口”（2026-10-31）。
+
+        注意：若本场结束后会话将因场次/时长上限停止，则不点“继续战斗”（否则脚本会在
+        排队界面退出、把游戏留在队列里），改点“回到港口”让游戏正常回港后再停止。
+        """
         hud = self.profile.battle_hud
         continue_feature = hud.result_continue_feature
-        if continue_feature:
+        stop_ahead = self._stop_expected_after_battle()
+        if continue_feature and not stop_ahead:
             match = self._match_feature(continue_feature)
             if match is not None and match.found:
                 self._result_continue_clicked = True
@@ -924,13 +929,27 @@ class StateMachine:
             match = self._match_feature(return_feature)
             if match is not None and match.found:
                 self._mark_exit_requested()
-                self._log_action("result_step", {"step": "return_port", "feature": return_feature})
+                detail = {"step": "return_port", "feature": return_feature}
+                if stop_ahead:
+                    detail["skip_continue"] = "本场后触发场次/时长上限"
+                self._log_action("result_step", detail)
                 self._transition(State.EXITING, "result_return_click")
                 return [_click_action(match, observation, "result_return_port")]
         # 按钮尚未出现（结算动画/网络延迟）：短暂重试，避免误入异常恢复
         if now >= self._result_choice_until:
             self._transition(State.ERROR_RECOVERY, "result_buttons_missing")
         return []
+
+    def _stop_expected_after_battle(self) -> bool:
+        """本场结束后是否会因场次/时长上限停止（用于决定是否点“继续战斗”）。"""
+        try:
+            if self.deps.session.check_stop() is not None:
+                return True
+        except Exception:
+            pass
+        return self._rotation_limit is not None and (
+            self._battles_completed + 1 >= self._rotation_limit
+        )
 
     # ==================================================================
     # DEAD_PENDING_EXIT

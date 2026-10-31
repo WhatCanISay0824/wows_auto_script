@@ -683,6 +683,24 @@ def test_result_continue_button_prefers_next_battle(tmp_path: Path) -> None:
     assert h.session.battle_starts == 2
 
 
+def test_result_skips_continue_when_session_stopping(tmp_path: Path) -> None:
+    """本场后触发 --max-battles 上限时不点“继续战斗”，改回港后再停止（不把游戏留在队列）。"""
+    h = Harness(tmp_path)
+    h.machine.set_rotation_limit(1)
+    drive_to_battle_active(h)
+    h.perception.features["battle_results"] = _match("battle_results")
+    h.step()
+    assert h.machine.state is State.BATTLE_FINISHED
+    h.clock.advance(0.2)
+    h.perception.features["result_continue_battle_button"] = _match("result_continue_battle_button")
+    h.perception.features["result_return_port_button"] = _match("result_return_port_button")
+    actions = h.step()
+    assert h.machine.state is State.EXITING
+    labels = [action.label for action in actions]
+    assert "result_continue" not in labels
+    assert "result_return_port" in labels
+
+
 def test_result_returns_to_port_without_continue_button(tmp_path: Path) -> None:
     """结算页没有“继续战斗！”时回退到“回到港口”。"""
     h = Harness(tmp_path)
