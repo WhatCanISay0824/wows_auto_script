@@ -953,8 +953,10 @@ def validate_profile(
     for name, value in (
         ("death_banner_feature", hud.death_banner_feature),
         ("result_feature", hud.result_feature),
+        ("result_continue_feature", hud.result_continue_feature),
+        ("result_return_feature", hud.result_return_feature),
     ):
-        if value not in known_features and value not in runtime_features:
+        if value and value not in known_features and value not in runtime_features:
             _error(issues, "unknown_feature", f"{hud_loc}.{name}", f"引用的界面特征不存在: {value}")
 
     # 视角与退出

@@ -85,8 +85,8 @@ navigation:
   full_map_close_wait_s: 0.4     # 点击生效后等待再按 M 关图
   full_map_verify_s: 8.0         # 关图后验证航向的观察窗口（自身标记位移或船速）
   full_map_retry: 2              # 验证失败后的全屏地图重试次数（不含首次）
-  autopilot_verify_min_move_px: 3.0   # 验证成功的最小自身标记位移（小地图内容区像素）
-  autopilot_verify_min_speed: 0.5     # 验证成功的最小船速（m/s）
+  autopilot_verify_min_move_px: 2.0   # 验证成功的最小自身标记位移（小地图内容区像素）
+  autopilot_verify_min_speed: 0.3     # 验证成功的最小船速（m/s）
   # 2026-10-31 实机：M 地图点选后自动驾驶已开启（船 19.3kts），但船速估计为 0、
   # 小地图 8s 位移不足 3px，导致误判失败并降级；改为优先用战斗 HUD 特征确认航向。
   autopilot_verify_feature: autopilot_indicator  # 航向验证特征（null=只靠位移/船速）

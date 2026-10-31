@@ -43,7 +43,7 @@ SELECTED_TEMPLATE = "selected.png"
 #: 右侧详情面板“当前已选中船名”模板路径（ISS-007 补充：比卡片选中态更稳的已选中证据）
 SELECTED_NAME_TEMPLATE = "selected_name.png"
 #: 选中态/船名模板默认阈值（与 ship.yaml 模型默认值一致）
-SELECTED_THRESHOLD = 0.85
+SELECTED_THRESHOLD = 0.78
 #: 右侧船名模板默认搜索区域（归一化窗口客户区；实机 2560×1600 右上详情面板）
 SELECTED_NAME_REGION: tuple[float, float, float, float] = (0.79, 0.07, 0.91, 0.13)
 #: 默认空装备槽（详细设计 6.8）

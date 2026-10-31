@@ -65,8 +65,8 @@ def make_config(
     close_wait: float = 0.4,
     verify_s: float = 8.0,
     retry: int = 2,
-    min_move: float = 3.0,
-    min_speed: float = 0.5,
+    min_move: float = 2.0,
+    min_speed: float = 0.3,
     verify_feature: str | None = "autopilot_indicator",
 ) -> NavigationConfig:
     return NavigationConfig(

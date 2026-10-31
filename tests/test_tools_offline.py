@@ -651,7 +651,7 @@ def test_calibrate_ship_selected_template_and_empty_loadout(tmp_path: Path) -> N
     assert data["loadout_slots"] == []
     assert data["selected_feature"] == "selected.png"
     assert data["selected_region"] == pytest.approx([0.0, 0.8, 1.0, 1.0])
-    assert data["selected_threshold"] == pytest.approx(0.85)
+    assert data["selected_threshold"] == pytest.approx(0.78)
     assert data["hp_bar_template"] == "hp_bar.png"
     # 工具生成的 ship.yaml 必须能被正式 loader 读取（selected.png 已存在 → selected_path 可解析）
     ship = load_ship(ship_dir / "ship.yaml")
@@ -699,7 +699,7 @@ def test_calibrate_ship_card_only_keeps_existing_selected_asset(tmp_path: Path) 
     data = cc.read_yaml_mapping(ship_dir / "ship.yaml")
     assert data["selected_feature"] == "selected.png"  # 原有字段保留
     assert data["selected_region"] is None  # 原 yaml 未配置且 card_search_region 为空
-    assert data["selected_threshold"] == pytest.approx(0.85)
+    assert data["selected_threshold"] == pytest.approx(0.78)
 
 
 def test_calibrate_ship_card_only_new_ship_without_selected(tmp_path: Path) -> None:
@@ -800,7 +800,7 @@ def test_calibrate_ship_name_template_save_flow(tmp_path: Path) -> None:
     data = cc.read_yaml_mapping(ship_dir / "ship.yaml")
     assert data["selected_name_feature"] == "selected_name.png"
     assert data["selected_name_region"] == pytest.approx([0.79, 0.07, 0.91, 0.13])
-    assert data["selected_name_threshold"] == pytest.approx(0.85)
+    assert data["selected_name_threshold"] == pytest.approx(0.78)
     assert data["loadout_slots"] == []  # 空 loadout_slots 仍允许保存
 
     # 工具生成的 ship.yaml 必须能被正式 loader 解析（ShipProfile/loader 已支持 selected_name_*）
@@ -808,7 +808,7 @@ def test_calibrate_ship_name_template_save_flow(tmp_path: Path) -> None:
     assert ship.ship_id == "name_ship"
     assert ship.selected_name_feature == "selected_name.png"
     assert ship.selected_name_region == NormalizedRect(0.79, 0.07, 0.91, 0.13)
-    assert ship.selected_name_threshold == pytest.approx(0.85)
+    assert ship.selected_name_threshold == pytest.approx(0.78)
     assert ship.selected_name_path == (ship_dir / "selected_name.png").resolve()
     issues = validate_ship(ship)
     assert not [issue for issue in issues if issue.is_error]

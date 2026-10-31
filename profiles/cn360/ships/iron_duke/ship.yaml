@@ -16,14 +16,14 @@ hp_bar_template: hp_bar.png   # 从实机战斗截图提取的“V 铁公爵”�
 # 尚未标定：文件暂不存在，validate 给 warning，运行时会保守失败并提示补标定（不猜选）。
 selected_feature: selected.png
 selected_region: [0.0, 0.80, 1.0, 1.0]   # 选中态模板搜索区域（缺省回退 card_search_region）
-selected_threshold: 0.85
+selected_threshold: 0.78
 # --- 右侧详情面板船名（ISS-007 实机补充 2026-10-31）：卡片选中态受背景/高亮影响时用它兜底 ---
 # selected_name.png：港口右侧详情面板指挥官上方的当前选中船名（如“V 铁公爵”文字），
 # 与卡片背景无关、跨帧更稳（实机跨帧 0.9999）；与 selected.png 任一命中即视为已选中。
 # 由标定工具生成；缺失时 validate 只告警，仍可用选中态模板确认。
 selected_name_feature: selected_name.png
 selected_name_region: [0.79, 0.07, 0.91, 0.13]  # 右侧详情面板顶部船名行
-selected_name_threshold: 0.85
+selected_name_threshold: 0.78
 # --- 选船查找参数（ISS-007）：滚动预算/端点/确认全部由配置驱动，不写死在代码里 ---
 max_scrolls: 20               # 扫描阶段最多滚动次数（空 ship_selection_sequence 也使用该预算）
 scroll_direction: down        # 轮播条滚动方向：down=向下滚（待实机确认）
@@ -39,6 +39,6 @@ endpoint_diff_ratio: 0.02     # 画面采样平均差异低于该比例视为没
 candidate_merge_px: 8         # 候选中心距离小于该像素视为同一张卡
 selection_timeout_s: 60.0     # 整个选船查找（定位+扫描+确认）总超时
 
-loadout_slots: []             # 信号旗校验由 profile.ship_check_sequence 在装备页完成
+loadout_slots: []             # 2026-10-31 起取消装备页/信号旗校验
 
 notes: 从 screenshots/铁公爵港口.png 提取卡片模板；可选补 hp_bar.png 启用血条死亡信号。

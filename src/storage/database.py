@@ -32,7 +32,10 @@ SCHEMA_VERSION = 2
 # battles.result 合法取值（详细设计 11.2）
 RESULT_VALUES: frozenset[str] = frozenset({"dead", "finished", "aborted"})
 # battles.exit_method 合法取值（实现补充第 4 节）
-EXIT_METHOD_VALUES: frozenset[str] = frozenset({"menu", "confirm", "direct", "recovery", "none"})
+# interrupted：暂停/停止/会话结束时未走完退出流程的战斗（_abort_battle 使用，2026-10-31 修复）
+EXIT_METHOD_VALUES: frozenset[str] = frozenset(
+    {"menu", "confirm", "direct", "recovery", "none", "interrupted"}
+)
 # 随机档案字段（实现补充 v2）
 RANDOM_PROFILE_FIELDS: tuple[str, ...] = (
     "camera_activity",

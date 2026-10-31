@@ -1543,6 +1543,12 @@ def load_profile(
             battle_hud_raw, "death_banner_feature", "death_banner", collected, hud_loc
         ),
         result_feature=_str_value(battle_hud_raw, "result_feature", "battle_results", collected, hud_loc),
+        result_continue_feature=_opt_str(
+            battle_hud_raw, "result_continue_feature", None, collected, hud_loc
+        ),
+        result_return_feature=_opt_str(
+            battle_hud_raw, "result_return_feature", "result_return_port_button", collected, hud_loc
+        ),
     )
 
     camera_raw = _section(raw, "camera", collected, label)
@@ -1786,10 +1792,10 @@ def load_ship(
         card_search_region=card_search_region,
         selected_feature=selected_feature,
         selected_region=selected_region,
-        selected_threshold=_float_value(raw, "selected_threshold", 0.85, collected, label),
+        selected_threshold=_float_value(raw, "selected_threshold", 0.78, collected, label),
         selected_name_feature=selected_name_feature,
         selected_name_region=selected_name_region,
-        selected_name_threshold=_float_value(raw, "selected_name_threshold", 0.85, collected, label),
+        selected_name_threshold=_float_value(raw, "selected_name_threshold", 0.78, collected, label),
         hp_bar_template=hp_bar_template,
         loadout_preset_feature=_opt_str(raw, "loadout_preset_feature", None, collected, label),
         loadout_slots=tuple(slots),

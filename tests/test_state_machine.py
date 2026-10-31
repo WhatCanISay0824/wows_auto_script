@@ -389,7 +389,11 @@ def make_app(tmp_path: Path, *, maps: dict[str, MapPack] | None = None) -> AppCo
             confirm_feature="exit_confirm",
             port_feature="port_indicator",
         ),
-        battle_hud=BattleHudConfig(result_feature="battle_results"),
+        battle_hud=BattleHudConfig(
+            result_feature="battle_results",
+            result_continue_feature="result_continue_battle_button",
+            result_return_feature="result_return_port_button",
+        ),
     )
     ship = ShipProfile(ship_id="test_ship", display_name="测试船")
     keymap = KeyMap(actions={"escape": "escape", "fire": "mouse_left", "full_map": "m"})
@@ -650,6 +654,55 @@ def test_result_priority_over_death(tmp_path: Path) -> None:
     h.step()
     assert h.machine.state is State.BATTLE_FINISHED
     assert h.machine.battle is not None
+
+
+def test_result_continue_button_prefers_next_battle(tmp_path: Path) -> None:
+    """2026-10-31 用户口径：结算页有“继续战斗！”时直接点击，不经过港口继续下一局。"""
+    h = Harness(tmp_path)
+    drive_to_battle_active(h)
+    h.perception.features["battle_results"] = _match("battle_results")
+    h.step()
+    assert h.machine.state is State.BATTLE_FINISHED
+    # 结算序列（wait_ms 10）完成 + “继续战斗！”按钮出现
+    h.clock.advance(0.2)
+    h.perception.features["result_continue_battle_button"] = _match("result_continue_battle_button")
+    actions = h.step()
+    assert h.machine.state is State.EXITING
+    assert any(action.label == "result_continue" for action in actions)
+    # 继续战斗后游戏直接进入排队界面（不经过港口）
+    h.perception.features["queue_indicator"] = _match("queue_indicator")
+    h.clock.advance(0.5)
+    h.step()
+    assert h.machine.state is State.START_COOP
+    assert "returned" in h.events.battle_marks
+    assert h.events.battles and h.events.battles[-1][0] == "finished"
+    assert h.machine.battles_completed == 1
+    # START_COOP 识别到排队 -> 新一场记录 + QUEUEING
+    h.step()
+    assert h.machine.state is State.QUEUEING
+    assert h.session.battle_starts == 2
+
+
+def test_result_returns_to_port_without_continue_button(tmp_path: Path) -> None:
+    """结算页没有“继续战斗！”时回退到“回到港口”。"""
+    h = Harness(tmp_path)
+    drive_to_battle_active(h)
+    h.perception.features["battle_results"] = _match("battle_results")
+    h.step()
+    assert h.machine.state is State.BATTLE_FINISHED
+    h.clock.advance(0.2)
+    h.perception.features["result_return_port_button"] = _match("result_return_port_button")
+    actions = h.step()
+    assert h.machine.state is State.EXITING
+    assert any(action.label == "result_return_port" for action in actions)
+    # 回到港口 -> POST_EXIT_INTERFACE -> PORT
+    h.perception.features["port_indicator"] = _match("port_indicator")
+    h.step()
+    assert h.machine.state is State.POST_EXIT_INTERFACE
+    h.step()
+    assert h.machine.state is State.PORT
+    assert h.events.battles and h.events.battles[-1][0] == "finished"
+    assert h.machine.battles_completed == 1
 
 
 def test_banner_or_missing_hp_bar_does_not_authorize_exit(tmp_path: Path) -> None:

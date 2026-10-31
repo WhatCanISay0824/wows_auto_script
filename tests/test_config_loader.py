@@ -105,7 +105,7 @@ def test_load_profile_real_cn360(project_root: Path) -> None:
     assert profile.client_id == "cn360"
     assert profile.display_name
     assert profile.reference_resolution == (2560, 1600)
-    assert len(profile.features) == 18  # 17 个界面模板 + 2026-10-31 新增 autopilot_indicator
+    assert len(profile.features) == 19  # 18 个界面模板 + 2026-10-31 新增 result_continue_battle_button
     # 2026-10-30 实机截图已全部提取（含退出菜单/确认框/装备页/标签页）
     assert all(feature.template_path is not None for feature in profile.features.values())
     assert profile.battle_hud.spectator_features == ()
@@ -125,9 +125,14 @@ def test_load_profile_real_cn360(project_root: Path) -> None:
     assert profile.exit.confirm_feature == "exit_confirm_yes"
     assert len(profile.start_sequence) == 4
     assert len(profile.start_sequence_full) == 3
-    assert len(profile.result_sequence) == 2
+    # 2026-10-31：结算页不再固定点“回到港口”，由状态机按“继续战斗优先”选择按钮
+    assert len(profile.result_sequence) == 1
+    assert profile.result_sequence[0].feature == "battle_results"
+    assert profile.battle_hud.result_continue_feature == "result_continue_battle_button"
+    assert profile.battle_hud.result_return_feature == "result_return_port_button"
     assert profile.ship_selection_sequence == ()
-    assert len(profile.ship_check_sequence) == 2
+    # 2026-10-31 用户确认：取消装备页/信号旗/加成卡检测
+    assert profile.ship_check_sequence == ()
     assert profile.loadout_verify_features == ()
     assert profile.state_features["PORT"][0] == "port_indicator"
     assert profile.profile_dir == project_root / "profiles" / "cn360"
@@ -164,7 +169,7 @@ def test_load_ship_real(project_root: Path) -> None:
     assert ship.scroll_direction == "down"
     assert ship.scroll_clicks == 2
     assert ship.max_scrolls == 20
-    assert ship.loadout_slots == ()  # 信号旗校验改由 profile.ship_check_sequence 完成
+    assert ship.loadout_slots == ()  # 2026-10-31 起不再校验装备/信号旗
     assert ship.ship_dir == path.parent
 
 

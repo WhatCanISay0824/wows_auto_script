@@ -1,8 +1,7 @@
 # 船只配置：VII 级驱逐舰 列宁格勒
 # 模板来源：2026-10-30 实机截图（2559×1599）
 # - card.png：港口底部船只轮播条卡片右侧（船体剪影 + 船名），避开左侧 VII/+50% 徽章与选中边框
-# - 装备校验：用户确认只要求信号旗数量为 0，由 profile.yaml 的 ship_check_sequence 切到装备页校验，
-#   因此这里不再配置 loadout_slots；左侧配件/升级不读取、不点击、不修改。
+# - 装备校验：2026-10-31 用户确认取消（不检测信号旗/经济加成卡）；装备页不读取、不点击、不修改。
 # - selected.png：目标船“已选中状态”模板（ISS-007），待实机补标定；缺失时运行时保守失败。
 # - 不售卖/不出售/不消耗任何船只或装备。
 
@@ -18,13 +17,13 @@ loadout_preset_feature: null
 # 尚未标定：文件暂不存在，validate 给 warning，运行时会保守失败并提示补标定（不猜选）。
 selected_feature: selected.png
 selected_region: [0.0, 0.80, 1.0, 1.0]   # 选中态模板搜索区域（缺省回退 card_search_region）
-selected_threshold: 0.85
+selected_threshold: 0.78
 # --- 右侧详情面板船名（ISS-007 实机补充 2026-10-31）：卡片选中态受背景/高亮影响时用它兜底 ---
 # selected_name.png：港口右侧详情面板指挥官上方的当前选中船名（如“VII 列宁格勒”文字），
 # 与卡片背景无关、跨帧更稳；与 selected.png 任一命中即视为已选中。由标定工具生成。
 selected_name_feature: selected_name.png
 selected_name_region: [0.79, 0.07, 0.91, 0.13]  # 右侧详情面板顶部船名行
-selected_name_threshold: 0.85
+selected_name_threshold: 0.78
 # --- 选船查找参数（ISS-007）：滚动预算/端点/确认全部由配置驱动，不写死在代码里 ---
 max_scrolls: 20               # 扫描阶段最多滚动次数（空 ship_selection_sequence 也使用该预算）
 scroll_direction: down        # 轮播条滚动方向：down=向下滚（待实机确认）
@@ -40,6 +39,6 @@ endpoint_diff_ratio: 0.02     # 画面采样平均差异低于该比例视为没
 candidate_merge_px: 8         # 候选中心距离小于该像素视为同一张卡
 selection_timeout_s: 60.0     # 整个选船查找（定位+扫描+确认）总超时
 
-loadout_slots: []             # 信号旗校验改由 profile.ship_check_sequence 在装备页完成
+loadout_slots: []             # 2026-10-31 起取消装备页/信号旗校验
 
 notes: 实机截图 214644 提取卡片模板；信号旗 0/8 模板见 features/loadout_signal_flags.png。

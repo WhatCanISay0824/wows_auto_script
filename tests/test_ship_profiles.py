@@ -52,12 +52,15 @@ def test_observation_feature_ids_include_sequence_features(project_root: Path) -
     app = load_project(project_root, "cn360").config
     engine = PerceptionEngine(app, capture=None)
     port_ids = engine._feature_ids_for(State.PORT)  # noqa: SLF001
-    assert "loadout_signal_flags" in port_ids  # ship_check_sequence 里的装备页信号旗
-    assert "port_equip_tab" in port_ids
+    assert "loadout_signal_flags" not in port_ids  # 2026-10-31 起不再校验装备页/信号旗
+    assert "port_equip_tab" not in port_ids
     assert "queue_indicator" in port_ids  # start_sequence 里的排队特征
     assert "exit_menu_return_port" in port_ids  # 退出流程特征
     battle_ids = engine._feature_ids_for(State.BATTLE_ACTIVE)  # noqa: SLF001
     assert "death_banner" in battle_ids
+    finished_ids = engine._feature_ids_for(State.BATTLE_FINISHED)  # noqa: SLF001
+    assert "result_continue_battle_button" in finished_ids
+    assert "result_return_port_button" in finished_ids
 
 
 # ---------------------------------------------------------------------------
@@ -72,13 +75,13 @@ def test_leningrad_ship_profile_has_selected_evidence_fields(project_root: Path)
     assert ship.selected_feature == "selected.png"
     # 选中态搜索区域缺省回退 card_search_region（轮播条）
     assert ship.selected_region == ship.card_search_region
-    assert ship.selected_threshold == 0.85
+    assert ship.selected_threshold == 0.78
     # 模板可能尚未标定；已标定时必须解析为存在的文件
     assert ship.selected_path is None or ship.selected_path.is_file()
     # 右侧详情面板船名证据（ISS-007 实机补充 2026-10-31）：与选中态模板互为兜底
     assert ship.selected_name_feature == "selected_name.png"
     assert ship.selected_name_region == NormalizedRect(0.79, 0.07, 0.91, 0.13)
-    assert ship.selected_name_threshold == 0.85
+    assert ship.selected_name_threshold == 0.78
     assert ship.selected_name_path is None or ship.selected_name_path.is_file()
     assert ship.cover_list_start is True
     assert ship.max_position_scrolls == 10
@@ -123,11 +126,11 @@ def test_ship_profile_selection_defaults() -> None:
     assert ship.selected_feature is None
     assert ship.selected_path is None
     assert ship.selected_region is None
-    assert ship.selected_threshold == 0.85
+    assert ship.selected_threshold == 0.78
     assert ship.selected_name_feature is None
     assert ship.selected_name_path is None
     assert ship.selected_name_region is None
-    assert ship.selected_name_threshold == 0.85
+    assert ship.selected_name_threshold == 0.78
     assert ship.cover_list_start is True
     assert ship.max_scrolls == 20
     assert ship.max_position_scrolls == 10

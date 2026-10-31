@@ -120,6 +120,9 @@ class StateMachine:
         self._confirm_seen = False
         self._dead_wait_until = 0.0
         self._pending_exit_actions: list[Action] = []
+        # 结算页按钮选择（2026-10-31）：优先“继续战斗！”直接下一局，否则“回到港口”
+        self._result_continue_clicked = False
+        self._result_choice_until = 0.0
         # 回港弹窗
         self._popup_rounds = 0
         self._popup_wait_until = 0.0
@@ -886,6 +889,8 @@ class StateMachine:
     # ==================================================================
     def _enter_battle_finished(self, now: float, reason: str) -> None:
         self._stop_subflows()
+        self._result_continue_clicked = False
+        self._result_choice_until = now + 20.0  # 结算按钮等待上限（结算动画/网络延迟）
         sequence = self.config.profile.result_sequence
         if sequence:
             try:
@@ -896,11 +901,36 @@ class StateMachine:
     def _handle_battle_finished(self, observation: Observation, now: float) -> list[Action]:
         status, actions = self._advance_steps(observation, now)
         if status is StepStatus.DONE:
-            self._mark_exit_requested()
-            self._transition(State.EXITING, "result_sequence_done")
-        elif status is StepStatus.FAILED:
+            done_actions = self._choose_result_button(observation, now)
+            return actions + done_actions
+        if status is StepStatus.FAILED:
             self._transition(State.ERROR_RECOVERY, "result_sequence_failed")
         return actions
+
+    def _choose_result_button(self, observation: Observation, now: float) -> list[Action]:
+        """结算页：有“继续战斗！”直接点击（下一局），否则点“回到港口”（2026-10-31）。"""
+        hud = self.profile.battle_hud
+        continue_feature = hud.result_continue_feature
+        if continue_feature:
+            match = self._match_feature(continue_feature)
+            if match is not None and match.found:
+                self._result_continue_clicked = True
+                self._mark_exit_requested()
+                self._log_action("result_step", {"step": "continue_battle", "feature": continue_feature})
+                self._transition(State.EXITING, "result_continue_click")
+                return [_click_action(match, observation, "result_continue")]
+        return_feature = hud.result_return_feature
+        if return_feature:
+            match = self._match_feature(return_feature)
+            if match is not None and match.found:
+                self._mark_exit_requested()
+                self._log_action("result_step", {"step": "return_port", "feature": return_feature})
+                self._transition(State.EXITING, "result_return_click")
+                return [_click_action(match, observation, "result_return_port")]
+        # 按钮尚未出现（结算动画/网络延迟）：短暂重试，避免误入异常恢复
+        if now >= self._result_choice_until:
+            self._transition(State.ERROR_RECOVERY, "result_buttons_missing")
+        return []
 
     # ==================================================================
     # DEAD_PENDING_EXIT
@@ -997,6 +1027,15 @@ class StateMachine:
         return []
 
     def _handle_exiting(self, observation: Observation, now: float) -> list[Action]:
+        # 结算页“继续战斗！”：游戏会直接回到排队界面（不再经过港口）
+        if self._result_continue_clicked and self._observed_feature(observation, "queue_indicator"):
+            self._result_continue_clicked = False
+            self._mark_returned_to_port()
+            self._log_action("result_step", {"step": "continue_battle_queued"})
+            self._finish_battle(
+                now, next_state=State.START_COOP, reason="battle_finished_continue"
+            )
+            return []
         if self._port_visible(observation, now):
             self._mark_returned_to_port()
             self._transition(State.POST_EXIT_INTERFACE, "port_detected")
@@ -1058,7 +1097,13 @@ class StateMachine:
                 continue
         return False
 
-    def _finish_battle(self, now: float) -> None:
+    def _finish_battle(
+        self,
+        now: float,
+        *,
+        next_state: State = State.PORT,
+        reason: str = "battle_finished_cleanup",
+    ) -> None:
         battle_id = self._battle_id
         result = self._battle_result or "finished"
         if battle_id is not None:
@@ -1075,7 +1120,15 @@ class StateMachine:
         self._battle_id = None
         self._battle = None
         self._notify_battle_context(None)
-        self._transition(State.PORT, "battle_finished_cleanup")
+        # 下一局直接排队（继续战斗）时也要遵守会话时长/场次/轮换限制（2026-10-31）
+        stop = self.deps.session.check_stop()
+        if stop is not None:
+            self.request_stop(str(stop.reason), stop.detail)
+            return
+        if self._rotation_limit is not None and self._battles_completed >= self._rotation_limit:
+            self.request_stop("account_rotation", f"本账号已完成 {self._battles_completed} 场")
+            return
+        self._transition(next_state, reason)
 
     # ==================================================================
     # ERROR_RECOVERY

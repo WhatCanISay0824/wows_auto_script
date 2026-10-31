@@ -114,6 +114,9 @@ class BattleHudConfig:
     spectator_features: tuple[str, ...] = ()
     death_banner_feature: str = "death_banner"
     result_feature: str = "battle_results"
+    # 结算页按钮（2026-10-31 用户口径）：优先“继续战斗！”直接下一局，没有时再“回到港口”
+    result_continue_feature: str | None = None
+    result_return_feature: str | None = "result_return_port_button"
 
 
 @dataclass(frozen=True, slots=True)
@@ -250,13 +253,13 @@ class ShipProfile:
     selected_feature: str | None = None
     # 选中态模板搜索区域；None 时由 loader 回退为 card_search_region
     selected_region: NormalizedRect | None = None
-    selected_threshold: float = 0.85
+    selected_threshold: float = 0.78
     # 右侧详情面板“当前选中船”船名模板（ISS-007 实机补充 2026-10-31）：
     # 港口右侧面板指挥官上方显示当前选中船名，与卡片背景/高亮无关，比 selected_feature 更稳；
     # 两者任一命中即视为已选中。模板缺失时 validate 只告警，不阻断旧流程。
     selected_name_feature: str | None = None
     selected_name_region: NormalizedRect | None = None
-    selected_name_threshold: float = 0.85
+    selected_name_threshold: float = 0.78
     # 每船独立的“己方血条存在”模板：不同船名/舰种的血条面板文字不同，换船需替换；
     # 未提供时死亡判定不使用“血条消失”信号（改用死亡提示/结算界面兜底）。
     hp_bar_template: str | None = None
@@ -427,8 +430,8 @@ class NavigationConfig:
     full_map_close_wait_s: float = 0.4  # 点击生效后等待再按 M 关图
     full_map_verify_s: float = 8.0  # 关图后验证航向生效的观察窗口
     full_map_retry: int = 2  # 验证失败后的全屏地图重试次数（不含首次）
-    autopilot_verify_min_move_px: float = 3.0  # 验证成功的最小自身标记位移（minimap_px）
-    autopilot_verify_min_speed: float = 0.5  # 验证成功的最小船速（m/s）
+    autopilot_verify_min_move_px: float = 2.0  # 验证成功的最小自身标记位移（minimap_px）
+    autopilot_verify_min_speed: float = 0.3  # 验证成功的最小船速（m/s）
     # ISS-001 实机修复：优先用战斗 HUD 的“M 自动驾驶开启”特征确认航向已生效
     # （实机中船速估计可能为 0、小地图 8s 位移不足 3px，会导致误判失败并降级）
     autopilot_verify_feature: str | None = "autopilot_indicator"
