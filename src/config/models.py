@@ -251,6 +251,12 @@ class ShipProfile:
     # 选中态模板搜索区域；None 时由 loader 回退为 card_search_region
     selected_region: NormalizedRect | None = None
     selected_threshold: float = 0.85
+    # 右侧详情面板“当前选中船”船名模板（ISS-007 实机补充 2026-10-31）：
+    # 港口右侧面板指挥官上方显示当前选中船名，与卡片背景/高亮无关，比 selected_feature 更稳；
+    # 两者任一命中即视为已选中。模板缺失时 validate 只告警，不阻断旧流程。
+    selected_name_feature: str | None = None
+    selected_name_region: NormalizedRect | None = None
+    selected_name_threshold: float = 0.85
     # 每船独立的“己方血条存在”模板：不同船名/舰种的血条面板文字不同，换船需替换；
     # 未提供时死亡判定不使用“血条消失”信号（改用死亡提示/结算界面兜底）。
     hp_bar_template: str | None = None
@@ -275,6 +281,7 @@ class ShipProfile:
     card_path: Path | None = None
     hp_bar_path: Path | None = None
     selected_path: Path | None = None
+    selected_name_path: Path | None = None
 
 
 # ---------------------------------------------------------------------------

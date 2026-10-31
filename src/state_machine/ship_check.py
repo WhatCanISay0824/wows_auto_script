@@ -27,7 +27,7 @@ from enum import StrEnum
 
 import numpy as np
 
-from ..common.types import Action, MatchResult, Observation, Rect
+from ..common.types import Action, MatchResult, NormalizedRect, Observation, Rect
 from ..config.models import AppConfig, ShipProfile
 from ..perception.engine import PerceptionEngine
 from ..state_machine.steps import StepSequenceExecutor, StepStatus
@@ -37,6 +37,10 @@ logger = logging.getLogger(__name__)
 SHIP_CARD_FEATURE = "ship_card"
 # 目标船“已选中状态”模板的运行期特征 ID（由 ship.yaml 的 selected_feature 注册）
 SHIP_SELECTED_FEATURE = "ship_selected"
+# 右侧详情面板“当前选中船”船名模板的运行期特征 ID（由 selected_name_feature 注册）
+SHIP_SELECTED_NAME_FEATURE = "ship_selected_name"
+# 右侧详情面板船名模板缺省搜索区域（归一化；覆盖指挥官上方的船名行）
+DEFAULT_SELECTED_NAME_REGION = NormalizedRect(0.79, 0.07, 0.91, 0.13)
 
 # 画面签名的采样网格：只用于判断“滚动后画面是否变化”，属于算法内部常数而非业务参数；
 # 可调阈值在 ship.yaml 的 endpoint_diff_ratio，采样密度不暴露给配置。
@@ -80,6 +84,9 @@ class ShipCheckResult:
     card_found: bool = False
     selected_found: bool = False
     selected_score: float = 0.0
+    # 右侧详情面板船名证据（ISS-007 实机补充：卡片选中态受背景/高亮影响时用它兜底）
+    selected_name_found: bool = False
+    selected_name_score: float = 0.0
 
     @property
     def failed_slots(self) -> tuple[SlotCheck, ...]:
@@ -128,6 +135,7 @@ class ShipChecker:
         self._click_count = 0
         self._probe_frame_id: int | None = None
         self._probe_selected: MatchResult | None = None
+        self._probe_selected_name: MatchResult | None = None
         self._probe_card: MatchResult | None = None
         self._candidates_frame_id: int | None = None
         self._candidates: tuple[MatchResult, ...] = ()
@@ -176,6 +184,7 @@ class ShipChecker:
         self._click_count = 0
         self._probe_frame_id = None
         self._probe_selected = None
+        self._probe_selected_name = None
         self._probe_card = None
         self._candidates_frame_id = None
         self._candidates = ()
@@ -208,29 +217,54 @@ class ShipChecker:
             except Exception as exc:  # 配置/模板错误不抛给主循环，转 FAILED
                 self._card_error = f"船只卡片模板注册失败: {exc}"
                 self._logger.warning(self._card_error)
-        if not ship.selected_feature:
-            self._evidence_error = (
-                "未配置选中态证据 selected_feature：无法确认当前是否已选中目标船；"
-                "请用标定工具补充选中态模板（selected.png）后重试，不会把“卡片可见”当作已选中"
-            )
-            self._logger.warning(self._evidence_error)
-        elif ship.selected_path is None:
-            self._evidence_error = (
-                f"选中态模板缺失: {ship.selected_feature}（待实机标定）；"
-                "请先补该模板后重试，不会把“卡片可见”当作已选中"
-            )
-            self._logger.warning(self._evidence_error)
-        else:
-            try:
-                self.engine.register_feature(
-                    SHIP_SELECTED_FEATURE,
-                    str(ship.selected_path),
-                    region=ship.selected_region,
-                    threshold=ship.selected_threshold,
+        selection_registered = False
+        name_registered = False
+        evidence_problems: list[str] = []
+        if ship.selected_feature:
+            if ship.selected_path is None:
+                evidence_problems.append(
+                    f"选中态模板缺失: {ship.selected_feature}（待标定）"
                 )
-            except Exception as exc:
-                self._evidence_error = f"选中态模板注册失败: {exc}"
-                self._logger.warning(self._evidence_error)
+            else:
+                try:
+                    self.engine.register_feature(
+                        SHIP_SELECTED_FEATURE,
+                        str(ship.selected_path),
+                        region=ship.selected_region,
+                        threshold=ship.selected_threshold,
+                    )
+                    selection_registered = True
+                except Exception as exc:
+                    evidence_problems.append(f"选中态模板注册失败: {exc}")
+        if ship.selected_name_feature:
+            if ship.selected_name_path is None:
+                evidence_problems.append(
+                    f"右侧详情面板船名模板缺失: {ship.selected_name_feature}（待标定）"
+                )
+            else:
+                try:
+                    self.engine.register_feature(
+                        SHIP_SELECTED_NAME_FEATURE,
+                        str(ship.selected_name_path),
+                        region=ship.selected_name_region or DEFAULT_SELECTED_NAME_REGION,
+                        threshold=ship.selected_name_threshold,
+                    )
+                    name_registered = True
+                except Exception as exc:
+                    evidence_problems.append(f"右侧船名模板注册失败: {exc}")
+        if not (selection_registered or name_registered):
+            detail = "；".join(evidence_problems) if evidence_problems else (
+                "未配置 selected_feature / selected_name_feature"
+            )
+            self._evidence_error = (
+                f"已选中证据不可用（{detail}）：无法确认当前是否已选中目标船；"
+                "请用标定工具补充 selected.png 或 selected_name.png 后重试，"
+                "不会把“卡片可见”当作已选中"
+            )
+            self._logger.warning(self._evidence_error)
+        elif evidence_problems:
+            # 一类证据可用、另一类缺失/注册失败：只告警，不阻断（运行期用可用证据确认）
+            self._logger.warning("部分已选中证据不可用（仍可用另一类证据）：%s", "；".join(evidence_problems))
         self._registered = True
 
     # ------------------------------------------------------------------
@@ -243,15 +277,21 @@ class ShipChecker:
         if self._evidence_error:
             result = ShipCheckResult(False, self._evidence_error)
         else:
-            selected, card = self._probe(None, force=True)
-            if selected.found:
-                result = self._make_result(True, "", card, selected)
+            selected, selected_name, card = self._probe(None, force=True)
+            if selected.found or selected_name.found:
+                result = self._make_result(True, "", card, selected, selected_name)
             elif card.found:
                 result = self._make_result(
-                    False, "仅看到目标船卡片、未确认已选中（selected_feature 未命中）", card, selected
+                    False,
+                    "仅看到目标船卡片、未确认已选中（selected.png / selected_name.png 均未命中）",
+                    card,
+                    selected,
+                    selected_name,
                 )
             else:
-                result = self._make_result(False, "未确认目标船已选中，也未找到目标船卡片", card, selected)
+                result = self._make_result(
+                    False, "未确认目标船已选中，也未找到目标船卡片", card, selected, selected_name
+                )
         self._last_result = result
         return result
 
@@ -279,11 +319,16 @@ class ShipChecker:
                 f"选船查找超时（{self.ship.selection_timeout_s:.1f}s）仍未确认目标船已选中："
                 "请检查筛选条件、卡片模板与选中态模板标定"
             )
-        selected, card = self._probe(observation)
-        self._last_result = self._make_result(selected.found, "", card, selected)
-        if selected.found:
+        selected, selected_name, card = self._probe(observation)
+        self._last_result = self._make_result(selected.found or selected_name.found, "", card, selected, selected_name)
+        if selected.found or selected_name.found:
             self._status = ShipCheckStatus.OK
-            self._logger.info("已确认当前已选中目标船：%s", self.ship.display_name)
+            self._logger.info(
+                "已确认当前已选中目标船：%s（选中态模板=%s，右侧船名=%s）",
+                self.ship.display_name,
+                selected.found,
+                selected_name.found,
+            )
             return self._status, []
         if not allow_selection:
             return self._fail("当前未确认已选中目标船，且当前场景不允许执行选船操作")
@@ -332,12 +377,17 @@ class ShipChecker:
             return ShipCheckStatus.SELECTING, []
         if elapsed >= self.ship.confirm_timeout_s:
             return self._confirm_failed("点击后确认超时")
-        selected, card = self._probe(observation, force=True)
-        self._last_result = self._make_result(selected.found, "", card, selected)
-        if selected.found:
+        selected, selected_name, card = self._probe(observation, force=True)
+        self._last_result = self._make_result(selected.found or selected_name.found, "", card, selected, selected_name)
+        if selected.found or selected_name.found:
             self._confirm_pending = False
             self._status = ShipCheckStatus.OK
-            self._logger.info("点击后已确认选中目标船：%s", self.ship.display_name)
+            self._logger.info(
+                "点击后已确认选中目标船：%s（选中态模板=%s，右侧船名=%s）",
+                self.ship.display_name,
+                selected.found,
+                selected_name.found,
+            )
             return self._status, []
         if card.found and self._click_count < max(1, int(self.ship.max_click_attempts)):
             self._logger.warning(
@@ -350,9 +400,10 @@ class ShipChecker:
     def _confirm_failed(self, detail: str) -> tuple[ShipCheckStatus, list[Action]]:
         self._confirm_pending = False
         reason = (
-            f"点击目标船卡后仍无法确认已选中（{detail}）：selected_feature="
-            f"{self.ship.selected_feature!r} 未命中；请补做/重做选中态模板标定后重试，"
-            "脚本不会把“卡片可见”当作已选中"
+            f"点击目标船卡后仍无法确认已选中（{detail}）："
+            f"selected_feature={self.ship.selected_feature!r}、"
+            f"selected_name_feature={self.ship.selected_name_feature!r} 均未命中；"
+            "请补做/重做选中态或右侧船名模板标定后重试，脚本不会把“卡片可见”当作已选中"
         )
         return self._fail(reason)
 
@@ -632,14 +683,19 @@ class ShipChecker:
 
     def _probe(
         self, observation: Observation | None, *, force: bool = False
-    ) -> tuple[MatchResult, MatchResult]:
-        """按帧缓存匹配“已选中证据 + 目标船卡”，避免 10Hz 主循环重复做模板匹配。"""
+    ) -> tuple[MatchResult, MatchResult, MatchResult]:
+        """按帧缓存匹配“选中态证据 + 右侧船名证据 + 目标船卡”。
+
+        后两者任一命中都表示“当前已选中目标船”；卡片只作为点击候选。
+        """
         fid = int(observation.frame_id) if observation is not None else 0
         if not force and fid > 0 and fid == self._probe_frame_id:
             selected = self._probe_selected or _not_found(SHIP_SELECTED_FEATURE)
+            selected_name = self._probe_selected_name or _not_found(SHIP_SELECTED_NAME_FEATURE)
             card = self._probe_card or _not_found(SHIP_CARD_FEATURE)
-            return selected, card
+            return selected, selected_name, card
         selected = self._safe_match(SHIP_SELECTED_FEATURE)
+        selected_name = self._safe_match(SHIP_SELECTED_NAME_FEATURE)
         card = (
             _not_found(SHIP_CARD_FEATURE)
             if self._card_error
@@ -647,8 +703,9 @@ class ShipChecker:
         )
         self._probe_frame_id = fid
         self._probe_selected = selected
+        self._probe_selected_name = selected_name
         self._probe_card = card
-        return selected, card
+        return selected, selected_name, card
 
     def _safe_match(self, feature_id: str) -> MatchResult:
         try:
@@ -659,7 +716,11 @@ class ShipChecker:
 
     @staticmethod
     def _make_result(
-        ok: bool, reason: str, card: MatchResult, selected: MatchResult
+        ok: bool,
+        reason: str,
+        card: MatchResult,
+        selected: MatchResult,
+        selected_name: MatchResult | None = None,
     ) -> ShipCheckResult:
         return ShipCheckResult(
             ok=ok,
@@ -668,6 +729,8 @@ class ShipChecker:
             card_found=card.found,
             selected_found=selected.found,
             selected_score=selected.score,
+            selected_name_found=bool(selected_name and selected_name.found),
+            selected_name_score=selected_name.score if selected_name is not None else 0.0,
         )
 
     @staticmethod

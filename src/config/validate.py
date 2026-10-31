@@ -1062,6 +1062,27 @@ def validate_ship(ship: ShipProfile, *, location: str | None = None) -> list[Val
         _check_probability(
             issues, ship.selected_threshold, _loc(location, "selected_threshold"), "选中态模板阈值"
         )
+    if ship.selected_name_feature:
+        if ship.ship_dir is not None and not (ship.ship_dir / ship.selected_name_feature).is_file():
+            _warn(
+                issues,
+                "file_missing",
+                _loc(location, "selected_name_feature"),
+                "右侧详情面板船名模板缺失（待标定）：不能只凭该证据确认已选中，仍可用选中态模板",
+            )
+        _check_probability(
+            issues,
+            ship.selected_name_threshold,
+            _loc(location, "selected_name_threshold"),
+            "右侧船名模板阈值",
+        )
+        if ship.selected_name_region is None:
+            _warn(
+                issues,
+                "missing",
+                _loc(location, "selected_name_region"),
+                "未配置右侧船名模板搜索区域：运行时回退到右侧面板默认区域",
+            )
     _check_int_positive(
         issues, ship.max_position_scrolls, _loc(location, "max_position_scrolls"), "起点定位最大滚动次数"
     )

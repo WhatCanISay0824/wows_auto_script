@@ -1739,6 +1739,12 @@ def load_ship(
     selected_region = _normalized_rect(raw, "selected_region", None, collected, label)
     if selected_region is None:
         selected_region = card_search_region
+    # 右侧详情面板船名模板（ISS-007 实机补充 2026-10-31）：与选中态模板互为兜底
+    selected_name_feature = _opt_str(raw, "selected_name_feature", None, collected, label)
+    selected_name_template_path = (
+        resolve_path(selected_name_feature, ship_dir) if selected_name_feature else None
+    )
+    selected_name_region = _normalized_rect(raw, "selected_name_region", None, collected, label)
     loadout_slots_raw = raw.get("loadout_slots")
     slots: list[LoadoutSlotDef] = []
     if loadout_slots_raw is None:
@@ -1781,6 +1787,9 @@ def load_ship(
         selected_feature=selected_feature,
         selected_region=selected_region,
         selected_threshold=_float_value(raw, "selected_threshold", 0.85, collected, label),
+        selected_name_feature=selected_name_feature,
+        selected_name_region=selected_name_region,
+        selected_name_threshold=_float_value(raw, "selected_name_threshold", 0.85, collected, label),
         hp_bar_template=hp_bar_template,
         loadout_preset_feature=_opt_str(raw, "loadout_preset_feature", None, collected, label),
         loadout_slots=tuple(slots),
@@ -1804,6 +1813,11 @@ def load_ship(
         selected_path=(
             selected_template_path
             if selected_template_path is not None and selected_template_path.is_file()
+            else None
+        ),
+        selected_name_path=(
+            selected_name_template_path
+            if selected_name_template_path is not None and selected_name_template_path.is_file()
             else None
         ),
     )

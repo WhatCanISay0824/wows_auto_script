@@ -10,10 +10,12 @@
 - 从港口截图框选船只卡片，保存为 ``ships/<ship_id>/card.png``；
 - 框选“已选中状态”的目标船卡片（含选中高亮/边框），保存为 ``ships/<ship_id>/selected.png``
   （ISS-007：运行时用它确认“当前选中的就是目标船”，不能把卡片可见当作已选中）；
+- 框选右侧详情面板的“当前已选中船名”文字，保存为 ``ships/<ship_id>/selected_name.png``
+  （ISS-007 补充：卡片选中态受背景/高亮影响时，船名文字是更稳的已选中证据）；
 - 框选空信号旗槽 / 空经济加成槽，保存为 ``ships/<ship_id>/loadout/<slot_id>_empty.png``
   （当前用户口径由 ``profile.ship_check_sequence`` 在装备页校验信号旗，空槽可留空保存）；
-- 生成/更新 ``ship.yaml``（card_template、selected_feature/region/threshold、loadout_slots、滚动参数等；
-  已有未知字段保留）；
+- 生成/更新 ``ship.yaml``（card_template、selected_feature/region/threshold、
+  selected_name_feature/region/threshold、loadout_slots、滚动参数等；已有未知字段保留）；
 - 模板尺寸/颜色方差提示（详细设计 12.3）。
 
 GUI 与逻辑分离：加载、框选换算、质量检查、YAML 组装都是纯函数，单元测试不创建窗口。
@@ -38,8 +40,12 @@ SHIP_ID_PATTERN = re.compile(r"^[a-z0-9_]+$")
 CARD_TEMPLATE = "card.png"
 #: 已选中态模板路径（相对船只目录；ISS-007：ShipChecker 用它确认目标船已被选中）
 SELECTED_TEMPLATE = "selected.png"
-#: 选中态模板默认阈值（与 ship.yaml 模型默认值一致）
+#: 右侧详情面板“当前已选中船名”模板路径（ISS-007 补充：比卡片选中态更稳的已选中证据）
+SELECTED_NAME_TEMPLATE = "selected_name.png"
+#: 选中态/船名模板默认阈值（与 ship.yaml 模型默认值一致）
 SELECTED_THRESHOLD = 0.85
+#: 右侧船名模板默认搜索区域（归一化窗口客户区；实机 2560×1600 右上详情面板）
+SELECTED_NAME_REGION: tuple[float, float, float, float] = (0.79, 0.07, 0.91, 0.13)
 #: 默认空装备槽（详细设计 6.8）
 DEFAULT_LOADOUT_SLOTS: tuple[tuple[str, str], ...] = (
     ("signal_flags", "信号旗槽位"),
@@ -54,6 +60,9 @@ KNOWN_SHIP_FIELDS: tuple[str, ...] = (
     "selected_feature",
     "selected_region",
     "selected_threshold",
+    "selected_name_feature",
+    "selected_name_region",
+    "selected_name_threshold",
     "loadout_preset_feature",
     "max_scrolls",
     "scroll_direction",
@@ -62,7 +71,8 @@ KNOWN_SHIP_FIELDS: tuple[str, ...] = (
     "notes",
 )
 SHIP_YAML_HEADER = """# 船只配置（详细设计 3.2 / 6.8 / ISS-007）
-# 由 src/tools/calibrate_ship 生成/更新；模板相对本目录（card.png、selected.png、loadout/*.png）。"""
+# 由 src/tools/calibrate_ship 生成/更新；模板相对本目录
+# （card.png、selected.png、selected_name.png、loadout/*.png）。"""
 
 
 # ---------------------------------------------------------------------------
@@ -83,6 +93,7 @@ class ShipEditorState:
     screenshot: np.ndarray | None = None
     card_image: np.ndarray | None = None
     selected_image: np.ndarray | None = None
+    name_image: np.ndarray | None = None
     loadout_images: dict[str, np.ndarray] = field(default_factory=dict)
     load_messages: list[str] = field(default_factory=list)
 
@@ -184,6 +195,10 @@ def ship_yaml_payload(state: ShipEditorState) -> dict[str, Any]:
     ISS-007：``selected_feature`` 指向 ``selected.png``；``selected_region`` 缺省沿用
     ``card_search_region``（选中态模板与船卡在同一轮播条区域搜索），阈值 0.85。
     本次未重新框选 selected.png 时保留 ship.yaml 里已有的 selected_* 字段，避免误删标定。
+
+    ISS-007 补充：``selected_name_*`` 指向右侧详情面板船名模板 ``selected_name.png``，
+    region 缺省 ``[0.79, 0.07, 0.91, 0.13]``。只在本次框选船名或 ship.yaml 已有该组字段时写入，
+    避免从未标定过船名的新船 yaml 里出现空 name 字段；已有值在未重新框选时原样保留。
     """
     source = state.data
     card_search_region = source.get("card_search_region")
@@ -200,13 +215,27 @@ def ship_yaml_payload(state: ShipEditorState) -> dict[str, Any]:
         "selected_feature": selected_feature,
         "selected_region": source.get("selected_region") or card_search_region,
         "selected_threshold": source.get("selected_threshold", SELECTED_THRESHOLD),
-        "loadout_preset_feature": source.get("loadout_preset_feature"),
-        "max_scrolls": source.get("max_scrolls", 20),
-        "scroll_direction": source.get("scroll_direction", "down"),
-        "scroll_clicks": source.get("scroll_clicks", 1),
-        "loadout_slots": list(_loadout_slots(source)),
-        "notes": str(source.get("notes") or ""),
     }
+    name_configured = state.name_image is not None or any(
+        key in source
+        for key in ("selected_name_feature", "selected_name_region", "selected_name_threshold")
+    )
+    if name_configured:
+        payload["selected_name_feature"] = (
+            SELECTED_NAME_TEMPLATE if state.name_image is not None else source.get("selected_name_feature")
+        )
+        payload["selected_name_region"] = source.get("selected_name_region") or list(SELECTED_NAME_REGION)
+        payload["selected_name_threshold"] = source.get("selected_name_threshold", SELECTED_THRESHOLD)
+    payload.update(
+        {
+            "loadout_preset_feature": source.get("loadout_preset_feature"),
+            "max_scrolls": source.get("max_scrolls", 20),
+            "scroll_direction": source.get("scroll_direction", "down"),
+            "scroll_clicks": source.get("scroll_clicks", 1),
+            "loadout_slots": list(_loadout_slots(source)),
+            "notes": str(source.get("notes") or ""),
+        }
+    )
     for key, value in source.items():
         if str(key) not in KNOWN_SHIP_FIELDS:
             payload.setdefault(str(key), value)
@@ -220,6 +249,7 @@ def validate_ship_editor(state: ShipEditorState) -> list[str]:
     - 新增已选中态模板 ``selected.png`` 的质量检查；未框选不报错（向后兼容）；
     - 空 ``loadout_slots`` 不再阻断保存（当前用户口径：信号旗由
       ``profile.ship_check_sequence`` 在装备页校验），改由 :func:`ship_editor_warnings` 提示。
+    - ISS-007 补充：右侧详情面板船名模板 ``selected_name.png`` 同样做质量检查，未框选不报错。
     """
     errors: list[str] = []
     if not state.ship_dir.is_dir():
@@ -240,6 +270,10 @@ def validate_ship_editor(state: ShipEditorState) -> list[str]:
         quality = cc.inspect_template(state.selected_image)
         if not quality.ok:
             errors.extend(f"选中态卡片: {message}" for message in quality.errors)
+    if state.name_image is not None:
+        quality = cc.inspect_template(state.name_image)
+        if not quality.ok:
+            errors.extend(f"右侧船名: {message}" for message in quality.errors)
     for slot_id, image in state.loadout_images.items():
         quality = cc.inspect_template(image)
         if not quality.ok:
@@ -277,7 +311,7 @@ class ShipSaveResult:
 
 
 def save_ship_editor(state: ShipEditorState) -> ShipSaveResult:
-    """保存卡片/已选中态/空槽 PNG 与 ship.yaml；结构错误时不写任何文件。"""
+    """保存卡片/已选中态/右侧船名/空槽 PNG 与 ship.yaml；结构错误时不写任何文件。"""
     errors = validate_ship_editor(state)
     if errors:
         return ShipSaveResult(saved=False, errors=tuple(errors))
@@ -290,6 +324,10 @@ def save_ship_editor(state: ShipEditorState) -> ShipSaveResult:
         selected_path = state.ship_dir / SELECTED_TEMPLATE
         cc.write_image(selected_path, state.selected_image)
         files.append(selected_path)
+    if state.name_image is not None:
+        name_path = state.ship_dir / SELECTED_NAME_TEMPLATE
+        cc.write_image(name_path, state.name_image)
+        files.append(name_path)
     for slot_id, image in state.loadout_images.items():
         target = state.ship_dir / empty_template_rel(slot_id)
         cc.write_image(target, image)
@@ -351,6 +389,11 @@ class ShipCalibrationApp:
             text="框选已选中状态的卡片（selected.png）",
             command=lambda: self._start("selected"),
         ).pack(fill="x", pady=2)
+        tk.Button(
+            left,
+            text="框选右侧详情面板船名（selected_name.png）",
+            command=lambda: self._start("name"),
+        ).pack(fill="x", pady=2)
         for slot_id, name in DEFAULT_LOADOUT_SLOTS:
             tk.Button(
                 left,
@@ -375,6 +418,12 @@ class ShipCalibrationApp:
             selected = "已有文件"
         else:
             selected = "未框选"
+        if self.state.name_image is not None:
+            name = "已框选"
+        elif (self.state.ship_dir / SELECTED_NAME_TEMPLATE).is_file():
+            name = "已有文件"
+        else:
+            name = "未框选"
         slots = "、".join(sorted(self.state.loadout_images)) or "无"
         frame = (
             f"{self.state.frame_size[0]}x{self.state.frame_size[1]}" if self.state.screenshot is not None else "无"
@@ -386,7 +435,7 @@ class ShipCalibrationApp:
         ]
         self._info.configure(
             text=f"截图: {self.state.screenshot_path or '未载入'}（{frame}）\n"
-            f"卡片: {card}\n已选中态: {selected}\n本次框选空槽: {slots}\n"
+            f"卡片: {card}\n已选中态: {selected}\n右侧船名: {name}\n本次框选空槽: {slots}\n"
             f"配置中槽位: {', '.join(saved_slots) or '无'}"
         )
 
@@ -423,6 +472,12 @@ class ShipCalibrationApp:
                 "拖动矩形框选“已选中状态”的目标船卡片：必须含该船船名/船体 + 选中高亮/边框，"
                 "不能只截通用边框（否则任何船被选中都会误匹配）",
             )
+        elif mode == "name":
+            self._set_pending(
+                "name",
+                "拖动矩形框选右侧详情面板的“当前已选中船名”文字（指挥官上方）："
+                "包含船名文字与周围固定背景，避免只截单个字；换船后该处文字会变化",
+            )
         else:
             self._pending_slot = (slot_id, slot_name)
             self._set_pending("slot", f"拖动矩形框选空槽位 {slot_name} 的模板")
@@ -447,6 +502,9 @@ class ShipCalibrationApp:
         elif pending == "selected":
             self.state.selected_image = template
             print(f"[已选中态卡片] {quality.summary()}")
+        elif pending == "name":
+            self.state.name_image = template
+            print(f"[右侧船名] {quality.summary()}")
         else:
             slot_id, slot_name = self._pending_slot
             width, height = self.state.frame_size
@@ -516,7 +574,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m src.tools.calibrate_ship",
         description=(
-            "船只标定 GUI：框选船只卡片、已选中态卡片（selected.png）与空装备槽模板，"
+            "船只标定 GUI：框选船只卡片、已选中态卡片（selected.png）、"
+            "右侧详情面板船名（selected_name.png）与空装备槽模板，"
             "生成/更新 ships/<ship_id>/ship.yaml"
         ),
     )

@@ -75,6 +75,11 @@ def test_leningrad_ship_profile_has_selected_evidence_fields(project_root: Path)
     assert ship.selected_threshold == 0.85
     # 模板可能尚未标定；已标定时必须解析为存在的文件
     assert ship.selected_path is None or ship.selected_path.is_file()
+    # 右侧详情面板船名证据（ISS-007 实机补充 2026-10-31）：与选中态模板互为兜底
+    assert ship.selected_name_feature == "selected_name.png"
+    assert ship.selected_name_region == NormalizedRect(0.79, 0.07, 0.91, 0.13)
+    assert ship.selected_name_threshold == 0.85
+    assert ship.selected_name_path is None or ship.selected_name_path.is_file()
     assert ship.cover_list_start is True
     assert ship.max_position_scrolls == 10
     assert ship.confirm_frames == 2
@@ -89,6 +94,9 @@ def test_iron_duke_ship_profile_has_selected_evidence_fields(project_root: Path)
     assert ship.selected_feature == "selected.png"
     assert ship.selected_region == NormalizedRect(0.0, 0.8, 1.0, 1.0)
     assert ship.selected_path is None or ship.selected_path.is_file()
+    assert ship.selected_name_feature == "selected_name.png"
+    assert ship.selected_name_region == NormalizedRect(0.79, 0.07, 0.91, 0.13)
+    assert ship.selected_name_path is None or ship.selected_name_path.is_file()
     assert ship.max_scrolls == 20
     assert ship.scroll_clicks == 2
 
@@ -116,6 +124,10 @@ def test_ship_profile_selection_defaults() -> None:
     assert ship.selected_path is None
     assert ship.selected_region is None
     assert ship.selected_threshold == 0.85
+    assert ship.selected_name_feature is None
+    assert ship.selected_name_path is None
+    assert ship.selected_name_region is None
+    assert ship.selected_name_threshold == 0.85
     assert ship.cover_list_start is True
     assert ship.max_scrolls == 20
     assert ship.max_position_scrolls == 10
@@ -198,3 +210,33 @@ def test_selected_template_present_produces_no_warning(tmp_path: Path) -> None:
     ship = load_ship(tmp_path / "ship.yaml")
     issues = validate_ship(ship)
     assert not [issue for issue in issues if "selected_feature" in issue.location]
+
+
+def test_load_ship_selected_name_fields_and_missing_warning(tmp_path: Path) -> None:
+    """右侧详情面板船名证据：解析字段；模板缺失只告警，不阻断运行。"""
+    (tmp_path / "ship.yaml").write_text(
+        "ship_id: demo\n"
+        "display_name: 演示船\n"
+        "card_template: card.png\n"
+        "selected_name_feature: selected_name.png\n"
+        "selected_name_region: [0.79, 0.07, 0.91, 0.13]\n"
+        "selected_name_threshold: 0.88\n",
+        encoding="utf-8",
+    )
+    ship = load_ship(tmp_path / "ship.yaml")
+    assert ship.selected_name_feature == "selected_name.png"
+    assert ship.selected_name_region == NormalizedRect(0.79, 0.07, 0.91, 0.13)
+    assert ship.selected_name_threshold == 0.88
+    assert ship.selected_name_path is None
+
+    issues = validate_ship(ship)
+    missing = [issue for issue in issues if "selected_name_feature" in issue.location]
+    assert missing and all(not issue.is_error for issue in missing)
+    assert any(issue.code == "file_missing" for issue in missing)
+    assert not [issue for issue in issues if issue.is_error and "selected_name" in issue.location]
+
+    (tmp_path / "selected_name.png").write_bytes(b"not a real png")
+    ship = load_ship(tmp_path / "ship.yaml")
+    assert ship.selected_name_path == (tmp_path / "selected_name.png").resolve()
+    issues = validate_ship(ship)
+    assert not [issue for issue in issues if "selected_name" in issue.location]

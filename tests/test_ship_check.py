@@ -31,6 +31,7 @@ from src.perception.capture import Frame
 from src.state_machine.ship_check import (
     SHIP_CARD_FEATURE,
     SHIP_SELECTED_FEATURE,
+    SHIP_SELECTED_NAME_FEATURE,
     ShipChecker,
     ShipCheckStatus,
 )
@@ -108,7 +109,11 @@ class FakeShipWorld:
 
 
 class FakeEngine:
-    """假感知：按世界状态返回 ship_card / ship_selected 匹配。"""
+    """假感知：按世界状态返回 ship_card / ship_selected / ship_selected_name 匹配。
+
+    ``selected_evidence_enabled`` / ``name_evidence_enabled`` 用于分别模拟两类“已选中证据”
+    是否可用（实机上 selected.png 可能因背景/高亮差异失配，而右侧船名仍可靠）。
+    """
 
     def __init__(
         self,
@@ -116,12 +121,16 @@ class FakeEngine:
         *,
         selected_registration_ok: bool = True,
         multi_candidates: bool = False,
+        selected_evidence_enabled: bool = True,
+        name_evidence_enabled: bool = True,
     ) -> None:
         self.world = world
         self.frame_id = 1
         self.registered: dict[str, dict] = {}
         self.selected_registration_ok = selected_registration_ok
         self.multi_candidates = multi_candidates
+        self.selected_evidence_enabled = selected_evidence_enabled
+        self.name_evidence_enabled = name_evidence_enabled
         self.match_calls = 0
 
     def register_feature(self, feature_id, template_path, region=None, threshold=0.85) -> None:
@@ -143,14 +152,21 @@ class FakeEngine:
 
     def match_feature(self, feature_id: str) -> MatchResult:
         self.match_calls += 1
+        # 未注册的特征（模板缺失/未配置）一律视为未命中，与真实引擎一致
+        if feature_id not in self.registered:
+            return MatchResult(feature_id, False, 0.0)
         if feature_id == SHIP_SELECTED_FEATURE:
-            if self.world.selected == self.world.target:
+            if self.selected_evidence_enabled and self.world.selected == self.world.target:
                 slot = self.world.target_slot()
                 center = None
                 if slot is not None:
                     center = (slot * self.world.card_width + self.world.card_width // 2, WINDOW_H // 2)
                 return MatchResult(feature_id, True, 0.97, center=center)
             return MatchResult(feature_id, False, 0.10)
+        if feature_id == SHIP_SELECTED_NAME_FEATURE:
+            if self.name_evidence_enabled and self.world.selected == self.world.target:
+                return MatchResult(feature_id, True, 0.99)
+            return MatchResult(feature_id, False, 0.12)
         if feature_id == SHIP_CARD_FEATURE:
             slot = self.world.target_slot()
             if slot is None:
@@ -207,6 +223,9 @@ def make_ship(
     *,
     selected_feature: str | None = "selected.png",
     selected_path: Path | None = Path("selected.png"),
+    selected_name_feature: str | None = None,
+    selected_name_path: Path | None = None,
+    selected_name_region: NormalizedRect | None = None,
     **overrides,
 ) -> ShipProfile:
     payload = {
@@ -218,6 +237,9 @@ def make_ship(
         "selected_feature": selected_feature,
         "selected_region": CARD_SEARCH,
         "selected_path": selected_path,
+        "selected_name_feature": selected_name_feature,
+        "selected_name_region": selected_name_region,
+        "selected_name_path": selected_name_path,
         "max_scrolls": 20,
         "scroll_direction": "down",
         "scroll_clicks": 1,
@@ -243,6 +265,8 @@ class Harness:
         steps: FakeSteps | None = None,
         multi_candidates: bool = False,
         selected_registration_ok: bool = True,
+        selected_evidence_enabled: bool = True,
+        name_evidence_enabled: bool = True,
     ) -> None:
         self.world = world
         self.steps = steps or FakeSteps()
@@ -250,6 +274,8 @@ class Harness:
             world,
             selected_registration_ok=selected_registration_ok,
             multi_candidates=multi_candidates,
+            selected_evidence_enabled=selected_evidence_enabled,
+            name_evidence_enabled=name_evidence_enabled,
         )
         profile = ClientProfile(
             client_id="test",
@@ -367,6 +393,53 @@ def test_click_without_selected_evidence_fails_not_ok() -> None:
     assert "选中" in harness.checker.failure_reason
     # 重复点击有上限（max_click_attempts=2），不能无限点击
     assert len(harness.click_actions()) == 2
+
+
+def test_already_selected_by_right_panel_name_returns_ok() -> None:
+    """实机回归：卡片选中态模板失配（0.815）时，右侧详情面板船名仍可确认已选中。"""
+    world = FakeShipWorld(["a", "target", "b", "c"], visible=3)
+    world.selected = "target"
+    ship = make_ship(
+        selected_feature=None,
+        selected_path=None,
+        selected_name_feature="selected_name.png",
+        selected_name_path=Path("selected_name.png"),
+    )
+    harness = Harness(world, ship=ship, selected_evidence_enabled=False)
+    status, actions = harness.tick()
+    assert status is ShipCheckStatus.OK
+    assert actions == []
+    assert harness.click_actions() == []
+    assert harness.checker.last_result is not None
+    assert harness.checker.last_result.selected_name_found is True
+
+
+def test_right_panel_name_confirms_after_click_when_card_selected_template_misses() -> None:
+    """点击目标卡后，选中的船名出现即可确认，不要求 selected.png 也必须命中。"""
+    world = FakeShipWorld(["a", "target", "b", "c"], visible=3)
+    ship = make_ship(
+        selected_name_feature="selected_name.png",
+        selected_name_path=Path("selected_name.png"),
+    )
+    harness = Harness(world, ship=ship, selected_evidence_enabled=False)
+    status = harness.run_until_terminal()
+    assert status is ShipCheckStatus.OK
+    assert world.selected == "target"
+    assert len(harness.click_actions()) == 1
+    assert harness.checker.last_result is not None
+    assert harness.checker.last_result.selected_name_found is True
+
+
+def test_both_evidence_types_unavailable_fails_conservatively() -> None:
+    world = FakeShipWorld(["a", "target", "b", "c"], visible=3)
+    world.selected = "target"
+    harness = Harness(world, ship=make_ship(selected_feature=None, selected_path=None))
+    status, actions = harness.tick()
+    assert status is ShipCheckStatus.FAILED
+    assert "已选中证据不可用" in harness.checker.failure_reason
+    assert actions == []
+
+
 
 
 def test_selected_feature_not_configured_fails_conservatively() -> None:

@@ -24,6 +24,7 @@ from src.common.clock import FakeClock, FakeSleeper
 from src.common.coords import ImageOrientation
 from src.common.types import NormalizedRect, Rect
 from src.config.loader import load_project, load_ship
+from src.config.validate import validate_ship
 from src.perception.capture import Frame
 from src.storage.database import Database
 from src.tools import calibrate_common as cc
@@ -766,6 +767,162 @@ def test_calibrate_ship_rejects_bad_selected_template(tmp_path: Path) -> None:
     blocked = calibrate_ship.save_ship_editor(state)
     assert blocked.saved is False
     assert not (ship_dir / "selected.png").exists()
+
+
+def test_calibrate_ship_name_template_save_flow(tmp_path: Path) -> None:
+    """ISS-007 补充：保存右侧详情面板船名模板 selected_name.png 与对应 ship.yaml 字段。"""
+    ship_dir = tmp_path / "profiles" / "testclient" / "ships" / "name_ship"
+    ship_dir.mkdir(parents=True)
+    write_yaml(
+        ship_dir / "ship.yaml",
+        {
+            "ship_id": "name_ship",
+            "display_name": "船名船",
+            "card_template": "card.png",
+            "card_search_region": [0.0, 0.8, 1.0, 1.0],
+            "loadout_slots": [],
+        },
+    )
+    screenshot = sample_background(640, 400, seed=31)
+    screenshot_path = tmp_path / "port.png"
+    cc.write_image(screenshot_path, screenshot)
+    state = calibrate_ship.load_ship_editor(ship_dir, screenshot_path)
+    state.card_image = cc.crop_region(screenshot, cc.BoxSelection(200, 300, 160, 60))
+    state.name_image = cc.crop_region(screenshot, cc.BoxSelection(510, 30, 60, 20))
+
+    assert calibrate_ship.validate_ship_editor(state) == []
+    result = calibrate_ship.save_ship_editor(state)
+    assert result.saved is True
+    assert (ship_dir / "card.png").is_file()
+    assert (ship_dir / "selected_name.png").is_file()
+    assert not (ship_dir / "selected.png").exists()  # 本次未框选卡片选中态
+
+    data = cc.read_yaml_mapping(ship_dir / "ship.yaml")
+    assert data["selected_name_feature"] == "selected_name.png"
+    assert data["selected_name_region"] == pytest.approx([0.79, 0.07, 0.91, 0.13])
+    assert data["selected_name_threshold"] == pytest.approx(0.85)
+    assert data["loadout_slots"] == []  # 空 loadout_slots 仍允许保存
+
+    # 工具生成的 ship.yaml 必须能被正式 loader 解析（ShipProfile/loader 已支持 selected_name_*）
+    ship = load_ship(ship_dir / "ship.yaml")
+    assert ship.ship_id == "name_ship"
+    assert ship.selected_name_feature == "selected_name.png"
+    assert ship.selected_name_region == NormalizedRect(0.79, 0.07, 0.91, 0.13)
+    assert ship.selected_name_threshold == pytest.approx(0.85)
+    assert ship.selected_name_path == (ship_dir / "selected_name.png").resolve()
+    issues = validate_ship(ship)
+    assert not [issue for issue in issues if issue.is_error]
+    assert not [issue for issue in issues if "selected_name" in issue.location]
+
+
+def test_calibrate_ship_card_and_selected_without_name_fields(tmp_path: Path) -> None:
+    """只框 card+selected 仍可保存，且不得凭空写入 selected_name_* 字段。"""
+    ship_dir = tmp_path / "profiles" / "testclient" / "ships" / "no_name"
+    ship_dir.mkdir(parents=True)
+    write_yaml(
+        ship_dir / "ship.yaml",
+        {
+            "ship_id": "no_name",
+            "display_name": "无船名模板",
+            "card_template": "card.png",
+            "loadout_slots": [
+                {
+                    "slot_id": "signal_flags",
+                    "name": "信号旗槽位",
+                    "empty_template": "loadout/signal_flags_empty.png",
+                }
+            ],
+        },
+    )
+    screenshot = sample_background(640, 400, seed=32)
+    screenshot_path = tmp_path / "port.png"
+    cc.write_image(screenshot_path, screenshot)
+    state = calibrate_ship.load_ship_editor(ship_dir, screenshot_path)
+    state.card_image = cc.crop_region(screenshot, cc.BoxSelection(100, 300, 160, 60))
+    state.selected_image = cc.crop_region(screenshot, cc.BoxSelection(100, 280, 160, 70))
+    assert state.name_image is None
+    assert calibrate_ship.validate_ship_editor(state) == []
+
+    result = calibrate_ship.save_ship_editor(state)
+    assert result.saved is True
+    assert (ship_dir / "selected.png").is_file()
+    assert not (ship_dir / "selected_name.png").exists()
+    data = cc.read_yaml_mapping(ship_dir / "ship.yaml")
+    for key in ("selected_name_feature", "selected_name_region", "selected_name_threshold"):
+        assert key not in data
+
+
+def test_calibrate_ship_card_only_preserves_existing_name_fields(tmp_path: Path) -> None:
+    """未重新框选船名时保留已有 selected_name_* 与既有 selected_name.png 资产。"""
+    ship_dir = tmp_path / "profiles" / "testclient" / "ships" / "keep_name"
+    ship_dir.mkdir(parents=True)
+    write_yaml(
+        ship_dir / "ship.yaml",
+        {
+            "ship_id": "keep_name",
+            "display_name": "保留船名",
+            "card_template": "card.png",
+            "selected_name_feature": "selected_name.png",
+            "selected_name_region": [0.8, 0.08, 0.9, 0.12],
+            "selected_name_threshold": 0.9,
+            "loadout_slots": [
+                {
+                    "slot_id": "signal_flags",
+                    "name": "信号旗槽位",
+                    "empty_template": "loadout/signal_flags_empty.png",
+                }
+            ],
+        },
+    )
+    existing = b"existing-selected-name-asset-not-to-overwrite"
+    (ship_dir / "selected_name.png").write_bytes(existing)
+    screenshot = sample_background(640, 400, seed=33)
+    screenshot_path = tmp_path / "port.png"
+    cc.write_image(screenshot_path, screenshot)
+    state = calibrate_ship.load_ship_editor(ship_dir, screenshot_path)
+    state.card_image = cc.crop_region(screenshot, cc.BoxSelection(100, 300, 160, 60))
+    assert state.name_image is None
+    assert calibrate_ship.validate_ship_editor(state) == []
+
+    result = calibrate_ship.save_ship_editor(state)
+    assert result.saved is True
+    assert (ship_dir / "selected_name.png").read_bytes() == existing
+    data = cc.read_yaml_mapping(ship_dir / "ship.yaml")
+    assert data["selected_name_feature"] == "selected_name.png"
+    assert data["selected_name_region"] == pytest.approx([0.8, 0.08, 0.9, 0.12])
+    assert data["selected_name_threshold"] == pytest.approx(0.9)
+
+
+def test_calibrate_ship_rejects_bad_name_template(tmp_path: Path) -> None:
+    """右侧船名模板质量过差（纯色）必须报错并阻止保存。"""
+    ship_dir = tmp_path / "profiles" / "testclient" / "ships" / "bad_name"
+    ship_dir.mkdir(parents=True)
+    write_yaml(
+        ship_dir / "ship.yaml",
+        {
+            "ship_id": "bad_name",
+            "display_name": "坏船名",
+            "card_template": "card.png",
+            "loadout_slots": [
+                {
+                    "slot_id": "signal_flags",
+                    "name": "信号旗槽位",
+                    "empty_template": "loadout/signal_flags_empty.png",
+                }
+            ],
+        },
+    )
+    screenshot = sample_background(640, 400, seed=34)
+    screenshot_path = tmp_path / "port.png"
+    cc.write_image(screenshot_path, screenshot)
+    state = calibrate_ship.load_ship_editor(ship_dir, screenshot_path)
+    state.card_image = cc.crop_region(screenshot, cc.BoxSelection(100, 300, 160, 60))
+    state.name_image = np.full((40, 40, 3), 128, dtype=np.uint8)  # 纯色
+    errors = calibrate_ship.validate_ship_editor(state)
+    assert any("右侧船名" in message for message in errors)
+    blocked = calibrate_ship.save_ship_editor(state)
+    assert blocked.saved is False
+    assert not (ship_dir / "selected_name.png").exists()
 
 
 def test_capture_marker_save_and_profile_update(tmp_path: Path) -> None:
