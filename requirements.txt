@@ -3,3 +3,4 @@
 numpy>=2.5
 opencv-python>=5.0.0.93
 PyYAML>=6.0.3
+Pillow>=11.3.0
