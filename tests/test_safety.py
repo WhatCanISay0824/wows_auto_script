@@ -83,6 +83,18 @@ def test_key_state_source_protocol_accepts_fake() -> None:
 
 # ---------------------------------------------------------------------------
 # StopController 共享标志
+
+
+def test_conditional_resume_cannot_clear_new_pause_or_stop():
+    controller = StopController()
+    old = controller.request_pause("window_unfocused")
+    assert controller.resume(expected_pause=old)
+    manual = controller.request_pause("manual")
+    assert not controller.resume(expected_pause=old)
+    assert controller.pause_request is manual
+    controller.request_stop("hotkey")
+    assert not controller.resume(expected_pause=manual)
+    assert controller.stop_requested
 # ---------------------------------------------------------------------------
 
 
@@ -359,3 +371,86 @@ def test_watchdog_rejects_invalid_interval(keys, clock) -> None:
     monitor = make_monitor(keys, clock)
     with pytest.raises(ValueError, match="轮询间隔必须为正数"):
         SafetyWatchdog(monitor, interval_s=0)
+
+
+# ---------------------------------------------------------------------------
+# 过载保护事件（可选 OverloadMonitor 注入，不改变 F12/心跳/恢复行为）
+# ---------------------------------------------------------------------------
+
+
+def test_overload_event_kinds_available() -> None:
+    assert SafetyEventKind.OVERLOAD_WARNING.value == "overload_warning"
+    assert SafetyEventKind.OVERLOAD_PAUSE_REQUESTED.value == "overload_pause_requested"
+    assert SafetyEventKind.OVERLOAD_STOP_REQUESTED.value == "overload_stop_requested"
+    assert SafetyEventKind.OVERLOAD_RESUME_REQUESTED.value == "overload_resume_requested"
+
+
+def test_safety_event_detail_is_serialized() -> None:
+    event = SafetyEvent(
+        SafetyEventKind.OVERLOAD_WARNING,
+        1.5,
+        None,
+        detail={"kind": "cpu", "message": "CPU 过高"},
+    )
+    data = event.to_dict()
+    assert data["kind"] == "overload_warning"
+    assert data["extra"] == {"kind": "cpu", "message": "CPU 过高"}
+    assert "reason" not in data
+    frozen = SafetyEvent(SafetyEventKind.OVERLOAD_WARNING, 1.5)
+    assert frozen.to_dict()["kind"] == "overload_warning"
+    assert "extra" not in frozen.to_dict()
+
+
+def test_safety_monitor_exposes_clock(keys, clock) -> None:
+    monitor = make_monitor(keys, clock)
+    assert monitor.clock is clock
+
+
+def test_watchdog_dispatches_overload_events_at_1hz(keys, clock) -> None:
+    class StubOverload:
+        poll_interval_s = 1.0
+
+        def __init__(self) -> None:
+            self.calls: list[float] = []
+
+        def poll(self, now: float | None = None) -> list[SafetyEvent]:
+            self.calls.append(float(now or 0.0))
+            return [SafetyEvent(SafetyEventKind.OVERLOAD_WARNING, float(now or 0.0))]
+
+    monitor = make_monitor(keys, clock)
+    monitor.heartbeat(0.0)
+    overload = StubOverload()
+    received: list[SafetyEvent] = []
+    watchdog = SafetyWatchdog(monitor, on_event=received.append, overload=overload)
+    assert watchdog.overload is overload
+
+    clock.advance(0.05)
+    events = watchdog.run_once()
+    assert [event.kind for event in events] == [SafetyEventKind.OVERLOAD_WARNING]
+    assert received == events
+    # 20 Hz 循环内只按 1 Hz 调用过载 poll
+    for _ in range(19):
+        clock.advance(0.05)
+        watchdog.run_once()
+    assert len(overload.calls) == 1
+    clock.advance(1.0)
+    watchdog.run_once()
+    assert len(overload.calls) == 2
+
+
+def test_watchdog_overload_exception_does_not_kill_watchdog(keys, clock) -> None:
+    class BrokenOverload:
+        poll_interval_s = 1.0
+
+        def poll(self, now: float | None = None) -> list[SafetyEvent]:
+            raise RuntimeError("过载监控崩了")
+
+    monitor = make_monitor(keys, clock)
+    clock.advance(0.05)
+    watchdog = SafetyWatchdog(monitor, overload=BrokenOverload())
+    assert watchdog.run_once() == []
+    # 后续轮询仍然工作：F12 仍能产生紧急停止
+    keys.press("f12")
+    clock.advance(2.0)
+    events = watchdog.run_once()
+    assert any(event.kind is SafetyEventKind.EMERGENCY_STOP for event in events)

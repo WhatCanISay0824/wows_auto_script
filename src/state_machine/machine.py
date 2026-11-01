@@ -113,12 +113,14 @@ class StateMachine:
         # PORT 子阶段
         self._port_phase = "idle"
         self._port_wait_until = 0.0
+        self._port_wait_battle_count = -1
         self._port_start_attempts = 0
         self._port_loadout_started = False
         # EXIT 子状态
         self._exit_retried = False
         self._confirm_seen = False
         self._dead_wait_until = 0.0
+        self._dead_wait_log_reason = ""
         self._pending_exit_actions: list[Action] = []
         # 结算页按钮选择（2026-10-31）：优先“继续战斗！”直接下一局，否则“回到港口”
         self._result_continue_clicked = False
@@ -249,6 +251,28 @@ class StateMachine:
     def update_window_info(self, info: WindowInfo | None) -> None:
         self._window_info = info
 
+    def suspend_for_gui(self) -> None:
+        """工具窗口前台时停止子流程，保留生命周期、会话和本场记录。"""
+        self._stop_subflows()
+
+    def continue_after_gui(self, observation: Observation, now: float) -> None:
+        """返回游戏后重新识别，再从当前画面重建动作。"""
+        self._now = now
+        detected = None if observation.window_missing else self._safe_detect_state(now)
+        allowed = (State.PORT, State.QUEUEING, State.LOADING, State.BATTLE_ACTIVE,
+                   State.BATTLE_FINISHED, State.DEAD_PENDING_EXIT, State.POST_EXIT_INTERFACE)
+        if detected not in allowed:
+            self.request_pause("gui_return_unknown", "返回游戏后无法识别画面，请检查后恢复")
+            return
+        if detected is self._state:
+            self._entered_at = now
+            enter = getattr(self, f"_enter_{detected.name.lower()}", None)
+            if enter is not None:
+                enter(now, "gui_return")
+        else:
+            self._transition(detected, "gui_return")
+        self._open_input_gate("gui_return")
+
     # ------------------------------------------------------------------
     # 主入口
     # ------------------------------------------------------------------
@@ -327,7 +351,8 @@ class StateMachine:
         if entry is None:
             return None
         limit, reason = entry
-        if limit > 0 and now - self._entered_at > limit:
+        started_at = max(self._entered_at, self._port_wait_until) if self._state is State.PORT else self._entered_at
+        if limit > 0 and now - started_at > limit:
             return reason
         return None
 
@@ -444,8 +469,12 @@ class StateMachine:
         self._port_phase = "idle"
         # 本会话尚未完成任何战斗（含暂停恢复后的重新进港口）时不等待；
         # 只有“两场之间”才使用随机冷却
-        between = 0.0 if self._battles_completed == 0 else self.deps.session.sample_between_battle_s()
-        self._port_wait_until = now + between
+        if self._port_wait_battle_count != self._battles_completed:
+            between = (0.0 if self._battles_completed == 0 else
+                       min(10.0, max(3.0, self.deps.session.sample_between_battle_s())))
+            self._port_wait_until = now + between
+            self._port_wait_battle_count = self._battles_completed
+        between = max(0.0, self._port_wait_until - now)
         self._port_start_attempts = 0
         self._port_loadout_started = False
         self.deps.ship_checker.reset()
@@ -561,6 +590,13 @@ class StateMachine:
         if self._observed_feature(observation, "queue_indicator"):
             self._begin_battle_record(now, map_id=None)
             self._transition(State.QUEUEING, "queue_detected")
+        elif self._battle_hud_visible(observation):
+            self._begin_battle_record(now, map_id=None)
+            self._transition(State.BATTLE_ACTIVE, "battle_hud_detected_from_start")
+        elif self._observed_feature(observation, "loading_indicator") or self._observed_feature(
+                observation, "loading_tip_area"):
+            self._begin_battle_record(now, map_id=None)
+            self._transition(State.LOADING, "loading_detected_from_start")
         return []
 
     def _enter_queueing(self, now: float, reason: str) -> None:
@@ -598,6 +634,10 @@ class StateMachine:
         self._stop_subflows()
         # ISS-006：同一场次内从暂停恢复时保留 _battle/_battle_id，不重建场次上下文
         resuming = self._battle is not None and self._battle_id is not None
+        if not resuming and self.deps.autopilot is not None:
+            reset = getattr(self.deps.autopilot, "reset", None)
+            if callable(reset):
+                reset()
         if self._battle is None:
             self._battle = _BattleRuntime(started_at=now, seed=self._rng.randrange(2**31))
         else:
@@ -775,11 +815,14 @@ class StateMachine:
 
         try:
             profile = RandomProfile.generate(self.config.global_config.behavior, seed=battle.seed)
-            self.deps.behavior.start(profile, now)
+            resume = getattr(self.deps.behavior, "resume", None)
+            if not persist and callable(resume) and getattr(self.deps.behavior, "profile", None) is not None:
+                resume(now)
+            else:
+                self.deps.behavior.start(profile, now)
             battle.behavior_started = True
             if (
-                persist
-                and self._battle_id is not None
+                self._battle_id is not None
                 and battle.random_profile_id is None
             ):
                 try:
@@ -917,16 +960,22 @@ class StateMachine:
         continue_feature = hud.result_continue_feature
         stop_ahead = self._stop_expected_after_battle()
         if continue_feature and not stop_ahead:
-            match = self._match_feature(continue_feature)
+            match = observation.feature(continue_feature) or self._match_feature(continue_feature, now)
             if match is not None and match.found:
                 self._result_continue_clicked = True
                 self._mark_exit_requested()
                 self._log_action("result_step", {"step": "continue_battle", "feature": continue_feature})
                 self._transition(State.EXITING, "result_continue_click")
                 return [_click_action(match, observation, "result_continue")]
+            if now < self._result_choice_until:
+                return []
+            self._save_diagnostic("result_continue_missing", now)
+            self._log_action("result_step", {"step": "continue_unavailable",
+                "feature": continue_feature, "score": match.score if match is not None else None,
+                "wait_s": 20.0})
         return_feature = hud.result_return_feature
         if return_feature:
-            match = self._match_feature(return_feature)
+            match = observation.feature(return_feature) or self._match_feature(return_feature, now)
             if match is not None and match.found:
                 self._mark_exit_requested()
                 detail = {"step": "return_port", "feature": return_feature}
@@ -962,26 +1011,42 @@ class StateMachine:
         self._stop_subflows()
         wait = self._rng.uniform(0.8, 2.0)
         self._dead_wait_until = now + wait
+        self._dead_wait_log_reason = ""
         self._log_action("state_change", {"to": "DEAD_PENDING_EXIT", "wait_s": round(wait, 2)})
 
     def _handle_dead_pending_exit(self, observation: Observation, now: float) -> list[Action]:
-        if now < self._dead_wait_until:
+        # 结算特征优先于等待/退出证据：等待期间出现结算页立即分流。
+        if self._result_visible(observation, now):
+            self._battle_result = "finished"
+            self._transition(State.BATTLE_FINISHED, "dead_wait_result")
             return []
-        # ISS-002：发送退出操作前再次校验“血条确认归零”证据仍在有效期内；
-        # 出现存活/未知证据时撤销尚未执行的退出，回到战斗继续等待自然结算。
+        if now < self._dead_wait_until:
+            self._log_dead_wait_once("awaiting_wait_window")
+            return []
+        # ISS-002：发送退出操作前再次校验“血条确认归零”证据仍在有效期内。
         if not self._exit_authorized(observation, now):
-            if self._result_visible(observation, now):
-                self._battle_result = "finished"
-                self._transition(State.BATTLE_FINISHED, "exit_revoked_result")
-            else:
-                self._log_action(
-                    "exit_revoked",
-                    {"reason": "hp_evidence_not_authorized", "death": observation.death.to_dict() if observation.death else None},
-                )
-                self._transition(State.BATTLE_ACTIVE, "exit_revoked")
+            death = observation.death
+            evidence = str(getattr(death, "hp_evidence", "unavailable"))
+            banner = bool(getattr(death, "banner", False))
+            if banner and evidence != "alive":
+                # 死亡提示不是退出授权，但也不能当成存活证据。留在死亡等待，
+                # 让后续新鲜帧继续积累“血条归零”证据；不重启巡航、不发退出键。
+                self._log_dead_wait_once("banner_without_alive_evidence")
+                return []
+            self._log_action(
+                "exit_revoked",
+                {"reason": "hp_evidence_not_authorized", "death": death.to_dict() if death else None},
+            )
+            self._transition(State.BATTLE_ACTIVE, "exit_revoked")
             return []
         self._transition(State.EXIT_MENU_OPEN, "dead_wait_done")
         return []
+
+    def _log_dead_wait_once(self, reason: str) -> None:
+        if reason == self._dead_wait_log_reason:
+            return
+        self._dead_wait_log_reason = reason
+        self._log_action("dead_wait", {"reason": reason})
 
     # ==================================================================
     # EXIT_MENU_OPEN / EXIT_CONFIRMING / EXITING
@@ -1074,10 +1139,13 @@ class StateMachine:
 
     def _handle_exiting(self, observation: Observation, now: float) -> list[Action]:
         # 结算页“继续战斗！”：游戏会直接回到排队界面（不再经过港口）
-        if self._result_continue_clicked and self._observed_feature(observation, "queue_indicator"):
+        next_battle_visible = (self._observed_feature(observation, "queue_indicator")
+            or self._observed_feature(observation, "loading_indicator")
+            or self._observed_feature(observation, "loading_tip_area")
+            or self._battle_hud_visible(observation))
+        if self._result_continue_clicked and next_battle_visible and not self._result_visible(observation, now):
             self._result_continue_clicked = False
-            self._mark_returned_to_port()
-            self._log_action("result_step", {"step": "continue_battle_queued"})
+            self._log_action("result_step", {"step": "continue_battle_detected"})
             self._finish_battle(
                 now, next_state=State.START_COOP, reason="battle_finished_continue"
             )
@@ -1295,6 +1363,15 @@ class StateMachine:
 
     def _resume_from_pause(self, observation: Observation, now: float, *, source: str) -> None:
         """ISS-006 恢复分流：当前会话战斗保留场次上下文；新进程不接管已有战斗。"""
+        if source == "window" and self._controller is not None:
+            request = self._controller.pause_request
+            if self._controller.stop_requested:
+                return
+            if request is not None:
+                if request.reason not in ("window_lost", "window_unfocused", "window_unavailable"):
+                    return
+                if not self._controller.resume(expected_pause=request):
+                    return
         detected = None if observation.window_missing else self._safe_detect_state(now)
         battle_id = self._battle_id
         battle_active = battle_id is not None and self._battle is not None and self._battle_result != "finished"
@@ -1359,10 +1436,9 @@ class StateMachine:
         self._open_input_gate("resume_init")
 
     def _stay_paused(self, reason: str, detail: str, source: str) -> None:
-        """恢复尝试无法离开 PAUSED 时保持暂停；用户手动恢复需重新同步控制器暂停状态。"""
+        """恢复尝试失败时，同步保留状态机和共享控制器的暂停状态。"""
         self._pause_reason = reason
-        if source == "user" and self._controller is not None:
-            # 主循环已清除控制器暂停，若不写回会在本状态“无人暂停”却无法自动恢复
+        if self._controller is not None:
             try:
                 self._controller.request_pause(reason, detail, hook="state_machine")
             except Exception:
@@ -1417,6 +1493,10 @@ class StateMachine:
         if self._session_id is None:
             return None
         try:
+            self._battle_result = ""
+            self._exit_method = "none"
+            self._exit_error = None
+            self._result_continue_clicked = False
             self._battle_id = self.deps.events.begin_battle(self._session_id, map_id)
             self.deps.screenshots.begin_battle(self._battle_id)
             self.deps.session.begin_battle()

@@ -346,3 +346,72 @@ def test_validate_app_without_project(tmp_path: Path) -> None:
     loaded = load_project(tmp_path, "cn360")
     issues = validate_app(loaded.config)
     assert any(issue.code == "empty" and issue.location == "maps" for issue in issues)
+
+
+# ---------------------------------------------------------------------------
+# 过载保护配置校验（overload 段：mode 枚举、阈值范围与逐级收紧）
+# ---------------------------------------------------------------------------
+
+
+def test_overload_valid_overrides(project: fx.TestProject, tmp_path: Path) -> None:
+    fx.edit_yaml_file(tmp_path / "config.yaml", "overload.mode", "pause_stop")
+    fx.edit_yaml_file(tmp_path / "config.yaml", "overload.sample_hz", 2)
+    fx.edit_yaml_file(tmp_path / "config.yaml", "overload.commit_pause_floor_mb", 3000)
+    fx.edit_yaml_file(tmp_path / "config.yaml", "overload.commit_pause_limit_ratio", 0.06)
+    fx.edit_yaml_file(tmp_path / "config.yaml", "overload.commit_warn_floor_mb", 9000)
+    report = _report(tmp_path, project)
+    assert report.ok, report.format_lines()
+
+
+def test_overload_invalid_mode(project: fx.TestProject, tmp_path: Path) -> None:
+    fx.edit_yaml_file(tmp_path / "config.yaml", "overload.mode", "yolo")
+    report = _report(tmp_path, project)
+    assert any(
+        issue.code == "enum" and "overload.mode" in issue.location for issue in report.errors
+    )
+
+
+def test_overload_ranges_rejected(project: fx.TestProject, tmp_path: Path) -> None:
+    fx.edit_yaml_file(tmp_path / "config.yaml", "overload.sample_hz", 0)
+    fx.edit_yaml_file(tmp_path / "config.yaml", "overload.cpu_warn_pct", 0)
+    fx.edit_yaml_file(tmp_path / "config.yaml", "overload.min_coverage", 1.5)
+    fx.edit_yaml_file(tmp_path / "config.yaml", "overload.starvation_pause_events", 0)
+    fx.edit_yaml_file(tmp_path / "config.yaml", "overload.auto_resume_max", -1)
+    report = _report(tmp_path, project)
+    errors = report.errors
+    assert any("overload.sample_hz" in issue.location for issue in errors)
+    assert any("overload.cpu_warn_pct" in issue.location for issue in errors)
+    assert any("overload.min_coverage" in issue.location for issue in errors)
+    assert any("overload.starvation_pause_events" in issue.location for issue in errors)
+    assert any("overload.auto_resume_max" in issue.location for issue in errors)
+
+
+def test_overload_commit_thresholds_must_tighten(project: fx.TestProject, tmp_path: Path) -> None:
+    # 停止阈值不能高于暂停阈值，否则会先暂停后“更容易停止”
+    fx.edit_yaml_file(tmp_path / "config.yaml", "overload.commit_stop_floor_mb", 9000)
+    fx.edit_yaml_file(tmp_path / "config.yaml", "overload.commit_fast_stop_limit_ratio", 0.5)
+    report = _report(tmp_path, project)
+    errors = report.errors
+    assert any(
+        "overload.commit_stop_floor_mb" in issue.location for issue in errors
+    )
+    assert any(
+        "overload.commit_fast_stop_limit_ratio" in issue.location for issue in errors
+    )
+
+
+def test_overload_window_relationships(project: fx.TestProject, tmp_path: Path) -> None:
+    fx.edit_yaml_file(tmp_path / "config.yaml", "overload.window_long_s", 10)
+    fx.edit_yaml_file(tmp_path / "config.yaml", "overload.commit_stop_window_s", 120)
+    fx.edit_yaml_file(tmp_path / "config.yaml", "overload.commit_fast_stop_sustained_s", 200)
+    report = _report(tmp_path, project)
+    errors = report.errors
+    assert any("overload.window_long_s" in issue.location for issue in errors)
+    assert any("overload.commit_stop_window_s" in issue.location for issue in errors)
+    assert any("overload.commit_fast_stop_sustained_s" in issue.location for issue in errors)
+
+
+def test_real_repo_overload_defaults_validate(project_root: Path) -> None:
+    report = validate_project(project_root, "cn360")
+    assert not report.has_errors, [issue.format() for issue in report.errors]
+    assert not any("overload" in issue.location for issue in report.issues)

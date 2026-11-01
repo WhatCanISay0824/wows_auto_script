@@ -33,7 +33,7 @@ import random
 import threading
 import time
 from collections import deque
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 
 from ..common.clock import Clock, Sleeper, SystemClock, SystemSleeper
@@ -125,8 +125,10 @@ class InputExecutor:
         sleeper: Sleeper | None = None,
         rng: random.Random | None = None,
         auto_start: bool = True,
+        can_execute: Callable[[], bool] | None = None,
     ) -> None:
         self._backend = backend
+        self._can_execute = can_execute
         self._config = config or InputConfig()
         if self._config.queue_max < 1:
             raise ValueError(f"input.queue_max 必须 >= 1，当前 {self._config.queue_max!r}")
@@ -530,6 +532,10 @@ class InputExecutor:
             if self._action_expired(action, now):
                 self._mark_expired(action, now)
                 continue
+            if self._can_execute is not None and not self._can_execute():
+                self.close_gate_and_release("foreground_changed")
+                self._drop_remaining(batch, index)
+                break
             try:
                 self._backend.send([action])
             except InputUnavailable as exc:

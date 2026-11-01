@@ -220,7 +220,7 @@ def test_between_battle_sampling_and_sleeper() -> None:
     controller, clock, _ = make_controller(rng=random.Random(11))
     controller.start()
     seconds = controller.wait_between_battles()
-    assert 15.0 <= seconds <= 60.0
+    assert 3.0 <= seconds <= 10.0
     assert clock.now() == pytest.approx(seconds)
 
 
@@ -230,7 +230,7 @@ def test_between_battle_sampling_reproducible() -> None:
     first_values = [first.sample_between_battle_s() for _ in range(5)]
     second_values = [second.sample_between_battle_s() for _ in range(5)]
     assert first_values == second_values
-    assert all(15.0 <= value <= 60.0 for value in first_values)
+    assert all(3.0 <= value <= 10.0 for value in first_values)
 
 
 def test_consecutive_start_failure_threshold() -> None:

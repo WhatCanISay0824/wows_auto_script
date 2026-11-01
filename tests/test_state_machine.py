@@ -482,19 +482,21 @@ def _match(feature_id: str, found: bool = True) -> MatchResult:
     return MatchResult(feature_id, found, 0.95, center=(100, 100), rect=(90, 90, 20, 20), scale=1.0)
 
 
-def _death_signals(now: float, *, authorized: bool = True) -> DeathSignals:
+def _death_signals(
+    now: float, *, authorized: bool = True, banner: bool = False, hp_evidence: str | None = None
+) -> DeathSignals:
     """构造一帧死亡信号；ISS-002 后退出只认 exit_authorized（血条确认归零证据）。"""
     return DeathSignals(
         hp_bar_absent=False,
         hp_zero=authorized,
-        banner=False,
+        banner=banner,
         marker_lost=False,
         spectator_ui=False,
         score=0.0,
         stable_ms=1500,
         timestamp=now,
         hp_fill_ratio=0.0 if authorized else 0.5,
-        hp_evidence="zero" if authorized else "unknown",
+        hp_evidence=hp_evidence or ("zero" if authorized else "unknown"),
         exit_authorized=authorized,
         evidence_at=now if authorized else 0.0,
     )
@@ -710,11 +712,12 @@ def test_result_continue_button_prefers_next_battle(tmp_path: Path) -> None:
     assert h.machine.state is State.EXITING
     assert any(action.label == "result_continue" for action in actions)
     # 继续战斗后游戏直接进入排队界面（不经过港口）
+    h.perception.features.clear()
     h.perception.features["queue_indicator"] = _match("queue_indicator")
     h.clock.advance(0.5)
     h.step()
     assert h.machine.state is State.START_COOP
-    assert "returned" in h.events.battle_marks
+    assert "returned" not in h.events.battle_marks
     assert h.events.battles and h.events.battles[-1][0] == "finished"
     assert h.machine.battles_completed == 1
     # START_COOP 识别到排队 -> 新一场记录 + QUEUEING
@@ -750,6 +753,10 @@ def test_result_returns_to_port_without_continue_button(tmp_path: Path) -> None:
     assert h.machine.state is State.BATTLE_FINISHED
     h.clock.advance(0.2)
     h.perception.features["result_return_port_button"] = _match("result_return_port_button")
+    actions = h.step()
+    assert h.machine.state is State.BATTLE_FINISHED
+    assert not any(action.label == "result_return_port" for action in actions)
+    h.clock.advance(20)
     actions = h.step()
     assert h.machine.state is State.EXITING
     assert any(action.label == "result_return_port" for action in actions)
@@ -788,23 +795,53 @@ def test_banner_or_missing_hp_bar_does_not_authorize_exit(tmp_path: Path) -> Non
     assert "death" not in h.events.battle_marks
 
 
-def test_exit_revoked_when_zero_evidence_lost(tmp_path: Path) -> None:
-    """ISS-002：等待退出期间出现存活/未知证据时撤销尚未执行的退出。"""
+def test_death_banner_unknown_evidence_keeps_waiting_for_fresh_zero(tmp_path: Path) -> None:
+    """死亡提示+未知证据留在死亡等待，后续新鲜零血证据仍可授权退出。"""
     h = Harness(tmp_path)
     drive_to_battle_active(h)
     h.perception.death = _death_signals(h.clock.now())
     h.step()
     assert h.machine.state is State.DEAD_PENDING_EXIT
-    # 等待期内证据转为未知（例如模板/帧异常）：不应进入退出菜单
+    # 等待期内只有死亡提示、血条未知：不能当作存活重启巡航，也不能发退出键。
     h.clock.advance(2.5)
-    h.perception.death = _death_signals(h.clock.now(), authorized=False)
+    h.perception.death = _death_signals(
+        h.clock.now(), authorized=False, banner=True, hp_evidence="unknown"
+    )
+    submitted_before = len(h.executor.submitted)
     h.step()
-    assert h.machine.state is State.BATTLE_ACTIVE
+    assert h.machine.state is State.DEAD_PENDING_EXIT
     assert "exit_requested" not in h.events.battle_marks
-    # 再次确认归零（新鲜证据）后可以重新发起退出
+    assert len(h.executor.submitted) == submitted_before
+    # 新帧继续积累到零血证据后可以退出。
+    h.perception.death = _death_signals(h.clock.now())
+    h.step()
+    assert h.machine.state is State.EXIT_MENU_OPEN
+
+
+def test_dead_wait_alive_evidence_returns_to_battle(tmp_path: Path) -> None:
+    h = Harness(tmp_path)
+    drive_to_battle_active(h)
     h.perception.death = _death_signals(h.clock.now())
     h.step()
     assert h.machine.state is State.DEAD_PENDING_EXIT
+    h.clock.advance(2.5)
+    h.perception.death = _death_signals(
+        h.clock.now(), authorized=False, banner=True, hp_evidence="alive"
+    )
+    h.step()
+    assert h.machine.state is State.BATTLE_ACTIVE
+
+
+def test_result_during_dead_wait_takes_priority(tmp_path: Path) -> None:
+    h = Harness(tmp_path)
+    drive_to_battle_active(h)
+    h.perception.death = _death_signals(h.clock.now())
+    h.step()
+    assert h.machine.state is State.DEAD_PENDING_EXIT
+    h.perception.features["battle_results"] = _match("battle_results")
+    h.step()
+    assert h.machine.state is State.BATTLE_FINISHED
+    assert "exit_requested" not in h.events.battle_marks
 
 
 def test_battle_error_recovery_does_not_send_escape(tmp_path: Path) -> None:
@@ -1035,11 +1072,11 @@ def test_first_port_visit_skips_between_battle_wait(tmp_path: Path) -> None:
     assert h.machine._port_wait_until == pytest.approx(h.clock.now())
     h.clock.advance(1.0)
     h.machine._enter_port(h.clock.now(), "test_resume_visit")
-    assert h.machine._port_wait_until == pytest.approx(h.clock.now())  # 暂停恢复不等待
+    assert h.machine._port_wait_until <= h.clock.now()  # 暂停恢复不等待
     h.machine._battles_completed = 1
     h.clock.advance(1.0)
     h.machine._enter_port(h.clock.now(), "test_second_visit")
-    assert h.machine._port_wait_until == pytest.approx(h.clock.now() + 30.0)
+    assert h.machine._port_wait_until == pytest.approx(h.clock.now() + 10.0)
 
 
 def test_paused_window_unavailable_auto_resumes_when_window_returns(tmp_path: Path) -> None:
@@ -1059,3 +1096,86 @@ def test_paused_window_unavailable_auto_resumes_when_window_returns(tmp_path: Pa
     h.machine.update_window_info(restored)
     h.step()
     assert h.machine.state is State.INIT
+
+
+def test_delayed_continue_button_wins_over_early_return_button(tmp_path):
+    h = Harness(tmp_path)
+    drive_to_battle_active(h)
+    h.perception.features = {"battle_results": _match("battle_results"),
+                             "result_return_port_button": _match("result_return_port_button")}
+    h.step()
+    h.clock.advance(1)
+    actions = h.step()
+    assert h.machine.state is State.BATTLE_FINISHED
+    assert not any(action.label == "result_return_port" for action in actions)
+    h.clock.advance(2)
+    h.perception.features["result_continue_battle_button"] = _match("result_continue_battle_button")
+    actions = h.step()
+    assert any(action.label == "result_continue" for action in actions)
+
+
+@pytest.mark.parametrize("feature,state", [
+    ("queue_indicator", State.QUEUEING), ("loading_indicator", State.LOADING),
+    ("battle_hud_indicator", State.BATTLE_ACTIVE),
+])
+def test_continue_starts_next_battle_when_queue_or_loading_is_skipped(tmp_path, feature, state):
+    h = Harness(tmp_path)
+    drive_to_battle_active(h)
+    old_id = h.machine.battle_id
+    h.perception.features = {"battle_results": _match("battle_results"),
+                             "result_continue_battle_button": _match("result_continue_battle_button")}
+    h.step()
+    h.clock.advance(1)
+    h.step()
+    assert h.machine.state is State.EXITING
+    h.perception.features = {feature: _match(feature)}
+    h.step()
+    assert h.machine.state is State.START_COOP
+    h.step()
+    assert h.machine.state is state
+    assert h.machine.battle_id != old_id
+    assert h.machine.battles_completed == 1
+    assert h.session.battle_starts == 2
+    assert h.events.battles == [("finished", "none", None)]
+
+
+def test_death_returns_port_then_joins_next_battle_with_one_short_wait(tmp_path):
+    h = Harness(tmp_path)
+    drive_to_battle_active(h)
+    old_id = h.machine.battle_id
+    h.perception.death = _death_signals(h.clock.now())
+    h.step()
+    h.clock.advance(2.5)
+    h.perception.death = _death_signals(h.clock.now())
+    h.step()
+    h.perception.features = {"exit_confirm": _match("exit_confirm")}
+    h.step()
+    h.step()
+    assert h.machine.state is State.EXITING
+    h.perception.death = None
+    h.perception.features = {"port_indicator": _match("port_indicator")}
+    calls = []
+    h.session.sample_between_battle_s = lambda: calls.append(1) or 7
+    h.step()
+    h.step()
+    assert h.machine.state is State.PORT
+    deadline = h.machine._port_wait_until
+    assert deadline == h.clock.now() + 7
+    assert h.events.battles[-1][0] == "dead"
+    h.clock.advance(2)
+    h.machine.request_pause("manual")
+    h.controller.resume()
+    h.perception.detected = State.PORT
+    h.machine.request_resume()
+    h.step()
+    assert h.machine._port_wait_until == deadline
+    assert len(calls) == 1
+    h.clock.advance(5)
+    for _ in range(5):
+        h.step()
+    assert h.machine.state is State.START_COOP
+    assert h.session.successes == 2
+    h.perception.features = {"queue_indicator": _match("queue_indicator")}
+    h.step()
+    assert h.machine.state is State.QUEUEING
+    assert h.machine.battle_id != old_id

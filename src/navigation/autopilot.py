@@ -3,19 +3,24 @@
 实机确认（2026-10-30，ISS-001）：直接点击战斗画面右下角的小地图**不会**设置航向；
 正确交互是“按 M 打开全屏战术地图 → 等待地图界面就绪 → 在目标位置左键点选 →
 再按 M 关闭地图返回战斗”。因此 autopilot 的运行默认是 ``navigation.surface=full_map``，
-旧的小地图直点路径保留为 ``surface=minimap`` 的失败降级/兼容路径。
+``surface=minimap`` 仅为旧兼容路径；自动周期仍先做水面筛选，验证失败保留全屏图并
+按间隔限频重试，不再因验证失败降级到小地图。
 
 目标点口径不变（实现补充 9.1，用户确认）：
 - 取开局时自身舰船标记在小地图内容区的归一化位置 ``(own_x, own_y)``；
 - 敌方区域 = 我方出生点关于地图中心的对称点，横坐标固定到中线，
   目标 = ``(0.5, 1 - own_y)``（再叠加 ``navigation.autopilot_offset`` 与安全内缩）；
 - 识别不到自身标记时最多等待 10 秒，之后回退到 ``(0.5, 0.5)`` 并记录 warning。
+- 自动目标在 M 开图前用当前小地图筛选安全水面（避开岛屿/海岸）；图像不可用、无效或
+  没有安全候选时本周期不按 M、不点击，10 秒后重试；用户显式目标保持原坐标，不做水面偏移。
+- 自动选中的目标在本次 M 开图/点击/关图期间冻结；未确认移动的目标加入最多 16 个失败
+  邻域，后续周期避开其 0.06 归一化邻域；成功移动、start/reset 或用户替换时清理。
 
 坐标换算（实现补充 10.1）：
 - ``navigation.full_map_rect`` 是全屏地图**内容区**相对窗口客户区的归一化矩形；
 - 目标归一化坐标 → full_map_rect 内像素 → 客户区像素 → 屏幕像素
   （``Observation.window_rect`` 是客户区屏幕矩形）；
-- ``surface=minimap`` 降级路径沿用 ``profile.minimap`` 的归一化内容区换算。
+- ``surface=minimap`` 旧兼容路径沿用 ``profile.minimap`` 的归一化内容区换算。
 
 full_map_rect 标定依据（2026-10-30 本地实机 M 地图截图 211242 / 211253，2559x1599，
 用 numpy/OpenCV 检测网格外边框得到，两张截图结果一致）：
@@ -38,19 +43,20 @@ full_map_rect 标定依据（2026-10-30 本地实机 M 地图截图 211242 / 211
 - ``open_map``：提交 M 开图（key_down/key_up 同批，由输入线程保证释放）；
 - ``wait_map``：等待地图界面就绪（``full_map_open_wait_s``；固定时长属于**时序假设**，
   需实机验证，不是模板判断）；
-- ``click``：在全屏地图内容区点选目标（或降级路径点小地图）；
+- ``click``：在全屏地图内容区点选目标（或 ``surface=minimap`` 兼容路径点小地图）；
 - ``wait_close``：等待点击生效（``full_map_close_wait_s``）后提交 M 关图；
 - ``verify``：关图后等待 ``full_map_verify_s``，用自身标记位移或船速确认航向生效；
-- ``reclick``：等待下一次周期重发，或验证失败后的重试/降级。
+- ``reclick``：等待下一次周期重发，或验证失败后的限频重试。
 
-失败处理：``verify`` 失败记 ``autopilot_verify_failed``，按 ``full_map_retry`` 重试；
-仍失败则降级 ``surface=minimap`` 一次并记 warning，不重复盲点同一目标。成功记
-``autopilot_confirmed``。``blocks_behavior`` 从提交开图到关图验证结束前为 True，
+失败处理：``verify`` 失败记 ``autopilot_verify_failed``，按 ``full_map_retry`` 快速重试；
+之后保留全屏地图路径，每至少 10 秒重试。HUD 激活提示只作辅助证据，关图后的新帧
+检测到位移或船速才记 ``autopilot_confirmed``。缺少地图标定或按键时保留旧兼容路径。
+``blocks_behavior`` 从提交开图到关图后取得新帧前为 True，
 状态机据此暂停随机行为；本模块从不发送 WASD，也不用 ESC 关地图（只用 keymap 的
 ``full_map`` 动作）。
 
 待实机确认（不得据此宣称已修复）：点击后是否真的设置航向、M 开/关时序、地图整图
-居中假设、比分栏遮挡；``surface=minimap`` 降级路径无法验证航向，只是兼容保留。
+居中假设、比分栏遮挡；``surface=minimap`` 旧兼容路径无法验证航向，只是兼容保留。
 """
 
 from __future__ import annotations
@@ -58,11 +64,15 @@ from __future__ import annotations
 import logging
 import math
 import random
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
 
+import numpy as np
+
 from ..common.types import Action, Observation, Rect
 from ..config.models import ClientProfile, KeyMap, NavigationConfig
+from .water_target import choose_water_target
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +88,10 @@ _MARKER_WAIT_S = 10.0
 _RETRY_GAP_S = 1.0
 # 地图序列期间感知连续缺失的宽限时间（超过则中止当前序列，避免盲点）
 _OBS_MISSING_GRACE_S = 2.0
+# 自动水面目标不可用时的等待间隔；不得用未验证的中心点代替
+_TARGET_UNAVAILABLE_RETRY_S = 10.0
+# 未移动的自动目标最多保留的失败邻域数量
+_MAX_FAILED_TARGETS = 16
 
 
 class _Phase(StrEnum):
@@ -142,6 +156,7 @@ class AutoPilotNavigator:
         on_event=None,
         logger_: logging.Logger | None = None,
         keymap: KeyMap | None = None,
+        minimap_provider: Callable[[Observation], np.ndarray | None] | None = None,
     ) -> None:
         self.config = config
         self.profile = profile
@@ -168,6 +183,61 @@ class AutoPilotNavigator:
         self._missing_marker_warned = False
         self._attempt = 0  # 连续验证失败次数（用于 full_map_retry）
         self._verify: _VerifyState | None = None
+        self._target_override: tuple[float, float] | None = None
+        self.move_confirmed = False
+        self.activation_detected = False
+        self.verify_failed = False
+        self.confirmed_at: float | None = None
+        self._movement_reference: tuple[float, float] | None = None
+        self._battle_view_after: float | None = None
+        # 自动水面目标：只在每个 M/点击/M 周期开始时选择一次，周期内冻结。
+        self._minimap_provider = minimap_provider
+        self._selected_target: tuple[float, float] | None = None
+        self._selected_from_marker = False
+        self._failed_targets: list[tuple[float, float]] = []
+        self._target_unavailable_reason: str | None = None
+
+    def replace_target(self, target: tuple[float, float], now: float) -> None:
+        """替换本场目标；已经开图时先完成当前序列，再使用最新目标。"""
+        x, y = target
+        if not all(math.isfinite(v) and 0.0 <= v <= 1.0 for v in (x, y)):
+            raise ValueError("目标坐标必须在 0 到 1 之间")
+        if self.config.full_map_rect is None or self._resolve_map_key() is None:
+            raise ValueError("缺少全屏地图标定或 M 按键映射，无法应用目标")
+        self._target_override = (x, y)
+        self._clear_selected_target()
+        self._clear_failed_targets()
+        self._surface = "full_map"
+        self._degraded = False
+        self.move_confirmed = False
+        self.activation_detected = False
+        self.verify_failed = False
+        self._next_click_at = float(now)
+        if self._phase in (_Phase.RECLICK, _Phase.WAIT_MARKER, _Phase.VERIFY):
+            self._phase = _Phase.RECLICK
+            self._verify = None
+            self._map_sequence = False
+        self._emit("autopilot_target_replaced", now, target=[x, y])
+
+    @property
+    def target_override(self) -> tuple[float, float] | None:
+        return self._target_override
+
+    def close_map_after_gui(self, now: float) -> list[Action]:
+        """GUI 打断已开图序列后，返回游戏先关图，再等待新战斗帧。"""
+        key = self._resolve_map_key()
+        if key is None:
+            raise ValueError("缺少全屏地图按键映射，无法关闭被打断的地图")
+        self._emit("autopilot_map_close", now, key=key, reason="gui_return")
+        return self._key_actions(key, "autopilot_close_map")
+
+    def _clear_selected_target(self) -> None:
+        self._selected_target = None
+        self._selected_from_marker = False
+
+    def _clear_failed_targets(self) -> None:
+        self._failed_targets.clear()
+        self._target_unavailable_reason = None
 
     # ------------------------------------------------------------------
     # 属性（供状态机/测试观察）
@@ -190,8 +260,13 @@ class AutoPilotNavigator:
 
     @property
     def blocks_behavior(self) -> bool:
-        """开图动作开始到关图验证结束前为 True，状态机据此暂停随机行为。"""
-        return self._active and self._map_sequence
+        """开关地图期间隔离输入；关图后已有新画面时可继续战斗行为。"""
+        return self._active and self._map_sequence and (
+            self._phase is not _Phase.VERIFY or self._battle_view_after is not None)
+
+    @property
+    def blocks_minimap(self) -> bool:
+        return self._map_open or self._battle_view_after is not None
 
     @property
     def map_open(self) -> bool:
@@ -228,12 +303,20 @@ class AutoPilotNavigator:
         self._phase_deadline = float(now)
         self._missing_marker_warned = False
         self._phase = _Phase.RECLICK  # 首个 tick 立即开始一轮（等待标记/重发时间已到）
-        self._surface = "full_map" if self.config.surface == "full_map" else "minimap"
+        self._surface = "full_map" if self._target_override is not None or self.config.surface == "full_map" else "minimap"
         self._degraded = False
         self._map_sequence = False
         self._map_open = False
         self._attempt = 0
         self._verify = None
+        self.move_confirmed = False
+        self.activation_detected = False
+        self.verify_failed = False
+        self.confirmed_at = None
+        self._movement_reference = None
+        self._battle_view_after = None
+        self._clear_selected_target()
+        self._clear_failed_targets()
         self._emit("autopilot_start", now, surface=self._surface)
         self._logger.info(
             "autopilot 导航启动：surface=%s，目标=%s（M 全屏地图点选后交给游戏自动驾驶，不碰 WASD）",
@@ -254,6 +337,7 @@ class AutoPilotNavigator:
         self._map_sequence = False
         self._map_open = False
         self._verify = None
+        self._battle_view_after = None
         self._phase_deadline = 0.0
         self._next_click_at = 0.0
         if map_was_open:
@@ -265,6 +349,13 @@ class AutoPilotNavigator:
         del was_map_sequence
 
     def reset(self) -> None:
+        self._target_override = None
+        self.move_confirmed = False
+        self.activation_detected = False
+        self.verify_failed = False
+        self.confirmed_at = None
+        self._movement_reference = None
+        self._battle_view_after = None
         self._active = False
         self._phase = _Phase.IDLE
         self._own_norm = None
@@ -278,6 +369,8 @@ class AutoPilotNavigator:
         self._attempt = 0
         self._degraded = False
         self._surface = "full_map" if self.config.surface == "full_map" else "minimap"
+        self._clear_selected_target()
+        self._clear_failed_targets()
 
     # ------------------------------------------------------------------
     # 主循环
@@ -288,17 +381,24 @@ class AutoPilotNavigator:
         now = float(now)
         if observation is None or observation.window_missing:
             return self._handle_missing_observation(now)
+        if (not self._map_open and self._battle_view_after is not None
+                and observation.frame_timestamp is not None
+                and observation.frame_timestamp > self._battle_view_after):
+            self._battle_view_after = None
         self._remember_own_position(observation)
+        if (self._phase in (_Phase.RECLICK, _Phase.WAIT_MARKER)
+                and observation.ship is not None and observation.ship.source != "lost"):
+            self._movement_reference = tuple(observation.ship.minimap_px)
 
         phase = self._phase
         if phase is _Phase.WAIT_MARKER:
             if not self._marker_ready(now):
                 return []
-            return self._begin_cycle(now)
+            return self._begin_cycle(observation, now)
         if phase is _Phase.RECLICK:
             if now < self._next_click_at:
                 return []
-            return self._begin_cycle(now)
+            return self._begin_cycle(observation, now)
         if phase is _Phase.OPEN_MAP:
             return self._open_map(now)
         if phase is _Phase.WAIT_MAP:
@@ -326,9 +426,20 @@ class AutoPilotNavigator:
     # ------------------------------------------------------------------
     # 相位推进
     # ------------------------------------------------------------------
-    def _begin_cycle(self, now: float) -> list[Action]:
+    def _begin_cycle(self, observation: Observation, now: float) -> list[Action]:
+        self.move_confirmed = False
+        self.activation_detected = False
+        self._clear_selected_target()
         if not self._marker_ready(now):
             self._phase = _Phase.WAIT_MARKER
+            return []
+        if (
+            self._minimap_provider is not None
+            and self._target_override is None
+            and not self._select_water_target(observation, now)
+        ):
+            self._phase = _Phase.RECLICK
+            self._next_click_at = now + _TARGET_UNAVAILABLE_RETRY_S
             return []
         if self._surface == "full_map":
             self._phase = _Phase.OPEN_MAP
@@ -347,6 +458,7 @@ class AutoPilotNavigator:
             return []
         self._map_sequence = True
         self._map_open = True
+        self._battle_view_after = math.inf
         self._phase = _Phase.WAIT_MAP
         self._phase_deadline = now + max(0.0, float(self.config.full_map_open_wait_s))
         self._emit("autopilot_map_open", now, key=key, wait_s=self.config.full_map_open_wait_s)
@@ -406,6 +518,7 @@ class AutoPilotNavigator:
             self._emit("autopilot_map_close_failed", now, reason=reason, map_maybe_open=True)
             return []
         self._logger.warning("autopilot 全屏地图异常（%s），先尽力按 M 关图", reason)
+        self._battle_view_after = now
         self._emit("autopilot_map_close", now, key=key, reason=reason)
         return self._key_actions(key, "autopilot_close_map")
 
@@ -416,9 +529,9 @@ class AutoPilotNavigator:
             return []
         self._map_open = False
         self._phase = _Phase.VERIFY
+        self._battle_view_after = now
         self._phase_deadline = now + max(0.0, float(self.config.full_map_verify_s))
-        self._verify = _VerifyState(started_at=now)
-        self._snapshot_verify_reference(observation)
+        self._verify = _VerifyState(started_at=now, ref_px=self._movement_reference)
         self._emit("autopilot_map_close", now, key=key, verify_s=self.config.full_map_verify_s)
         self._logger.info(
             "autopilot 按 M 关闭全屏地图，等待 %.2fs 验证航向（点击时目标 %s）",
@@ -430,25 +543,17 @@ class AutoPilotNavigator:
     # ------------------------------------------------------------------
     # 验证
     # ------------------------------------------------------------------
-    def _snapshot_verify_reference(self, observation: Observation | None) -> None:
-        verify = self._verify
-        if verify is None or observation is None:
-            return
-        ship = observation.ship
-        if ship is None or ship.source == "lost":
-            return
-        verify.ref_px = (float(ship.minimap_px[0]), float(ship.minimap_px[1]))
-
     def _update_verify(self, observation: Observation) -> None:
         verify = self._verify
         if verify is None:
             return
-        # ISS-001 实机修复：优先用战斗 HUD 的“M 自动驾驶开启”特征确认航向已生效。
-        # 实机中船速估计可能为 0、小地图 8s 位移不足 3px，仅靠位移/船速会误判失败并降级。
+        if observation.frame_timestamp is None or observation.frame_timestamp <= verify.started_at:
+            return
+        self._battle_view_after = None
+        # HUD 提示只能证明识别到激活文字，不能证明舰船已经移动。
         verify_feature = self.config.autopilot_verify_feature
         if verify_feature and observation.found(verify_feature):
-            verify.confirmed = True
-            verify.confirmed_by = verify_feature
+            self.activation_detected = True
         ship = observation.ship
         if ship is None or ship.source == "lost":
             return
@@ -470,12 +575,16 @@ class AutoPilotNavigator:
 
     def _confirm(self, now: float) -> None:
         verify = self._verify
+        self.move_confirmed = True
+        self.verify_failed = False
+        self.confirmed_at = now
         self._map_sequence = False
         self._map_open = False
         self._attempt = 0
         self._verify = None
         self._phase = _Phase.RECLICK
         self._next_click_at = now + self._sample_interval()
+        self._clear_failed_targets()
         detail = {
             "displacement_px": round(verify.displacement_px, 2) if verify else 0.0,
             "speed_mps": round(verify.speed_mps, 3) if verify else 0.0,
@@ -495,12 +604,36 @@ class AutoPilotNavigator:
         )
 
     def _verify_failed(self, now: float) -> None:
+        self.verify_failed = True
+        self.move_confirmed = False
         verify = self._verify
         self._attempt += 1
         attempt = self._attempt
         self._map_sequence = False
         self._map_open = False
         self._verify = None
+        if (
+            self._minimap_provider is not None
+            and self._target_override is None
+            and self._selected_target is not None
+        ):
+            failed_target = self._selected_target
+            self._failed_targets.append(failed_target)
+            if len(self._failed_targets) > _MAX_FAILED_TARGETS:
+                del self._failed_targets[:-_MAX_FAILED_TARGETS]
+            self._emit(
+                "autopilot_target_rejected",
+                now,
+                target=[round(failed_target[0], 4), round(failed_target[1], 4)],
+                reason="no_movement",
+                excluded=len(self._failed_targets),
+            )
+            self._logger.warning(
+                "autopilot 自动目标未产生移动，加入失败邻域（目标 %s，累计 %d 个）",
+                [round(failed_target[0], 4), round(failed_target[1], 4)],
+                len(self._failed_targets),
+            )
+            self._clear_selected_target()
         detail = {
             "attempt": attempt,
             "retry_limit": int(self.config.full_map_retry),
@@ -520,9 +653,17 @@ class AutoPilotNavigator:
             self._phase = _Phase.RECLICK
             self._next_click_at = now + _RETRY_GAP_S
             return
-        self._degrade_to_minimap(now, "verify_failed")
+        # 小地图直点已被实机证实无效。开局倒计时或选点未生效后仍走全屏地图，限频重试。
+        self._phase = _Phase.RECLICK
+        self._next_click_at = now + max(10.0, float(self.config.full_map_verify_s))
+        self._logger.warning("autopilot 尚未检测到移动，保留全屏地图路径，%.0fs 后重试", self._next_click_at - now)
 
     def _degrade_to_minimap(self, now: float, reason: str) -> None:
+        if self._target_override is not None:
+            self._logger.warning("用户目标无法通过全屏地图应用：%s，不向小地图补发点击", reason)
+            self._abort_sequence(now, reason)
+            self._next_click_at = now + 10
+            return
         if self._surface == "minimap":
             self._phase = _Phase.RECLICK
             self._next_click_at = now + _RETRY_GAP_S
@@ -570,9 +711,101 @@ class AutoPilotNavigator:
         return actions
 
     # ------------------------------------------------------------------
+    # 自动水面目标：每个 M/点击/M 周期开始时选择一次，周期内冻结
+    # ------------------------------------------------------------------
+    def _select_water_target(self, observation: Observation, now: float) -> bool:
+        provider = self._minimap_provider
+        if provider is None:
+            return True
+        raw_x, raw_y, from_marker = self._normalized_target()
+        desired = self._clamp_full_map_target(raw_x, raw_y)
+        try:
+            image = provider(observation)
+        except Exception as exc:
+            self._note_target_unavailable(now, "provider_error", error=type(exc).__name__)
+            return False
+        if image is None:
+            self._note_target_unavailable(now, "image_unavailable")
+            return False
+        if not self._is_valid_minimap_image(image):
+            self._note_target_unavailable(now, "invalid_image")
+            return False
+        chosen = choose_water_target(
+            image,
+            desired,
+            own_position=self._current_own_norm(observation),
+            excluded=tuple(self._failed_targets),
+        )
+        if chosen is None:
+            reason = "no_candidate_after_failures" if self._failed_targets else "no_water_candidate"
+            self._note_target_unavailable(now, reason, excluded=len(self._failed_targets))
+            return False
+        self._selected_target = chosen
+        self._selected_from_marker = from_marker
+        self._target_unavailable_reason = None
+        raw = [round(raw_x, 4), round(raw_y, 4)]
+        if math.dist(chosen, desired) > 1e-9:
+            adjusted = [round(chosen[0], 4), round(chosen[1], 4)]
+            self._emit(
+                "autopilot_target_adjusted",
+                now,
+                raw=raw,
+                adjusted=adjusted,
+                reason="sea_clearance",
+                excluded=len(self._failed_targets),
+            )
+            self._logger.info(
+                "autopilot 自动目标避开陆地/海岸：%s -> %s（离岸安全距离；已排除 %d 个失败邻域）",
+                raw,
+                adjusted,
+                len(self._failed_targets),
+            )
+        else:
+            self._logger.debug("autopilot 自动目标保留默认点 %s（水面安全）", raw)
+        return True
+
+    def _note_target_unavailable(self, now: float, reason: str, **detail) -> None:
+        """同一不可用状态只记录一次，避免每帧或每次重试重复刷屏。"""
+        if reason == self._target_unavailable_reason:
+            return
+        self._target_unavailable_reason = reason
+        self._emit("autopilot_target_unavailable", now, reason=reason, **detail)
+        self._logger.warning(
+            "autopilot 自动水面目标不可用（%s）：本周期不按 M、不点击，%.0fs 后重试",
+            reason,
+            _TARGET_UNAVAILABLE_RETRY_S,
+        )
+
+    @staticmethod
+    def _is_valid_minimap_image(image: object) -> bool:
+        return (
+            isinstance(image, np.ndarray)
+            and image.dtype == np.uint8
+            and image.ndim == 3
+            and image.shape[2] == 3
+            and image.shape[0] >= 32
+            and image.shape[1] >= 32
+        )
+
+    def _current_own_norm(self, observation: Observation) -> tuple[float, float] | None:
+        """当前观测的自身标记归一化位置；使用实际小地图内容尺寸，不用旧出生点。"""
+        ship = observation.ship
+        if ship is None or ship.source == "lost":
+            return None
+        content = self._minimap_content_rect(observation)
+        if content is None or content.w <= 0 or content.h <= 0:
+            return None
+        px, py = ship.minimap_px
+        x = min(max(float(px) / content.w, 0.0), 1.0)
+        y = min(max(float(py) / content.h, 0.0), 1.0)
+        return x, y
+
+    # ------------------------------------------------------------------
     # 目标与坐标换算
     # ------------------------------------------------------------------
     def _marker_ready(self, now: float) -> bool:
+        if self._target_override is not None:
+            return True
         if self.config.autopilot_target != "symmetric":
             return True
         if self._own_norm is not None:
@@ -599,7 +832,7 @@ class AutoPilotNavigator:
         self._logger.info("autopilot 记录我方出生点（小地图归一化）: (%.3f, %.3f)", x, y)
 
     def compute_target(self, observation: Observation) -> AutoPilotTarget | None:
-        """minimap 降级路径：目标归一化 → 小地图内容区像素 → 屏幕像素。"""
+        """minimap 旧兼容路径：目标归一化 → 小地图内容区像素 → 屏幕像素。"""
         content_rel = self._minimap_content_rect(observation)
         window = Rect(*observation.window_rect)
         if content_rel is None or window.w <= 0 or window.h <= 0:
@@ -627,8 +860,7 @@ class AutoPilotNavigator:
         if rect.w <= 8 or rect.h <= 8:
             return None
         target_x, target_y, from_marker = self._normalized_target()
-        target_x = min(max(target_x, _FULL_MAP_EDGE_SAFE_X), 1.0 - _FULL_MAP_EDGE_SAFE_X)
-        target_y = min(max(target_y, _FULL_MAP_EDGE_SAFE_Y), 1.0 - _FULL_MAP_EDGE_SAFE_Y)
+        target_x, target_y = self._clamp_full_map_target(target_x, target_y)
         local_x = rect.x + int(round(target_x * rect.w))
         local_y = rect.y + int(round(target_y * rect.h))
         return AutoPilotTarget(
@@ -639,7 +871,17 @@ class AutoPilotNavigator:
             surface="full_map",
         )
 
+    def _clamp_full_map_target(self, x: float, y: float) -> tuple[float, float]:
+        return (
+            min(max(x, _FULL_MAP_EDGE_SAFE_X), 1.0 - _FULL_MAP_EDGE_SAFE_X),
+            min(max(y, _FULL_MAP_EDGE_SAFE_Y), 1.0 - _FULL_MAP_EDGE_SAFE_Y),
+        )
+
     def _normalized_target(self) -> tuple[float, float, bool]:
+        if self._target_override is not None:
+            return self._target_override[0], self._target_override[1], False
+        if self._selected_target is not None:
+            return self._selected_target[0], self._selected_target[1], self._selected_from_marker
         offset_x, offset_y = self.config.autopilot_offset
         if self.config.autopilot_target == "center":
             return 0.5 + offset_x, 0.5 + offset_y, False

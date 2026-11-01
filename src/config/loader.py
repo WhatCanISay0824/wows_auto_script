@@ -53,6 +53,7 @@ from .models import (
     MapPack,
     MinimapConfig,
     NavigationConfig,
+    OverloadConfig,
     PathsConfig,
     PerceptionConfig,
     Route,
@@ -117,6 +118,11 @@ FORBIDDEN_ACCOUNT_KEY_PARTS: tuple[str, ...] = (
     "验证码",
     "密码",
     "令牌",
+)
+# 过载保护配置（config.yaml overload 段）：未知键按 error 处理，避免拼写错误被静默忽略
+OVERLOAD_KEYS: frozenset[str] = frozenset(item.name for item in fields(OverloadConfig))
+OVERLOAD_INT_FIELDS: frozenset[str] = frozenset(
+    {"starvation_pause_events", "starvation_stop_events", "auto_resume_max"}
 )
 
 IssueSink = list[ValidationIssue]
@@ -935,6 +941,37 @@ def load_global(
         ),
     )
 
+    # --- 过载保护（config.yaml overload 段；未知键 error） -------------------
+    overload_raw = section("overload")
+    ol_loc = f"{label}: overload"
+    unknown_overload = sorted(set(overload_raw) - OVERLOAD_KEYS)
+    for key in unknown_overload:
+        _error(
+            collected,
+            "unknown_key",
+            f"{ol_loc}.{key}",
+            f"overload 段存在未知配置键 {key!r}（允许: {', '.join(sorted(OVERLOAD_KEYS))}）",
+        )
+    overload_values: dict[str, Any] = {}
+    for item in fields(OverloadConfig):
+        if item.name == "mode":
+            overload_values["mode"] = _str_value(
+                overload_raw, "mode", defaults.overload.mode, collected, ol_loc
+            )
+        elif item.name in OVERLOAD_INT_FIELDS:
+            overload_values[item.name] = _int_value(
+                overload_raw, item.name, int(getattr(defaults.overload, item.name)), collected, ol_loc
+            )
+        else:
+            overload_values[item.name] = _float_value(
+                overload_raw,
+                item.name,
+                float(getattr(defaults.overload, item.name)),
+                collected,
+                ol_loc,
+            )
+    overload = OverloadConfig(**overload_values)
+
     session_raw = section("session")
     sess_loc = f"{label}: session"
     allowed_hours_raw = session_raw.get("allowed_hours")
@@ -1214,6 +1251,7 @@ def load_global(
         ship=ship_config,
         safety=safety,
         session=session,
+        overload=overload,
         timeouts=timeouts,
         input=input_config,
         logging=logging_config,

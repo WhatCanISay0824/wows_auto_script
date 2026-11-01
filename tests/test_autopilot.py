@@ -99,6 +99,7 @@ def make_observation(
     window: Rect = WINDOW,
     window_missing: bool = False,
     features: dict[str, MatchResult] | None = None,
+    timestamp: float = 0.0,
 ) -> Observation:
     content = MINIMAP_NORM.to_pixels(window.w, window.h)
     ship = None
@@ -112,7 +113,8 @@ def make_observation(
             source="marker",
         )
     return Observation(
-        timestamp=0.0,
+        timestamp=timestamp,
+        frame_timestamp=timestamp,
         window_rect=window.to_tuple(),
         ship=ship,
         window_missing=window_missing,
@@ -160,6 +162,50 @@ def key_actions(actions: list) -> list[tuple[str, str | None]]:
     return [(action.kind.value, action.key) for action in actions]
 
 
+def test_target_override_survives_resume_and_reset_restores_default():
+    nav = make_nav(make_config(), keymap=make_keymap())
+    nav.start(0)
+    nav.replace_target((0.3, 0.7), 1)
+    observation = make_observation((0.5, 0.8))
+    assert nav.compute_full_map_target(observation).normalized == (0.3, 0.7)
+    nav.stop()
+    nav.start(2)
+    assert nav.compute_full_map_target(observation).normalized == (0.3, 0.7)
+    nav.reset()
+    nav.start(3)
+    nav.tick(observation, 3)
+    assert nav.compute_full_map_target(observation).normalized == pytest.approx((0.5, 0.2))
+
+
+def test_cached_frame_after_map_close_cannot_confirm_movement():
+    nav = make_nav(make_config(), keymap=make_keymap())
+    nav.start(0)
+    obs = make_observation((0.5, 0.8))
+    for moment in (0, 0.1, 1.2, 1.3, 1.8):
+        nav.tick(obs, moment)
+    cached = make_observation((0.5, 0.8), dx=8, speed=6, timestamp=1.0)
+    nav.tick(replace(cached, timestamp=2.2), 2.2)
+    assert not nav.move_confirmed
+    nav.tick(replace(cached, timestamp=2.4, frame_timestamp=2.4), 2.4)
+    assert nav.move_confirmed
+
+
+@pytest.mark.parametrize("reset", [False, True])
+def test_resume_without_marker_does_not_reuse_old_movement_reference(reset):
+    nav = make_nav(make_config(target="center"), keymap=make_keymap())
+    nav.start(0)
+    nav.tick(make_observation((0.5, 0.8)), 0)
+    nav.stop()
+    if reset:
+        nav.reset()
+    nav.start(100)
+    for moment in (100, 100.1, 101.2, 101.3, 101.8):
+        nav.tick(make_observation(None, timestamp=moment), moment)
+    nav.tick(make_observation((0.5, 0.8), dx=50, timestamp=102), 102)
+    assert nav.phase == "verify"
+    assert not nav.move_confirmed
+
+
 # ---------------------------------------------------------------------------
 # full_map 主路径
 # ---------------------------------------------------------------------------
@@ -201,9 +247,15 @@ def test_full_map_sequence_opens_clicks_closes_and_confirms() -> None:
     all_actions.extend(actions)
     assert key_actions(actions) == [("key_down", "m"), ("key_up", "m")]
     assert nav.phase == "verify" and nav.blocks_behavior is True
+    assert nav.blocks_minimap is True
+
+    # 关图后的新战斗帧可显示地图并执行行为，移动验证继续独立进行。
+    nav.tick(make_observation((0.5, 0.8), timestamp=1.9), 1.9)
+    assert nav.phase == "verify"
+    assert not nav.blocks_behavior and not nav.blocks_minimap
 
     # 船速超过阈值 -> 确认成功，解除行为阻塞
-    assert nav.tick(make_observation((0.5, 0.8), speed=6.0), 2.0) == []
+    assert nav.tick(make_observation((0.5, 0.8), speed=6.0, timestamp=2.0), 2.0) == []
     assert nav.phase == "reclick"
     assert nav.blocks_behavior is False
     target = nav.last_target
@@ -263,14 +315,28 @@ def test_full_map_confirms_by_marker_displacement() -> None:
     assert nav.tick(obs, 1.8) != []
     assert nav.phase == "verify"
     # 船速仍为 0，但自身标记位移 6px >= 3px -> 确认成功
-    moved = make_observation((0.5, 0.8), dx=6.0)
+    moved = make_observation((0.5, 0.8), dx=6.0, timestamp=2.5)
     assert nav.tick(moved, 2.5) == []
     assert nav.phase == "reclick"
     assert nav.blocks_behavior is False
 
 
-def test_full_map_confirms_by_autopilot_indicator_feature() -> None:
-    """ISS-001 实机回归：M 点选后“M 自动驾驶开启”出现即确认，不再误判失败/降级。"""
+# 异常关图后也要在新帧到位时解除小地图隔离。
+def test_aborted_map_close_unblocks_minimap_on_fresh_frame():
+    nav = make_nav(make_config(), keymap=make_keymap())
+    nav.start(0)
+    obs = make_observation((0.5, 0.8))
+    nav.tick(obs, 0)
+    nav.tick(obs, 0.1)
+    nav.tick(obs, 1.2)
+    nav.tick(make_observation((0.5, 0.8), window=Rect(0, 0, 0, 0)), 1.3)
+    assert nav.blocks_minimap
+    nav.tick(make_observation((0.5, 0.8), timestamp=1.4), 1.4)
+    assert not nav.blocks_minimap
+
+
+def test_indicator_without_movement_does_not_confirm_cruise() -> None:
+    """静止 HUD 提示不能证明舰船已经开始巡航。"""
     events = _Events()
     nav = make_nav(make_config(), keymap=make_keymap(), events=events)
     nav.start(0.0)
@@ -289,13 +355,12 @@ def test_full_map_confirms_by_autopilot_indicator_feature() -> None:
             center=(400, 1270),
         )
     }
-    # 船速 0、位移 0，仅凭 HUD 特征也应确认成功
-    confirm_obs = make_observation((0.5, 0.8), features=indicator)
+    confirm_obs = make_observation((0.5, 0.8), features=indicator, timestamp=2.2)
     assert nav.tick(confirm_obs, 2.2) == []
-    assert nav.phase == "reclick"
-    confirmed = events.last("autopilot_confirmed")
-    assert confirmed["confirmed_by"] == "autopilot_indicator"
-    assert nav.blocks_behavior is False
+    assert nav.phase == "verify"
+    assert nav.activation_detected
+    assert not nav.move_confirmed
+    assert "autopilot_confirmed" not in events.names()
 
 
 def test_full_map_verify_feature_can_be_disabled() -> None:
@@ -325,7 +390,7 @@ def test_periodic_reclick_opens_map_again_after_confirmed() -> None:
     nav.tick(obs, 1.2)
     nav.tick(obs, 1.3)
     nav.tick(obs, 1.8)
-    nav.tick(make_observation((0.5, 0.8), speed=5.0), 2.0)
+    nav.tick(make_observation((0.5, 0.8), speed=5.0, timestamp=2.0), 2.0)
     assert nav.phase == "reclick"
     assert abs(nav.next_click_at - 32.0) < 1e-6
     assert nav.tick(obs, 30.0) == []  # 未到重发时间
@@ -360,7 +425,7 @@ def test_full_map_waits_marker_then_falls_back_to_center() -> None:
 # ---------------------------------------------------------------------------
 # 失败重试与降级
 # ---------------------------------------------------------------------------
-def test_full_map_verify_failure_retries_then_degrades_to_minimap() -> None:
+def test_full_map_verify_failure_keeps_full_map_and_limits_retries() -> None:
     events = _Events()
     nav = make_nav(make_config(retry=1), keymap=make_keymap(), events=events)
     nav.start(0.0)
@@ -387,21 +452,20 @@ def test_full_map_verify_failure_retries_then_degrades_to_minimap() -> None:
     assert events.last("autopilot_verify_failed")["attempt"] == 1
 
     run_failing_cycle(9.7 + 1.0)  # 重试：下一次周期从 next_click_at=10.7 开始
-    assert nav.surface == "minimap"
-    assert nav.degraded is True
+    assert nav.surface == "full_map"
+    assert nav.degraded is False
     assert nav.phase == "reclick"
     assert events.names().count("autopilot_verify_failed") == 2
-    assert events.names().count("autopilot_degrade") == 1
-    assert events.last("autopilot_degrade")["reason"] == "verify_failed"
+    assert "autopilot_degrade" not in events.names()
 
-    # 降级后周期重发走旧“直接点小地图”路径：不再按 M
-    retry_at = 20.4 + 1.0
-    assert nav.tick(obs, retry_at) == []  # begin cycle -> click 相位
-    assert nav.phase == "click"
+    retry_at = nav.next_click_at
+    assert retry_at >= 30.4
+    assert nav.tick(obs, retry_at - 0.1) == []
+    assert nav.phase == "reclick"
+    assert nav.tick(obs, retry_at) == []
+    assert nav.phase == "open_map"
     actions = nav.tick(obs, retry_at + 0.1)
-    assert len(actions) == 1
-    assert nav.last_target is not None and nav.last_target.surface == "minimap"
-    assert nav.tick(obs, retry_at + 0.2) == []  # 降级后只点击、无 M 按键
+    assert key_actions(actions) == [("key_down", "m"), ("key_up", "m")]
 
 
 def test_full_map_success_resets_retry_counter() -> None:
@@ -422,7 +486,7 @@ def test_full_map_success_resets_retry_counter() -> None:
     nav.tick(obs, 12.2)
     nav.tick(obs, 12.3)
     nav.tick(obs, 12.8)
-    nav.tick(make_observation((0.5, 0.8), speed=5.0), 13.0)
+    nav.tick(make_observation((0.5, 0.8), speed=5.0, timestamp=13.0), 13.0)
     assert nav.phase == "reclick"
     assert nav.surface == "full_map"
     assert nav.degraded is False
@@ -617,3 +681,23 @@ def test_missing_minimap_config_returns_no_blind_click() -> None:
     assert nav.tick(obs, 0.1) == []
     assert nav.clicks == 0
     assert "autopilot_click_skipped" in events.names()
+
+
+def test_user_target_always_uses_m_map_even_if_default_surface_is_minimap():
+    nav = make_nav(make_config(surface="minimap"), keymap=make_keymap())
+    nav.start(0)
+    nav.replace_target((0.3, 0.6), 1)
+    nav.stop()
+    nav.start(2)
+    obs = make_observation((0.5, 0.8), timestamp=2)
+    nav.tick(obs, 2)
+    assert key_actions(nav.tick(obs, 2.1)) == [("key_down", "m"), ("key_up", "m")]
+    assert nav.surface == "full_map"
+
+
+def test_user_target_without_full_map_calibration_is_rejected():
+    nav = make_nav(make_config(full_map_rect=None), keymap=make_keymap())
+    nav.start(0)
+    with pytest.raises(ValueError, match="全屏地图"):
+        nav.replace_target((0.3, 0.6), 1)
+    assert nav.target_override is None

@@ -58,6 +58,29 @@ class RecordingBackend:
         self.release_processed.set()
 
 
+def test_foreground_is_checked_again_after_wait_before_sending():
+    """发送间隔内切走窗口时，不把剩余动作发送到新窗口。"""
+    backend = RecordingBackend()
+    foreground = [True]
+    clock = FakeClock()
+
+    class FocusChangingSleeper:
+        def sleep(self, seconds):
+            clock.advance(seconds)
+            foreground[0] = False
+
+    executor = InputExecutor(backend, InputConfig(min_action_interval_ms=100), clock=clock,
+                             sleeper=FocusChangingSleeper(), can_execute=lambda: foreground[0])
+    try:
+        executor.submit([Action.key_down("m"), Action.key_up("m"), Action.click_abs(200, 200)])
+        wait_until(lambda: backend.release_count > 0)
+        assert len(backend.actions) == 1
+        assert not executor.gate_open
+        assert all(action.kind.value != "click_abs" for action in backend.actions)
+    finally:
+        executor.stop(drain=False)
+
+
 @pytest.fixture
 def executors():
     """创建可自动回收的 InputExecutor 工厂。"""

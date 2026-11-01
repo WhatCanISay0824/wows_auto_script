@@ -21,10 +21,12 @@ window:
 
 keys_file: keys.yaml
 
-# 小地图标定（实测 211346 战斗截图）：小地图位于右下角，内容区为深色网格面板
-# （不含上方 1~10 数字栏和左侧 A~J 字母栏的外侧？字母在面板内），右下贴边。
+# 小地图标定（2026-11-01 诊断截图，2560×1600）：小地图位于右下角，profile 矩形外框约 376×376，
+# 按 border_px=2 四边内缩后实际内容区 372×372；右下贴边。旧矩形外框约 514×507，误含左上方
+# 战斗画面；本轮按当前游戏截图校正。
+# 注意：该标定对应当前游戏的小地图尺寸；用户在游戏内调整小地图大小后仍需重新标定。
 minimap:
-  rect: [0.798, 0.677, 0.999, 0.994]
+  rect: [0.853125, 0.765, 1.0, 1.0]
   border_px: 2
   frame_feature: null                    # 小地图边框模板不稳定，暂不使用
   marker_template: marker/marker.png     # 自身舰船白色箭头（已从实机截图提取）
@@ -126,7 +128,7 @@ features:
   autopilot_indicator:
     template: features/autopilot_indicator.png     # 战斗 HUD 左侧“M 自动驾驶开启”（ISS-001 航向验证，2026-10-31 实机帧提取）
     region: [0.10, 0.74, 0.32, 0.85]
-    threshold: 0.72   # 2026-10-31 下调：战斗中提示可能被烟雾/遮挡，0.82 偶发漏检导致误降级
+    threshold: 0.85   # 未开启时的灰色提示实测匹配 0.788，不能作为激活证据
   hp_bar_present:
     template: features/hp_bar_present.png          # 左下“VII 列宁格勒”血条文字（静态）
     region: [0.0, 0.72, 0.17, 0.80]

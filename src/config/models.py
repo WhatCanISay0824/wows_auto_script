@@ -493,11 +493,92 @@ class SafetyConfig:
 
 @dataclass(frozen=True, slots=True)
 class SessionConfig:
-    between_battle_s: tuple[float, float] = (15.0, 60.0)
+    between_battle_s: tuple[float, float] = (3.0, 10.0)
     daily_battle_cap: int = 30
     allowed_hours: tuple[str, str] | None = None
     max_consecutive_start_failures: int = 2
     recovery_max_per_10min: int = 3
+
+
+@dataclass(frozen=True, slots=True)
+class OverloadConfig:
+    """性能采样与过载保护（GUI 设计 §6 / 2026-10-31 确认阈值）。
+
+    只描述参数，不读系统指标、不做判定；采样、状态机与事件分别位于
+    ``src.common.sysmetrics``、``src.execution.overload_policy``、``src.execution.overload``。
+
+    默认 ``mode="monitor"``：只采样并在界面记录“本应暂停/停止”，不实际暂停或停止。
+    所有 MB 阈值为“余量下限”或“占用上限”，实际生效值 = max(下限, 比例 × 总量/上限)：
+    这样 16GB/32GB/64GB 机器都按同一相对口径提前预警。阈值全部来自配置，不写死在代码里。
+    """
+
+    #: off=关闭；monitor=只记录；pause_stop=先暂停、必要时停止；stop=达到条件直接停止
+    mode: str = "monitor"
+    #: 采样频率（1 Hz；窗口覆盖率按该频率估算）
+    sample_hz: float = 1.0
+    #: 判定持续窗口（秒）
+    window_warn_s: float = 60.0
+    window_long_s: float = 120.0
+    window_stop_after_pause_s: float = 180.0
+    window_resume_s: float = 60.0
+    #: 窗口有效覆盖率下限（样本缺失/首拍/越界丢弃后低于该值不判定）
+    min_coverage: float = 0.9
+    # --- W 告警（只记录，不动作） --------------------------------------------
+    cpu_warn_pct: float = 90.0
+    physical_warn_floor_mb: float = 2500.0
+    physical_warn_limit_ratio: float = 0.08
+    commit_warn_floor_mb: float = 6000.0
+    commit_warn_limit_ratio: float = 0.12
+    script_private_warn_floor_mb: float = 1024.0
+    script_private_baseline_ratio: float = 2.0
+    #: 启动预热窗口（秒）：期间的脚本内存峰值作为基线，2×基线作为告警阈值
+    script_warmup_s: float = 120.0
+    # --- T1 暂停（可恢复，仅“脚本控制中”生效） ------------------------------
+    commit_pause_floor_mb: float = 2000.0
+    commit_pause_limit_ratio: float = 0.05
+    #: 60s 窗口内低于暂停阈值的占比下限
+    commit_pause_occupancy: float = 0.8
+    # --- T2 停止（终态） ----------------------------------------------------
+    commit_stop_floor_mb: float = 1200.0
+    commit_stop_limit_ratio: float = 0.025
+    commit_stop_window_s: float = 30.0
+    commit_stop_occupancy: float = 0.9
+    #: 快速通道：Commit 余量极低时连续持续该秒数即停止（不等 30s 慢通道）
+    commit_fast_stop_floor_mb: float = 400.0
+    commit_fast_stop_limit_ratio: float = 0.01
+    commit_fast_stop_sustained_s: float = 10.0
+    # --- 清醒采样迟到（系统卡顿/线程饿死） ----------------------------------
+    starvation_lateness_s: float = 2.5
+    starvation_pause_events: int = 3
+    starvation_stop_events: int = 3
+    starvation_window_s: float = 120.0
+    starvation_stop_window_s: float = 180.0
+    # --- 睡眠/挂起与时间跳变 ------------------------------------------------
+    #: 睡眠识别：``GTC64-QUT`` 偏移增量 ≥ max(该下限, 比例×当拍迟到) 时视为睡眠覆盖迟到
+    sleep_detect_s: float = 1.0
+    sleep_cover_ratio: float = 0.5
+    sleep_grace_s: float = 120.0
+    #: 墙上时间与单调时间差超过该值视为系统时间跳变（清窗）
+    clock_jump_s: float = 2.0
+    # --- 告警滞回与限频 -----------------------------------------------------
+    #: 退出告警需要恢复幅度：上界指标 < 阈值×该比例；下界指标 > 阈值/该比例
+    warn_clear_ratio: float = 0.8
+    warn_clear_s: float = 60.0
+    warn_repeat_interval_s: float = 300.0
+    # --- 自动恢复 -----------------------------------------------------------
+    pause_min_s: float = 60.0
+    #: 恢复所需 Commit 余量 > 暂停阈值 × 该比例
+    resume_commit_ratio: float = 1.5
+    resume_occupancy: float = 0.9
+    resume_quiet_s: float = 120.0
+    #: 每个会话最多自动恢复次数（超过后不再自动恢复，交给人工）
+    auto_resume_max: int = 2
+    #: 该窗口（秒）内反复暂停一次即停止自动恢复
+    auto_resume_repeat_window_s: float = 600.0
+
+
+#: 过载保护合法模式（与 src/execution/overload_policy.py 的 OverloadMode 一致）
+OVERLOAD_MODES: frozenset[str] = frozenset({"off", "monitor", "pause_stop", "stop"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -644,6 +725,7 @@ class GlobalConfig:
     ship: ShipConfig = field(default_factory=ShipConfig)
     safety: SafetyConfig = field(default_factory=SafetyConfig)
     session: SessionConfig = field(default_factory=SessionConfig)
+    overload: OverloadConfig = field(default_factory=OverloadConfig)
     timeouts: TimeoutsConfig = field(default_factory=TimeoutsConfig)
     input: InputConfig = field(default_factory=InputConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)

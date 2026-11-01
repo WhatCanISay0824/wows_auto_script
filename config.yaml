@@ -39,9 +39,9 @@ map:
 
 navigation:
   # ===== 导航模式（用户简化需求 + ISS-001 修复口径）=====
-  # autopilot：按 M 打开全屏战术地图，点选“我方出生点关于地图中心的对称区域”后交给
-  #            游戏自动驾驶，之后不碰 WASD，也不识别地图/航线；只需要客户端小地图标定、
-  #            自身标记模板与下面的全屏地图内容区矩形。
+  # autopilot：默认目标基于当前小地图筛选安全水面（避开岛屿/海岸），再按 M 打开全屏战术
+  #            地图点选并交给游戏自动驾驶；不碰 WASD，也不识别地图/航线。水面图像不可用
+  #            或没有安全候选时不按 M、不点击，等待后重试。
   # waypoints：传统模式，需要地图包、地图识别、出生点与航线标定（保留可选）。
   mode: autopilot
   autopilot_target: symmetric  # center=地图中心；symmetric=对称敌区且横坐标固定到中线
@@ -49,7 +49,8 @@ navigation:
   autopilot_overshoot: 0.6     # waypoints 旧模式预留，autopilot 不使用
   autopilot_offset: [0.0, 0.0] # 目标点相对归一化坐标微调（[dx, dy]，0 为不偏移）
   # 点击面（ISS-001，实现补充 10.1）：实机确认“先按 M 开全屏地图再点选”才会设置航向，
-  # 直接点战斗画面小地图无效。full_map=autopilot 默认；minimap=旧交互，仅失败降级/兼容。
+  # 直接点战斗画面小地图无效。full_map=autopilot 默认；minimap 仅为旧兼容路径，
+  # 自动周期仍先做水面筛选；验证失败保留全屏地图路径并按间隔限频重试，不再降级到小地图。
   surface: full_map
   arrival_m: 400               # waypoints 模式到达判定距离（世界米，仅作上限）
   overshoot_m: 800             # waypoints 模式越点判定距离
@@ -84,12 +85,12 @@ navigation:
   full_map_open_wait_s: 1.0      # 按 M 后等待地图界面就绪（固定时序假设，非模板判断）
   full_map_close_wait_s: 0.4     # 点击生效后等待再按 M 关图
   full_map_verify_s: 8.0         # 关图后验证航向的观察窗口（自身标记位移或船速）
-  full_map_retry: 2              # 验证失败后的全屏地图重试次数（不含首次）
+  full_map_retry: 2              # 验证失败后的全屏地图重试次数（不含首次）；之后保留全屏图限频重试
   autopilot_verify_min_move_px: 2.0   # 验证成功的最小自身标记位移（小地图内容区像素）
   autopilot_verify_min_speed: 0.3     # 验证成功的最小船速（m/s）
-  # 2026-10-31 实机：M 地图点选后自动驾驶已开启（船 19.3kts），但船速估计为 0、
-  # 小地图 8s 位移不足 3px，导致误判失败并降级；改为优先用战斗 HUD 特征确认航向。
-  autopilot_verify_feature: autopilot_indicator  # 航向验证特征（null=只靠位移/船速）
+  # autopilot_verify_feature 仅表示识别到 HUD 激活提示，是辅助激活证据；
+  # 移动仍必须由关图后的新帧位移或船速满足阈值确认（该特征不能单独确认航向）。
+  autopilot_verify_feature: autopilot_indicator  # 辅助激活证据（null=只靠新帧位移/船速）
 
 
 behavior:
@@ -184,8 +185,67 @@ safety:
   restart_wait_s: 30                   # 自动重启前等待
   restart_max_attempts: 2              # 自动重启最大尝试次数
 
+overload:
+  # ===== 性能采样与过载保护（2026-10-31 确认阈值；无第三方依赖）=====
+  # 采样：ctypes 调 GetSystemTimes / GetPerformanceInfo(psapi) / GlobalMemoryStatusEx /
+  #       GetProcessMemoryInfo / GetProcessTimes / GetTickCount64 / QueryUnbiasedInterruptTime。
+  # 所有 MB 阈值语义 = max(下限, 比例 × 总量/上限)，16G/32G/64G 机器按同一相对口径预警。
+  # 判定窗口 1 Hz 采样、30/60/120s 滚动；有效覆盖率 <90% 不判定（样本缺失/首拍/越界丢弃）；
+  # 睡眠/挂起用 GetTickCount64−QueryUnbiasedInterruptTime 识别：清窗+宽限且不计迟到。
+  # 安全口径：CPU / 物理可用 / 心跳 / 帧龄 / 脚本内存只告警，绝不单独触发暂停或停止。
+  mode: monitor                 # off=关闭；monitor=只记录本应暂停/停止；pause_stop=先暂停、必要时停止；stop=直接停止
+  sample_hz: 1                  # 采样频率（1 Hz）
+  window_warn_s: 60             # W/T1 判定持续窗口（秒）
+  window_long_s: 120            # 长观察窗口（迟到事件统计）
+  window_stop_after_pause_s: 180  # 暂停后继续观察迟到事件的窗口
+  window_resume_s: 60           # 恢复条件观察窗口
+  min_coverage: 0.9             # 窗口有效样本覆盖率下限
+  # --- W 告警（只记录，不动作）---
+  cpu_warn_pct: 90              # 全机 CPU ≥ 该值持续 60s 告警
+  physical_warn_floor_mb: 2500  # 物理可用内存下限（MB）
+  physical_warn_limit_ratio: 0.08  # 物理可用内存 < 8% 总内存告警
+  commit_warn_floor_mb: 6000    # Commit 余量下限（MB）
+  commit_warn_limit_ratio: 0.12  # Commit 余量 < 12% Commit 上限告警
+  script_private_warn_floor_mb: 1024  # 脚本进程私有内存下限（MB）
+  script_private_baseline_ratio: 2.0   # 超过 2× 预热基线也告警
+  script_warmup_s: 120          # 启动预热窗口（秒），期间的进程内存峰值作为基线
+  # --- T1 暂停（可恢复，仅“脚本控制中”生效）---
+  commit_pause_floor_mb: 2000   # Commit 余量暂停下限（MB）
+  commit_pause_limit_ratio: 0.05   # Commit 余量 < 5% 上限
+  commit_pause_occupancy: 0.8   # 60s 窗口内低于暂停阈值的占比 ≥80%
+  # --- T2 停止（终态）---
+  commit_stop_floor_mb: 1200    # 已暂停后 Commit 余量停止下限（MB）
+  commit_stop_limit_ratio: 0.025   # 已暂停后 Commit 余量 < 2.5% 上限
+  commit_stop_window_s: 30      # 已暂停后停止判定窗口（秒）
+  commit_stop_occupancy: 0.9    # 30s 窗口内低于停止阈值的占比 ≥90%
+  commit_fast_stop_floor_mb: 400   # 快速停止 Commit 余量下限（MB）
+  commit_fast_stop_limit_ratio: 0.01  # 快速停止 Commit 余量 < 1% 上限
+  commit_fast_stop_sustained_s: 10    # 快速通道连续持续秒数
+  # --- 清醒采样迟到（系统卡顿/看门狗线程饿死）---
+  starvation_lateness_s: 2.5    # 清醒采样迟到阈值（实际间隔超出 1s 的部分）
+  starvation_pause_events: 3    # 120s 内迟到事件 ≥3 次 → 暂停
+  starvation_stop_events: 3     # 暂停后 180s 内迟到事件仍 ≥3 次 → 停止
+  starvation_window_s: 120      # 迟到事件统计窗口
+  starvation_stop_window_s: 180  # 暂停后迟到事件统计窗口
+  # --- 睡眠/挂起与系统时间跳变 ---
+  sleep_detect_s: 1.0           # 睡眠覆盖最小秒数（GTC64-QUT 偏移增量 ≥ 该值与迟到比例中的较大者）
+  sleep_cover_ratio: 0.5        # 睡眠覆盖判定：偏移增量 ≥ 0.5×当拍迟到也视为睡眠
+  sleep_grace_s: 120            # 睡眠/唤醒后宽限（秒），期间的迟到不计数、不判定暂停/恢复
+  clock_jump_s: 2               # 墙上时间与单调时间差 > 该值视为系统时间调整（清窗）
+  # --- 告警滞回与限频 ---
+  warn_clear_ratio: 0.8         # 退出告警需恢复幅度（上界 <阈值×0.8；下界 >阈值/0.8）
+  warn_clear_s: 60              # 满足退出条件需持续的秒数
+  warn_repeat_interval_s: 300   # 同类告警最多每 5 分钟一条
+  # --- 自动恢复 ---
+  pause_min_s: 60               # 暂停至少持续该秒数才允许自动恢复
+  resume_commit_ratio: 1.5      # Commit 余量 >1.5×暂停阈值才允许恢复
+  resume_occupancy: 0.9         # 恢复条件 60s 窗口占比 ≥90%
+  resume_quiet_s: 120           # 恢复前要求无迟到事件的窗口
+  auto_resume_max: 2            # 每个会话最多自动恢复次数（超过后交给人工）
+  auto_resume_repeat_window_s: 600  # 10 分钟内反复暂停则停止自动恢复
+
 session:
-  between_battle_s: [15, 60]           # 两场之间的随机等待
+  between_battle_s: [3, 10]            # 回港后两场之间随机等待 3～10 秒
   daily_battle_cap: 30                 # 每日场次上限（跨进程累计）
   allowed_hours: null                  # 允许运行的时段，例如 ["08:00", "23:00"]；null 表示不限
   max_consecutive_start_failures: 2    # 连续开局失败多少次后暂停

@@ -137,6 +137,23 @@ def test_quiet_period_suppresses_actions() -> None:
     assert scheduler.next_camera_at >= 10.0
 
 
+def test_resume_preserves_consumables_and_emits_actions_without_opening_quiet_period():
+    config = make_config(camera_interval_s=(FAR, FAR), attack_interval_s=(1, 1),
+                         consumable_max_per_battle=1, fire_burst=(1, 1))
+    scheduler, events = collect_scheduler(config, make_profile(consumable_ratio=1.0))
+    scheduler.tick(make_observation(11), 11)
+    assert scheduler.consumables_used == 1
+    profile = scheduler.profile
+    scheduler.stop()
+    scheduler.resume(20)
+    assert scheduler.profile is profile
+    assert scheduler.consumables_used == 1
+    actions = scheduler.tick(make_observation(21), 21)
+    assert any(action.kind is ActionKind.CLICK_ABS for action in actions)
+    assert "behavior_resume" in event_names(events)
+    assert scheduler.consumables_used == 1
+
+
 def test_camera_interval_within_configured_bounds() -> None:
     config = make_config(camera_interval_s=(3.0, 15.0), attack_interval_s=(FAR, FAR))
     scheduler, events = collect_scheduler(config, make_profile(seed=9))

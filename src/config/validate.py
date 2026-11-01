@@ -37,6 +37,7 @@ from .loader import (
     relative_label,
 )
 from .models import (
+    OVERLOAD_MODES,
     AccountsConfig,
     AppConfig,
     BehaviorConfig,
@@ -46,6 +47,7 @@ from .models import (
     KeyMap,
     MapPack,
     NavigationConfig,
+    OverloadConfig,
     PerceptionConfig,
     ShipProfile,
     StepDef,
@@ -338,6 +340,9 @@ def validate_global_config(config: GlobalConfig) -> list[ValidationIssue]:
         issues, safety.restart_max_attempts, _loc(location, "safety.restart_max_attempts"), "重启次数"
     )
 
+    # --- overload（性能采样与过载保护） ---
+    _validate_overload(issues, config.overload, location)
+
     # --- session ---
     session = config.session
     _check_pair(issues, session.between_battle_s, _loc(location, "session.between_battle_s"), "场间等待")
@@ -421,6 +426,132 @@ def validate_global_config(config: GlobalConfig) -> list[ValidationIssue]:
     # --- perception ---
     _validate_perception(issues, config.perception, location)
     return issues
+
+
+def _validate_overload(issues: list[ValidationIssue], overload: OverloadConfig, location: str) -> None:
+    """过载保护参数范围与单调性校验（阈值全部来自配置，禁止把停止阈值配得比告警还宽）。"""
+
+    def loc(name: str) -> str:
+        return _loc(location, f"overload.{name}")
+
+    if overload.mode not in OVERLOAD_MODES:
+        _error(
+            issues,
+            "enum",
+            loc("mode"),
+            f"未知过载保护模式 {overload.mode!r}（允许 {sorted(OVERLOAD_MODES)}）",
+        )
+    if not 0.2 <= overload.sample_hz <= 10.0:
+        _error(issues, "range", loc("sample_hz"), f"采样频率应在 0.2～10 Hz，当前 {overload.sample_hz}")
+    if not 0.0 < overload.cpu_warn_pct <= 100.0:
+        _error(issues, "range", loc("cpu_warn_pct"), f"CPU 告警阈值应在 (0, 100]，当前 {overload.cpu_warn_pct}")
+
+    for name in (
+        "physical_warn_floor_mb",
+        "commit_warn_floor_mb",
+        "commit_pause_floor_mb",
+        "commit_stop_floor_mb",
+        "commit_fast_stop_floor_mb",
+        "script_private_warn_floor_mb",
+        "window_warn_s",
+        "window_long_s",
+        "window_stop_after_pause_s",
+        "window_resume_s",
+        "commit_stop_window_s",
+        "commit_fast_stop_sustained_s",
+        "starvation_lateness_s",
+        "sleep_detect_s",
+        "sleep_grace_s",
+        "clock_jump_s",
+        "warn_clear_s",
+        "warn_repeat_interval_s",
+        "pause_min_s",
+        "script_warmup_s",
+        "auto_resume_repeat_window_s",
+    ):
+        _check_positive(issues, float(getattr(overload, name)), loc(name), name)
+
+    for name in (
+        "physical_warn_limit_ratio",
+        "commit_warn_limit_ratio",
+        "commit_pause_limit_ratio",
+        "commit_stop_limit_ratio",
+        "commit_fast_stop_limit_ratio",
+        "min_coverage",
+        "commit_pause_occupancy",
+        "commit_stop_occupancy",
+        "warn_clear_ratio",
+        "resume_occupancy",
+        "sleep_cover_ratio",
+    ):
+        _check_probability(issues, float(getattr(overload, name)), loc(name), name)
+
+    if overload.script_private_baseline_ratio <= 1.0:
+        _error(
+            issues,
+            "range",
+            loc("script_private_baseline_ratio"),
+            f"脚本内存基线倍数必须大于 1，当前 {overload.script_private_baseline_ratio}",
+        )
+    if overload.resume_commit_ratio <= 1.0:
+        _error(
+            issues,
+            "range",
+            loc("resume_commit_ratio"),
+            f"恢复 Commit 倍数必须大于 1（相对暂停阈值），当前 {overload.resume_commit_ratio}",
+        )
+    if overload.starvation_pause_events < 1:
+        _error(issues, "range", loc("starvation_pause_events"), "迟到暂停事件数必须 ≥1")
+    if overload.starvation_stop_events < 1:
+        _error(issues, "range", loc("starvation_stop_events"), "迟到停止事件数必须 ≥1")
+    if overload.auto_resume_max < 0:
+        _error(issues, "range", loc("auto_resume_max"), "自动恢复次数不能为负")
+
+    # 阈值必须逐级收紧：快速停止 < 停止 < 暂停 < 告警（余量下限）
+    ordered_floors = (
+        ("commit_fast_stop_floor_mb", overload.commit_fast_stop_floor_mb),
+        ("commit_stop_floor_mb", overload.commit_stop_floor_mb),
+        ("commit_pause_floor_mb", overload.commit_pause_floor_mb),
+        ("commit_warn_floor_mb", overload.commit_warn_floor_mb),
+    )
+    ordered_ratios = (
+        ("commit_fast_stop_limit_ratio", overload.commit_fast_stop_limit_ratio),
+        ("commit_stop_limit_ratio", overload.commit_stop_limit_ratio),
+        ("commit_pause_limit_ratio", overload.commit_pause_limit_ratio),
+        ("commit_warn_limit_ratio", overload.commit_warn_limit_ratio),
+    )
+    for ordered, label in ((ordered_floors, "Commit 余量下限"), (ordered_ratios, "Commit 上限比例")):
+        for (lower_name, lower), (upper_name, upper) in zip(ordered, ordered[1:], strict=False):
+            if not (0.0 <= lower < upper):
+                _error(
+                    issues,
+                    "range",
+                    loc(lower_name),
+                    f"{label}必须逐级收紧：{lower_name}={lower} 应小于 {upper_name}={upper}",
+                )
+    if overload.commit_fast_stop_limit_ratio >= 1.0 or overload.commit_warn_limit_ratio >= 1.0:
+        _error(issues, "range", loc("commit_warn_limit_ratio"), "Commit 比例阈值必须小于 1")
+
+    if overload.window_long_s < overload.window_warn_s:
+        _error(issues, "range", loc("window_long_s"), "长窗口不能短于告警窗口")
+    if overload.window_stop_after_pause_s < overload.starvation_stop_window_s:
+        _error(
+            issues,
+            "range",
+            loc("window_stop_after_pause_s"),
+            "暂停后停止观察窗口不能短于迟到停止窗口",
+        )
+    if overload.commit_stop_window_s >= overload.window_warn_s:
+        _error(issues, "range", loc("commit_stop_window_s"), "Commit 停止窗口应短于暂停/告警窗口")
+    if overload.commit_fast_stop_sustained_s >= overload.commit_stop_window_s:
+        _error(
+            issues,
+            "range",
+            loc("commit_fast_stop_sustained_s"),
+            "快速停止持续时间应短于 Commit 停止窗口",
+        )
+    if overload.warn_clear_s > overload.window_long_s:
+        _error(issues, "range", loc("warn_clear_s"), "告警退出持续时间不能超过长窗口")
 
 
 def _validate_navigation(issues: list[ValidationIssue], nav: NavigationConfig, location: str) -> None:
