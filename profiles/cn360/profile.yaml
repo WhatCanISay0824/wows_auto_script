@@ -21,10 +21,12 @@ window:
 
 keys_file: keys.yaml
 
-# 小地图标定（实测 211346 战斗截图）：小地图位于右下角，内容区为深色网格面板
-# （不含上方 1~10 数字栏和左侧 A~J 字母栏的外侧？字母在面板内），右下贴边。
+# 小地图标定（2026-11-01 诊断截图，2560×1600）：小地图位于右下角，profile 矩形外框约 376×376，
+# 按 border_px=2 四边内缩后实际内容区 372×372；右下贴边。旧矩形外框约 514×507，误含左上方
+# 战斗画面；本轮按当前游戏截图校正。
+# 注意：该标定对应当前游戏的小地图尺寸；用户在游戏内调整小地图大小后仍需重新标定。
 minimap:
-  rect: [0.798, 0.677, 0.999, 0.994]
+  rect: [0.853125, 0.765, 1.0, 1.0]
   border_px: 2
   frame_feature: null                    # 小地图边框模板不稳定，暂不使用
   marker_template: marker/marker.png     # 自身舰船白色箭头（已从实机截图提取）
@@ -34,15 +36,29 @@ minimap:
   marker_jump_px: 300
   marker_lost_s: 3
 
-# 战斗 HUD 与死亡判定标定（实测截图）
+# 战斗 HUD 与死亡判定标定（实测截图；ISS-002 / 评审 10.2 口径）
 battle_hud:
-  hp_bar_region: [0.026, 0.731, 0.118, 0.758]   # 己方血条绿色填充区域（左下）
+  # 整条己方血条区域（含空条底色与暗红空血轮廓），归一化到窗口客户区。
+  # 标定依据：2026-10-30 三张实机截图，覆盖铁公爵（宽剪影）与列宁格勒（窄剪影），
+  # 区域需同时包含两种剪影的完整宽度与舰体底部横条（y 约 0.737~0.7665）。
+  hp_bar_region: [0.014, 0.737, 0.130, 0.7665]
+  # 旧绿色 HSV 范围降级为辅助证据（只写调试日志，不再单独代表血量）
   hp_fill_hsv_lower: [68, 150, 150]             # 实测绿色填充 HSV ≈ (80, 190~217, 200~244)
   hp_fill_hsv_upper: [92, 255, 255]
-  hp_fill_zero_ratio: 0.05
+  hp_fill_zero_ratio: 0.05                      # 旧字段：保留兼容，已不再作为判零依据
+  # ISS-002 颜色无关填充列比例判定：fill ratio = 填充列数 / 区域宽度
+  # 实机样本：满血绿≈0.70、79.6% 黄≈0.77、0 血红色空条≈0.007
+  hp_bar_empty_max_ratio: 0.02                  # 低于=空条（确认归零）
+  hp_bar_alive_min_ratio: 0.10                  # 高于=存活；两者之间=无法判断（不授权）
+  hp_bar_confirm_frames: 2                      # 连续 N 个新帧确认归零才授权提前退出
+  hp_bar_evidence_ttl_s: 1.0                    # 归零证据有效期（秒）；超时/矛盾证据撤销授权
   spectator_features: []                        # 用户确认：死亡立刻退出，不需要观战界面
   death_banner_feature: death_banner            # 已提取（“您的战舰已被玩家摧毁”）
   result_feature: battle_results                # 已提取（结算页右侧固定分页栏）
+  # 结算页按钮优先顺序（2026-10-31 用户确认）：有“继续战斗！”直接点，直接开下一局；
+  # 没有时再点“回到港口”。两个特征任一未配置/未命中时按另一优先顺序兜底。
+  result_continue_feature: result_continue_battle_button
+  result_return_feature: result_return_port_button
 
 camera:
   relative: true        # 视角使用鼠标相对移动（详细设计 8.4）
@@ -62,11 +78,11 @@ exit:
 
 # 状态识别特征表（详细设计 5.4）。第一个为主判定，其余为辅助；缺失特征会被跳过。
 state_features:
-  PORT: [port_indicator, port_battle_button, coop_mode_selected, port_equip_tab]
+  PORT: [port_indicator, port_battle_button, coop_mode_selected]
   QUEUEING: [queue_indicator, cancel_queue_button]
   LOADING: []                     # 加载界面模板可缺省：排队结束后直接检测战斗 HUD 进战斗
-  BATTLE_ACTIVE: [battle_hud_indicator, hp_bar_present]
-  BATTLE_FINISHED: [battle_results, result_panel]
+  BATTLE_ACTIVE: [battle_hud_indicator, hp_bar_present, autopilot_indicator]
+  BATTLE_FINISHED: [battle_results, result_panel, result_continue_battle_button, result_return_port_button]
   EXIT_MENU_OPEN: [exit_menu_return_port]
   EXIT_CONFIRMING: [exit_confirm_yes]
   POST_EXIT_INTERFACE: []         # 回港弹窗暂不处理（未知弹窗由异常恢复 ESC 兜底）
@@ -75,7 +91,7 @@ state_features:
 popup_features: []
 
 # 界面特征模板（详细设计 3.2 / 5.4）。region 为归一化搜索区域 [x1,y1,x2,y2]。
-# 已提取：18 个（含 2026-10-30 新补的退出菜单/确认框/装备页/标签页模板）。
+# 已提取：19 个（含 2026-10-30 新补的退出菜单/确认框/装备页/标签页模板）。
 features:
   port_indicator:
     template: features/port_indicator.png          # 顶部“港口”标签（实机画面提取）
@@ -109,6 +125,10 @@ features:
     template: features/battle_hud_indicator.png    # 顶部绿/红队旗图标（实机画面提取，不受天空光照影响）
     region: [0.44, 0.02, 0.58, 0.10]
     threshold: 0.85
+  autopilot_indicator:
+    template: features/autopilot_indicator.png     # 战斗 HUD 左侧“M 自动驾驶开启”（ISS-001 航向验证，2026-10-31 实机帧提取）
+    region: [0.10, 0.74, 0.32, 0.85]
+    threshold: 0.85   # 未开启时的灰色提示实测匹配 0.788，不能作为激活证据
   hp_bar_present:
     template: features/hp_bar_present.png          # 左下“VII 列宁格勒”血条文字（静态）
     region: [0.0, 0.72, 0.17, 0.80]
@@ -129,15 +149,19 @@ features:
     template: features/result_return_port_button.png  # “回到港口”按钮
     region: [0.38, 0.88, 0.64, 0.98]
     threshold: 0.85
+  result_continue_battle_button:
+    template: features/result_continue_battle_button.png  # “继续战斗！”按钮（优先点击，直接下一局）
+    region: [0.74, 0.86, 0.92, 0.95]
+    threshold: 0.80
   # ---- 实测退出菜单 / 退出确认框（215424 / 215411）----
   exit_menu_return_port:
     template: features/exit_menu_return_port.png      # ESC 菜单里的“离开战斗”按钮
     region: [0.40, 0.36, 0.60, 0.44]
-    threshold: 0.85
+    threshold: 0.78   # 2026-10-31 下调：菜单淡入期间匹配分数偏低，避免误判未打开而重复按 ESC
   exit_confirm_yes:
     template: features/exit_confirm_yes.png           # “离开战斗?” 确认框里的“是”按钮
     region: [0.34, 0.45, 0.48, 0.53]
-    threshold: 0.85
+    threshold: 0.78   # 与退出菜单同步下调
   # ---- 实测港口标签页 / 装备页信号旗（210924 / 214644）----
   port_equip_tab:
     template: features/port_equip_tab.png             # 顶部“装备”标签（实机画面提取，未选中态）
@@ -185,16 +209,13 @@ start_sequence_full:
     timeout_ms: 20000
     retries: 0
 
-# 结算界面：等结算稳定后点“回到港口”；之后由 EXITING 状态等待回港
+# 结算界面：等结算稳定后由状态机选择按钮（优先“继续战斗！”直接下一局，否则“回到港口”）。
+# 2026-10-31 用户确认：结算页有“继续战斗！”就点它，不要再固定点“回到港口”。
 result_sequence:
   - action: wait_feature
     feature: battle_results
     timeout_ms: 60000
     retries: 0
-  - action: click_feature
-    feature: result_return_port_button
-    timeout_ms: 10000
-    retries: 2
 
 # 弹窗清理：暂未截图 popup_close_button，先留空；未知弹窗由异常恢复 ESC 兜底。
 # 后续若观察到固定奖励/任务弹窗，补模板后在此加入 click_feature 步骤。
@@ -205,22 +226,13 @@ popup_sequence: []
 # 因此不再需要打开列表的步骤。
 ship_selection_sequence: []
 
-# 每场战斗前的装备页校验（用户确认：只要求信号旗数量为 0）：
-# 点顶部“装备”标签 → 等“信号旗 0/8”特征（数量不为 0 则匹配失败，进入 PAUSED）。
-# 校验后不必切回港口页：“加入战斗”按钮在装备页同样存在，直接开局即可。
-ship_check_sequence:
-  - action: click_feature
-    feature: port_equip_tab
-    timeout_ms: 3000
-    retries: 1
-  - action: wait_feature
-    feature: loadout_signal_flags
-    timeout_ms: 3000
-    retries: 0
+# 每场战斗前不再校验装备页/信号旗/加成卡（2026-10-31 用户确认：信号旗检测容易失效则取消该状态）。
+# 只保留“已选中目标船”校验；装备页不读不点，不检测加成卡与信号旗。
+ship_check_sequence: []
 
 # 船只校验：ship_card 由运行时的船只卡片模板注册（来自 ships/<ship_id>/card.png）
 ship_verify_features: [ship_card]
-loadout_verify_features: []   # 信号旗已在 ship_check_sequence 中校验，不再重复检查
+loadout_verify_features: []   # 已取消信号旗/加成卡校验（ISS-007 实机补充）
 
 # 默认不自动清除已装配的信号旗或加成卡
 clear_loadout_sequence: null

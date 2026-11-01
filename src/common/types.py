@@ -330,9 +330,22 @@ class ShipPosition:
         }
 
 
+#: 血条证据等级（ISS-002 / 评审 10.2）：
+#: - ``alive``：血条区域有效且填充比例达到存活下限；
+#: - ``zero``：血条区域有效且填充比例低于空条上限（确认归零）；
+#: - ``unknown``：血条区域存在但有效/填充比例无法判定（遮挡、处于空→活死区）；
+#: - ``unavailable``：没有可用血条区域/帧/模板，无法判定。
+HP_EVIDENCE_LEVELS: tuple[str, ...] = ("alive", "zero", "unknown", "unavailable")
+
+
 @dataclass(frozen=True, slots=True)
 class DeathSignals:
-    """死亡信号投票结果（详细设计 5.9）。"""
+    """死亡信号投票结果（详细设计 5.9 / 评审 10.2）。
+
+    退出授权只认 ``exit_authorized``：血条区域有效 + 连续帧确认归零 + 证据在 TTL 内；
+    ``banner`` / ``hp_bar_absent`` / ``marker_lost`` / ``spectator_ui`` 仍参与投票与日志，
+    但**不能单独授权提前退出**（ISS-002）。
+    """
 
     hp_bar_absent: bool
     hp_zero: bool
@@ -343,6 +356,15 @@ class DeathSignals:
     stable_ms: int
     timestamp: float = 0.0
     votes: dict[str, bool] = field(default_factory=dict)
+    # --- ISS-002：血条归零证据（评审 10.2）------------------------------
+    #: 血条区域填充列比例（0~1）；None 表示没有可用血条区域或帧。
+    hp_fill_ratio: float | None = None
+    #: 证据等级，取值见 :data:`HP_EVIDENCE_LEVELS`。
+    hp_evidence: str = "unavailable"
+    #: 是否授权提前退出（只由感知层根据确认归零证据给出）。
+    exit_authorized: bool = False
+    #: 最近一次“确认归零”证据的时间戳（单调时钟秒；0 表示从未确认）。
+    evidence_at: float = 0.0
 
     @property
     def dead(self) -> bool:
@@ -359,6 +381,10 @@ class DeathSignals:
             "score": round(self.score, 3),
             "stable_ms": self.stable_ms,
             "votes": dict(self.votes),
+            "hp_fill_ratio": None if self.hp_fill_ratio is None else round(self.hp_fill_ratio, 4),
+            "hp_evidence": self.hp_evidence,
+            "exit_authorized": self.exit_authorized,
+            "evidence_at": round(self.evidence_at, 3),
         }
 
 

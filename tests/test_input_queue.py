@@ -58,6 +58,29 @@ class RecordingBackend:
         self.release_processed.set()
 
 
+def test_foreground_is_checked_again_after_wait_before_sending():
+    """发送间隔内切走窗口时，不把剩余动作发送到新窗口。"""
+    backend = RecordingBackend()
+    foreground = [True]
+    clock = FakeClock()
+
+    class FocusChangingSleeper:
+        def sleep(self, seconds):
+            clock.advance(seconds)
+            foreground[0] = False
+
+    executor = InputExecutor(backend, InputConfig(min_action_interval_ms=100), clock=clock,
+                             sleeper=FocusChangingSleeper(), can_execute=lambda: foreground[0])
+    try:
+        executor.submit([Action.key_down("m"), Action.key_up("m"), Action.click_abs(200, 200)])
+        wait_until(lambda: backend.release_count > 0)
+        assert len(backend.actions) == 1
+        assert not executor.gate_open
+        assert all(action.kind.value != "click_abs" for action in backend.actions)
+    finally:
+        executor.stop(drain=False)
+
+
 @pytest.fixture
 def executors():
     """创建可自动回收的 InputExecutor 工厂。"""
@@ -468,3 +491,98 @@ def test_transient_backend_error_is_recorded_and_recovers(executors) -> None:
     assert executor.consecutive_errors == 0
     assert executor.error_count == 1
     assert executor.executed_actions == 1
+
+
+# ---------------------------------------------------------------------------
+# ISS-004 统一输入门禁：暂停/停止后旧动作失效、新动作被拒绝、恢复后只执行新动作
+# ---------------------------------------------------------------------------
+
+
+def test_close_gate_rejects_new_actions_and_releases(executors) -> None:
+    backend = RecordingBackend()
+    executor = executors(backend, config=InputConfig(min_action_interval_ms=0))
+    executor.submit([Action.key_down("w", label="hold_w")])
+    assert executor.wait_until_idle(2.0)
+    assert executor.gate_open
+
+    executor.close_gate_and_release("pause", wait=True)
+    assert not executor.gate_open
+    assert executor.gate_reason == "pause"
+    assert backend.release_count == 1
+    releases_before = executor.release_count
+
+    executor.submit([Action.move_rel(3, 3, label="after_pause")])
+    assert executor.wait_until_idle(1.0)
+    assert labels(backend.actions) == ["hold_w"]
+    assert executor.rejected_actions >= 1
+    assert executor.release_count == releases_before
+
+    assert executor.open_gate("resume")
+    executor.submit([Action.move_rel(4, 4, label="after_resume")])
+    assert executor.wait_until_idle(2.0)
+    assert labels(backend.actions) == ["hold_w", "after_resume"]
+
+
+def test_pause_cancels_queued_batches_and_invalidates_inflight(executors) -> None:
+    backend = RecordingBackend()
+    backend.block_enabled.set()
+    executor = executors(backend, config=InputConfig(min_action_interval_ms=0))
+    executor.submit([Action.move_rel(0, 0, label="in_flight")])
+    assert backend.block_entered.wait(2.0)
+    executor.submit(
+        [Action.move_rel(1, 1, label="pending1"), Action.move_rel(2, 2, label="pending2")]
+    )
+
+    executor.close_gate_and_release("pause", wait=False)
+    backend.unblock.set()
+    assert backend.release_processed.wait(3.0)
+    assert executor.wait_until_idle(2.0)
+
+    assert labels(backend.actions) == ["in_flight"], "暂停后排队动作必须全部丢弃"
+    assert all(name == INPUT_THREAD_NAME for name in backend.release_threads)
+    assert executor.dropped_actions >= 2
+
+
+def test_pause_twice_and_resume_does_not_replay_old_actions(executors) -> None:
+    backend = RecordingBackend()
+    executor = executors(backend, config=InputConfig(min_action_interval_ms=0))
+    executor.close_gate_and_release("pause1", wait=True)
+    releases_after_first = backend.release_count
+    executor.close_gate_and_release("pause2", wait=True)
+    assert backend.release_count == releases_after_first + 1
+
+    executor.submit([Action.move_rel(1, 1, label="queued_while_paused")])
+    assert executor.open_gate("resume")
+    executor.submit([Action.move_rel(2, 2, label="fresh")])
+    assert executor.wait_until_idle(2.0)
+    assert labels(backend.actions) == ["fresh"]
+
+
+# ---------------------------------------------------------------------------
+# ISS-009 连续失败后立即释放，并可显式重置后恢复
+# ---------------------------------------------------------------------------
+
+
+def test_consecutive_failures_release_and_reset(executors) -> None:
+    backend = RecordingBackend()
+    backend.fail_times = 10
+    executor = executors(backend, config=InputConfig(min_action_interval_ms=0))
+    executor.submit([Action.move_rel(1, 1), Action.move_rel(2, 2), Action.move_rel(3, 3)])
+
+    wait_until(lambda: executor.failed, message="连续失败未进入 failed 状态")
+    wait_until(lambda: backend.release_count >= 1, message="失败后输入线程未尝试释放")
+    assert not executor.gate_open
+    assert executor.gate_reason == "input_failed"
+    assert backend.actions == []
+
+    executor.submit([Action.move_rel(4, 4, label="after_failed")])
+    assert executor.wait_until_idle(1.0)
+    assert labels(backend.actions) == []
+
+    backend.fail_times = 0
+    assert executor.reset_after_failure()
+    assert executor.failed is False
+    assert executor.gate_open
+    executor.submit([Action.move_rel(5, 5, label="recovered")])
+    assert executor.wait_until_idle(2.0)
+    assert labels(backend.actions) == ["recovered"]

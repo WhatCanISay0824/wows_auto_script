@@ -201,7 +201,7 @@ def test_end_battle_validates_enums(db: Database) -> None:
     with pytest.raises(DatabaseError):
         db.end_battle(battle_id, "dead", "unknown_method")
     assert {"dead", "finished", "aborted"} == RESULT_VALUES
-    assert {"menu", "confirm", "direct", "recovery", "none"} == EXIT_METHOD_VALUES
+    assert {"menu", "confirm", "direct", "recovery", "none", "interrupted"} == EXIT_METHOD_VALUES
 
 
 def test_set_battle_context(db: Database) -> None:

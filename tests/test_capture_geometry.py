@@ -26,11 +26,14 @@ from src.perception.capture import (
     dib_section_to_bgr,
     frame_invalid_reason,
     frame_is_valid,
+    is_fullscreen_client_rect,
     rect_within,
 )
 
 # 测试客户端尺寸（远小于真实 2560x1600，但不能小于最小帧尺寸）
 CLIENT_RECT = Rect(10, 20, 64, 48)
+#: 无边框全屏测试用客户区（与虚拟屏幕一致）
+FULL_RECT = Rect(0, 0, 2560, 1600)
 HWND = 0x1234
 
 
@@ -99,15 +102,24 @@ class GrabOnlySource:
 
 
 class FakeSource:
-    """带 PrintWindow 兜底能力的假图像来源。"""
+    """带 PrintWindow / 桌面截屏兜底能力的假图像来源。"""
 
-    def __init__(self, image: np.ndarray, *, print_image: np.ndarray | None = None) -> None:
+    def __init__(
+        self,
+        image: np.ndarray,
+        *,
+        print_image: np.ndarray | None = None,
+        screen_image: np.ndarray | None = None,
+    ) -> None:
         self.image = image
         self.print_image = print_image
+        self.screen_image = screen_image
         self.grab_calls: list[tuple[int, Rect]] = []
         self.print_calls: list[tuple[int, Rect]] = []
+        self.screen_calls: list[Rect] = []
         self.closed = 0
         self.print_error: Exception | None = None
+        self.screen_error: Exception | None = None
 
     def grab(self, hwnd: int, rect: Rect) -> np.ndarray:
         self.grab_calls.append((hwnd, rect))
@@ -119,6 +131,13 @@ class FakeSource:
             raise self.print_error
         assert self.print_image is not None
         return self.print_image
+
+    def grab_screen(self, rect: Rect) -> np.ndarray:
+        self.screen_calls.append(rect)
+        if self.screen_error is not None:
+            raise self.screen_error
+        assert self.screen_image is not None
+        return self.screen_image
 
     def close(self) -> None:
         self.closed += 1
@@ -445,6 +464,153 @@ def test_capture_can_disable_print_window_fallback() -> None:
     assert source.print_calls == []
 
 
+# ---------------------------------------------------------------------------
+# 桌面 DC 截屏（无边框全屏，2026-10-31 实机修复：PrintWindow 冻结帧）
+# ---------------------------------------------------------------------------
+
+
+def _patch_virtual_screen(monkeypatch: pytest.MonkeyPatch, rect: Rect = FULL_RECT) -> None:
+    monkeypatch.setattr(capture_mod, "virtual_screen_rect", lambda: rect)
+
+
+def test_is_fullscreen_client_rect() -> None:
+    virtual = Rect(0, 0, 2560, 1600)
+    assert is_fullscreen_client_rect(Rect(0, 0, 2560, 1600), virtual) is True
+    # 原点有 2px 以内的取整误差仍算全屏
+    assert is_fullscreen_client_rect(Rect(1, -1, 2560, 1600), virtual) is True
+    assert is_fullscreen_client_rect(Rect(0, 0, 1920, 1080), virtual) is False
+    assert is_fullscreen_client_rect(Rect(10, 20, 64, 48), virtual) is False
+    # 多显示器：虚拟屏幕更宽时，只占主屏的窗口不算全屏
+    assert is_fullscreen_client_rect(Rect(0, 0, 2560, 1600), Rect(0, 0, 4480, 1600)) is False
+
+
+def test_capture_auto_uses_screen_dc_for_fullscreen(monkeypatch: pytest.MonkeyPatch) -> None:
+    """无边框全屏 + 前台：优先桌面 DC 截屏，避免窗口 BitBlt 冻结帧。"""
+    _patch_virtual_screen(monkeypatch)
+    black = np.zeros((FULL_RECT.h, FULL_RECT.w, 3), dtype=np.uint8)
+    screen_image = _noise(FULL_RECT.w, FULL_RECT.h, seed=11)
+    source = FakeSource(black, screen_image=screen_image)
+    capture = _make_capture(
+        FakeLocator(_window_info(FULL_RECT, foreground=True)),
+        source,
+        require_foreground=True,
+    )
+    frame = capture.capture()
+    assert source.grab_calls == []
+    assert source.screen_calls == [FULL_RECT]
+    assert source.print_calls == []
+    np.testing.assert_array_equal(frame.image, screen_image)
+
+    # 第二次固定桌面截屏，不再尝试窗口 BitBlt
+    capture.capture()
+    assert len(source.screen_calls) == 2
+
+
+def test_capture_auto_fullscreen_prefers_screen_even_if_window_image_valid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """回归：窗口 BitBlt 可能返回“有效但冻结”的旧画面，不能靠画面校验发现，必须优先桌面截屏。"""
+    _patch_virtual_screen(monkeypatch)
+    frozen = _noise(FULL_RECT.w, FULL_RECT.h, seed=21)
+    live = _noise(FULL_RECT.w, FULL_RECT.h, seed=22)
+    source = FakeSource(frozen, screen_image=live)
+    capture = _make_capture(
+        FakeLocator(_window_info(FULL_RECT, foreground=True)),
+        source,
+        require_foreground=True,
+    )
+    frame = capture.capture()
+    assert source.grab_calls == []
+    np.testing.assert_array_equal(frame.image, live)
+
+
+def test_capture_auto_falls_back_to_window_when_screen_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_virtual_screen(monkeypatch)
+    window_image = _noise(FULL_RECT.w, FULL_RECT.h, seed=23)
+    source = FakeSource(window_image)
+    source.screen_error = CaptureUnavailable("桌面截屏失败")
+    capture = _make_capture(
+        FakeLocator(_window_info(FULL_RECT, foreground=True)),
+        source,
+        require_foreground=True,
+    )
+    frame = capture.capture()
+    assert source.screen_calls == [FULL_RECT]
+    assert len(source.grab_calls) == 1
+    np.testing.assert_array_equal(frame.image, window_image)
+
+
+def test_capture_window_method_keeps_print_window_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_virtual_screen(monkeypatch)
+    black = np.zeros((FULL_RECT.h, FULL_RECT.w, 3), dtype=np.uint8)
+    print_image = _noise(FULL_RECT.w, FULL_RECT.h, seed=12)
+    source = FakeSource(black, print_image=print_image, screen_image=_noise(FULL_RECT.w, FULL_RECT.h, seed=13))
+    capture = GdiCapture(
+        FakeLocator(_window_info(FULL_RECT, foreground=True)),
+        clock=FakeClock(),
+        source=source,
+        require_foreground=True,
+        capture_method="window",
+    )
+    frame = capture.capture()
+    assert source.screen_calls == []
+    np.testing.assert_array_equal(frame.image, print_image)
+
+
+def test_capture_screen_method_forces_screen_dc(monkeypatch: pytest.MonkeyPatch) -> None:
+    screen_image = _noise(CLIENT_RECT.w, CLIENT_RECT.h, seed=14)
+    source = FakeSource(_noise(CLIENT_RECT.w, CLIENT_RECT.h, seed=15), screen_image=screen_image)
+    capture = GdiCapture(
+        FakeLocator(_window_info()),
+        clock=FakeClock(),
+        source=source,
+        capture_method="screen",
+    )
+    frame = capture.capture()
+    assert source.grab_calls == []
+    assert source.screen_calls == [CLIENT_RECT]
+    np.testing.assert_array_equal(frame.image, screen_image)
+
+
+def test_capture_auto_non_fullscreen_keeps_print_window(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_virtual_screen(monkeypatch)
+    black = np.zeros((CLIENT_RECT.h, CLIENT_RECT.w, 3), dtype=np.uint8)
+    print_image = _noise(CLIENT_RECT.w, CLIENT_RECT.h, seed=16)
+    source = FakeSource(black, print_image=print_image, screen_image=_noise(CLIENT_RECT.w, CLIENT_RECT.h, seed=17))
+    capture = _make_capture(FakeLocator(_window_info()), source, require_foreground=True)
+    frame = capture.capture()
+    assert source.screen_calls == []
+    np.testing.assert_array_equal(frame.image, print_image)
+
+
+def test_capture_invalid_screen_falls_back_to_print_window(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_virtual_screen(monkeypatch)
+    black = np.zeros((FULL_RECT.h, FULL_RECT.w, 3), dtype=np.uint8)
+    print_image = _noise(FULL_RECT.w, FULL_RECT.h, seed=18)
+    source = FakeSource(black, print_image=print_image, screen_image=black.copy())
+    capture = _make_capture(
+        FakeLocator(_window_info(FULL_RECT, foreground=True)),
+        source,
+        require_foreground=True,
+    )
+    frame = capture.capture()
+    # 桌面截屏在“优先尝试”和“黑屏兜底”阶段各尝试一次，均失败后走 PrintWindow
+    assert source.screen_calls == [FULL_RECT, FULL_RECT]
+    np.testing.assert_array_equal(frame.image, print_image)
+
+
+def test_capture_rejects_unknown_capture_method() -> None:
+    with pytest.raises(ValueError, match="capture_method"):
+        GdiCapture(
+            FakeLocator(_window_info()),
+            clock=FakeClock(),
+            source=FakeSource(_noise(CLIENT_RECT.w, CLIENT_RECT.h)),
+            capture_method="bogus",
+        )
+
+
 def test_capture_records_timing_statistics() -> None:
     ticks = iter([0.0, 0.5, 0.5, 0.65])
     capture = _make_capture(
@@ -490,6 +656,7 @@ class _FakeGdi:
         self.delete_object_calls: list[int] = []
         self.delete_dc_calls = 0
         self.bitblt_calls = 0
+        self.bitblt_from_calls: list[tuple[int, int]] = []
         self.print_calls = 0
         self.bitblt_ok = True
         self.get_dc_ok = True
@@ -528,6 +695,12 @@ class _FakeGdi:
         self.bitblt_calls += 1
         return self.bitblt_ok
 
+    def bitblt_from(
+        self, dst_dc: int, width: int, height: int, src_dc: int, src_x: int, src_y: int
+    ) -> bool:
+        self.bitblt_from_calls.append((src_x, src_y))
+        return self.bitblt_ok
+
     def print_window(self, hwnd: int, hdc: int) -> bool:
         self.print_calls += 1
         return self.print_ok
@@ -543,6 +716,7 @@ def _patch_gdi(monkeypatch: pytest.MonkeyPatch) -> _FakeGdi:
     monkeypatch.setattr(capture_mod, "_gdi_delete_object", fake.delete_object)
     monkeypatch.setattr(capture_mod, "_gdi_delete_dc", fake.delete_dc)
     monkeypatch.setattr(capture_mod, "_gdi_bitblt", fake.bitblt)
+    monkeypatch.setattr(capture_mod, "_gdi_bitblt_from", fake.bitblt_from)
     monkeypatch.setattr(capture_mod, "_gdi_print_window", fake.print_window)
     monkeypatch.setattr(capture_mod, "is_dpi_aware", lambda: True)
 
@@ -624,6 +798,27 @@ def test_gdi_frame_source_dpi_awareness_modes(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setattr(capture_mod, "set_dpi_awareness", lambda: "per_monitor_v2")
     assert GdiFrameSource().dpi_awareness == "per_monitor_v2"
     assert GdiFrameSource(dpi_aware=False).dpi_awareness == "skipped"
+
+
+def test_gdi_frame_source_grab_screen_uses_desktop_dc(monkeypatch: pytest.MonkeyPatch) -> None:
+    """桌面 DC 截屏从客户区在屏幕上的 (x,y) 复制，而不是窗口 DC 的 (0,0)。"""
+    fake = _patch_gdi(monkeypatch)
+    source = GdiFrameSource()
+    rect = Rect(100, 50, 64, 48)
+    image = source.grab_screen(rect)
+    assert image.shape == (48, 64, 3)
+    assert fake.bitblt_from_calls == [(100, 50)]
+    assert fake.print_calls == 0
+    source.close()
+
+
+def test_gdi_frame_source_grab_screen_raises_when_bitblt_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = _patch_gdi(monkeypatch)
+    fake.bitblt_ok = False
+    source = GdiFrameSource()
+    with pytest.raises(CaptureUnavailable, match="桌面 BitBlt 失败"):
+        source.grab_screen(Rect(0, 0, 64, 48))
+    source.close()
 
 
 def test_gdi_frame_source_uses_real_dib_conversion_without_patch(monkeypatch: pytest.MonkeyPatch) -> None:

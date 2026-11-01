@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from src.common.clock import FakeClock
@@ -31,6 +32,7 @@ from src.config.models import (
     StepDef,
     WindowConfig,
 )
+from src.execution.safety import StopController
 from src.state_machine.accounts import AccountRotator
 from src.state_machine.machine import MachineDeps, StateMachine
 from src.state_machine.ship_check import ShipCheckStatus
@@ -159,12 +161,25 @@ class FakeExecutor:
         self.submitted: list[Action] = []
         self.stopped = False
         self.released = 0
+        self.gate_open = True
 
     def submit(self, actions) -> None:
         self.submitted.extend(actions)
 
     def release_all(self) -> None:
         self.released += 1
+
+    def close_gate_and_release(self, reason: str = "", *, wait: bool = False, timeout: float = 2.0) -> int:
+        self.gate_open = False
+        self.released += 1
+        return 1
+
+    def open_gate(self, reason: str = "") -> bool:
+        self.gate_open = True
+        return True
+
+    def reset_after_failure(self) -> bool:
+        return True
 
     def stop(self, drain: bool = True) -> None:
         self.stopped = True
@@ -375,7 +390,11 @@ def make_app(tmp_path: Path, *, maps: dict[str, MapPack] | None = None) -> AppCo
             confirm_feature="exit_confirm",
             port_feature="port_indicator",
         ),
-        battle_hud=BattleHudConfig(result_feature="battle_results"),
+        battle_hud=BattleHudConfig(
+            result_feature="battle_results",
+            result_continue_feature="result_continue_battle_button",
+            result_return_feature="result_return_port_button",
+        ),
     )
     ship = ShipProfile(ship_id="test_ship", display_name="测试船")
     keymap = KeyMap(actions={"escape": "escape", "fire": "mouse_left", "full_map": "m"})
@@ -417,6 +436,8 @@ class Harness:
         self.session = FakeSession()
         self.screenshots = FakeScreenshots()
         self.ship_checker = ship_checker or FakeShipChecker()
+        self.controller = StopController()
+        self.battle_contexts: list[int | None] = []
         self.machine = StateMachine(
             MachineDeps(
                 config=self.app,
@@ -431,6 +452,8 @@ class Harness:
                 screenshots=self.screenshots,  # type: ignore[arg-type]
                 ship_checker=self.ship_checker,  # type: ignore[arg-type]
                 autopilot=self.autopilot,
+                controller=self.controller,
+                on_battle_context=self.battle_contexts.append,
             )
         )
         self.machine.update_window_info(
@@ -457,6 +480,26 @@ class Harness:
 
 def _match(feature_id: str, found: bool = True) -> MatchResult:
     return MatchResult(feature_id, found, 0.95, center=(100, 100), rect=(90, 90, 20, 20), scale=1.0)
+
+
+def _death_signals(
+    now: float, *, authorized: bool = True, banner: bool = False, hp_evidence: str | None = None
+) -> DeathSignals:
+    """构造一帧死亡信号；ISS-002 后退出只认 exit_authorized（血条确认归零证据）。"""
+    return DeathSignals(
+        hp_bar_absent=False,
+        hp_zero=authorized,
+        banner=banner,
+        marker_lost=False,
+        spectator_ui=False,
+        score=0.0,
+        stable_ms=1500,
+        timestamp=now,
+        hp_fill_ratio=0.0 if authorized else 0.5,
+        hp_evidence=hp_evidence or ("zero" if authorized else "unknown"),
+        exit_authorized=authorized,
+        evidence_at=now if authorized else 0.0,
+    )
 
 
 def drive_to_battle_active(h: Harness) -> None:
@@ -536,16 +579,56 @@ def test_port_start_sequence_flow(tmp_path: Path) -> None:
     assert h.perception.begin_battle_calls == 1
 
 
+def test_death_esc_opens_confirm_dialog_directly(tmp_path: Path) -> None:
+    """2026-10-31 实机回归：死亡后 ESC 直接弹“确认离开战斗?”，不等菜单也要能退出。"""
+    h = Harness(tmp_path)
+    drive_to_battle_active(h)
+    h.perception.death = _death_signals(h.clock.now())
+    h.step()
+    assert h.machine.state is State.DEAD_PENDING_EXIT
+    h.clock.advance(2.5)
+    h.perception.death = _death_signals(h.clock.now())
+    h.step()
+    assert h.machine.state is State.EXIT_MENU_OPEN
+    # ESC 后直接出现确认框（没有“菜单→离开战斗”按钮）
+    h.perception.features["exit_confirm"] = _match("exit_confirm")
+    h.step()
+    assert h.machine.state is State.EXIT_CONFIRMING
+    h.step()
+    assert h.machine.state is State.EXITING
+    assert "exit_requested" in h.events.battle_marks
+
+
+def test_exit_menu_timeout_saves_diagnostic(tmp_path: Path) -> None:
+    """退出菜单超时要保存诊断截图，便于定位是没开菜单还是模板失配。"""
+    h = Harness(tmp_path)
+    drive_to_battle_active(h)
+    h.perception.death = _death_signals(h.clock.now())
+    h.step()
+    h.clock.advance(2.5)
+    h.perception.death = _death_signals(h.clock.now())
+    h.step()
+    assert h.machine.state is State.EXIT_MENU_OPEN
+    h.perception.last_frame = SimpleNamespace(image=object())  # 让诊断截图有帧可存
+    h.clock.advance(9.0)
+    h.step()  # 超时前先触发一次 ESC 重试（并保存 retry 诊断）
+    assert "exit_menu_retry" in h.screenshots.diagnostics
+    h.step()  # 超过 exit_menu_s -> ERROR_RECOVERY
+    assert h.machine.state is State.ERROR_RECOVERY
+    assert "exit_menu_timeout" in h.screenshots.diagnostics
+
+
 def test_dead_exit_flow_to_port(tmp_path: Path) -> None:
     h = Harness(tmp_path)
     drive_to_battle_active(h)
-    # 死亡
-    h.perception.death = DeathSignals(True, False, True, False, False, score=0.85, stable_ms=1200, timestamp=h.clock.now())
+    # 死亡：只有“血条确认归零”证据（exit_authorized）才允许提前退出
+    h.perception.death = _death_signals(h.clock.now())
     h.step()
     assert h.machine.state is State.DEAD_PENDING_EXIT
     assert "death" in h.events.battle_marks
-    # 等待 0.8~2.0s 后进入退出菜单
+    # 等待 0.8~2.0s 后进入退出菜单（每帧重新给出新鲜证据）
     h.clock.advance(2.5)
+    h.perception.death = _death_signals(h.clock.now())
     h.step()
     assert h.machine.state is State.EXIT_MENU_OPEN
     # 菜单打开 + 返回港口按钮 -> EXIT_CONFIRMING
@@ -608,11 +691,171 @@ def test_autopilot_mode_starts_without_map_recognition(tmp_path: Path) -> None:
 def test_result_priority_over_death(tmp_path: Path) -> None:
     h = Harness(tmp_path)
     drive_to_battle_active(h)
-    h.perception.death = DeathSignals(True, False, True, False, False, score=0.9, stable_ms=1500, timestamp=h.clock.now())
+    h.perception.death = _death_signals(h.clock.now())
     h.perception.features["battle_results"] = _match("battle_results")
     h.step()
     assert h.machine.state is State.BATTLE_FINISHED
     assert h.machine.battle is not None
+
+
+def test_result_continue_button_prefers_next_battle(tmp_path: Path) -> None:
+    """2026-10-31 用户口径：结算页有“继续战斗！”时直接点击，不经过港口继续下一局。"""
+    h = Harness(tmp_path)
+    drive_to_battle_active(h)
+    h.perception.features["battle_results"] = _match("battle_results")
+    h.step()
+    assert h.machine.state is State.BATTLE_FINISHED
+    # 结算序列（wait_ms 10）完成 + “继续战斗！”按钮出现
+    h.clock.advance(0.2)
+    h.perception.features["result_continue_battle_button"] = _match("result_continue_battle_button")
+    actions = h.step()
+    assert h.machine.state is State.EXITING
+    assert any(action.label == "result_continue" for action in actions)
+    # 继续战斗后游戏直接进入排队界面（不经过港口）
+    h.perception.features.clear()
+    h.perception.features["queue_indicator"] = _match("queue_indicator")
+    h.clock.advance(0.5)
+    h.step()
+    assert h.machine.state is State.START_COOP
+    assert "returned" not in h.events.battle_marks
+    assert h.events.battles and h.events.battles[-1][0] == "finished"
+    assert h.machine.battles_completed == 1
+    # START_COOP 识别到排队 -> 新一场记录 + QUEUEING
+    h.step()
+    assert h.machine.state is State.QUEUEING
+    assert h.session.battle_starts == 2
+
+
+def test_result_skips_continue_when_session_stopping(tmp_path: Path) -> None:
+    """本场后触发 --max-battles 上限时不点“继续战斗”，改回港后再停止（不把游戏留在队列）。"""
+    h = Harness(tmp_path)
+    h.machine.set_rotation_limit(1)
+    drive_to_battle_active(h)
+    h.perception.features["battle_results"] = _match("battle_results")
+    h.step()
+    assert h.machine.state is State.BATTLE_FINISHED
+    h.clock.advance(0.2)
+    h.perception.features["result_continue_battle_button"] = _match("result_continue_battle_button")
+    h.perception.features["result_return_port_button"] = _match("result_return_port_button")
+    actions = h.step()
+    assert h.machine.state is State.EXITING
+    labels = [action.label for action in actions]
+    assert "result_continue" not in labels
+    assert "result_return_port" in labels
+
+
+def test_result_returns_to_port_without_continue_button(tmp_path: Path) -> None:
+    """结算页没有“继续战斗！”时回退到“回到港口”。"""
+    h = Harness(tmp_path)
+    drive_to_battle_active(h)
+    h.perception.features["battle_results"] = _match("battle_results")
+    h.step()
+    assert h.machine.state is State.BATTLE_FINISHED
+    h.clock.advance(0.2)
+    h.perception.features["result_return_port_button"] = _match("result_return_port_button")
+    actions = h.step()
+    assert h.machine.state is State.BATTLE_FINISHED
+    assert not any(action.label == "result_return_port" for action in actions)
+    h.clock.advance(20)
+    actions = h.step()
+    assert h.machine.state is State.EXITING
+    assert any(action.label == "result_return_port" for action in actions)
+    # 回到港口 -> POST_EXIT_INTERFACE -> PORT
+    h.perception.features["port_indicator"] = _match("port_indicator")
+    h.step()
+    assert h.machine.state is State.POST_EXIT_INTERFACE
+    h.step()
+    assert h.machine.state is State.PORT
+    assert h.events.battles and h.events.battles[-1][0] == "finished"
+    assert h.machine.battles_completed == 1
+
+
+def test_banner_or_missing_hp_bar_does_not_authorize_exit(tmp_path: Path) -> None:
+    """ISS-002：死亡提示/血条名称消失不得单独授权提前退出。"""
+    h = Harness(tmp_path)
+    drive_to_battle_active(h)
+    h.perception.death = DeathSignals(
+        hp_bar_absent=True,
+        hp_zero=False,
+        banner=True,
+        marker_lost=True,
+        spectator_ui=False,
+        score=0.9,
+        stable_ms=5000,
+        timestamp=h.clock.now(),
+        hp_fill_ratio=None,
+        hp_evidence="unavailable",
+        exit_authorized=False,
+        evidence_at=0.0,
+    )
+    for _ in range(3):
+        h.clock.advance(0.6)
+        h.step()
+    assert h.machine.state is State.BATTLE_ACTIVE
+    assert "death" not in h.events.battle_marks
+
+
+def test_death_banner_unknown_evidence_keeps_waiting_for_fresh_zero(tmp_path: Path) -> None:
+    """死亡提示+未知证据留在死亡等待，后续新鲜零血证据仍可授权退出。"""
+    h = Harness(tmp_path)
+    drive_to_battle_active(h)
+    h.perception.death = _death_signals(h.clock.now())
+    h.step()
+    assert h.machine.state is State.DEAD_PENDING_EXIT
+    # 等待期内只有死亡提示、血条未知：不能当作存活重启巡航，也不能发退出键。
+    h.clock.advance(2.5)
+    h.perception.death = _death_signals(
+        h.clock.now(), authorized=False, banner=True, hp_evidence="unknown"
+    )
+    submitted_before = len(h.executor.submitted)
+    h.step()
+    assert h.machine.state is State.DEAD_PENDING_EXIT
+    assert "exit_requested" not in h.events.battle_marks
+    assert len(h.executor.submitted) == submitted_before
+    # 新帧继续积累到零血证据后可以退出。
+    h.perception.death = _death_signals(h.clock.now())
+    h.step()
+    assert h.machine.state is State.EXIT_MENU_OPEN
+
+
+def test_dead_wait_alive_evidence_returns_to_battle(tmp_path: Path) -> None:
+    h = Harness(tmp_path)
+    drive_to_battle_active(h)
+    h.perception.death = _death_signals(h.clock.now())
+    h.step()
+    assert h.machine.state is State.DEAD_PENDING_EXIT
+    h.clock.advance(2.5)
+    h.perception.death = _death_signals(
+        h.clock.now(), authorized=False, banner=True, hp_evidence="alive"
+    )
+    h.step()
+    assert h.machine.state is State.BATTLE_ACTIVE
+
+
+def test_result_during_dead_wait_takes_priority(tmp_path: Path) -> None:
+    h = Harness(tmp_path)
+    drive_to_battle_active(h)
+    h.perception.death = _death_signals(h.clock.now())
+    h.step()
+    assert h.machine.state is State.DEAD_PENDING_EXIT
+    h.perception.features["battle_results"] = _match("battle_results")
+    h.step()
+    assert h.machine.state is State.BATTLE_FINISHED
+    assert "exit_requested" not in h.events.battle_marks
+
+
+def test_battle_error_recovery_does_not_send_escape(tmp_path: Path) -> None:
+    """ISS-002：战斗内未知画面不得自动发送 ESC（退出菜单键只用于已授权退出）。"""
+    h = Harness(tmp_path)
+    drive_to_battle_active(h)
+    h.perception.detected = None  # 战斗内无法识别当前界面
+    h.machine._transition(State.ERROR_RECOVERY, "test_unknown")  # noqa: SLF001 - 测试直接构造场景
+    for _ in range(3):
+        h.clock.advance(0.5)
+        h.step()
+    assert h.machine.state is State.PAUSED
+    assert h.machine.pause_reason == "battle_unknown_interface"
+    assert not any(action.label == "recovery_escape" for action in h.executor.submitted)
 
 
 def test_pause_and_resume(tmp_path: Path) -> None:
@@ -621,10 +864,111 @@ def test_pause_and_resume(tmp_path: Path) -> None:
     h.machine.request_pause("window_unfocused")
     assert h.machine.state is State.PAUSED
     assert h.executor.released >= 1
+    assert h.executor.gate_open is False
+    # ISS-006：状态机暂停同步到共享 StopController，F11 恢复后主循环能看到同一状态
+    assert h.controller.paused
+    assert h.controller.resume()
     h.machine.request_resume()
     h.clock.advance(0.1)
     h.step()
     assert h.machine.state is State.INIT
+    assert h.executor.gate_open is True
+    assert not h.controller.paused
+
+
+def test_battle_pause_resume_keeps_battle_context(tmp_path: Path) -> None:
+    """ISS-006：战斗内暂停恢复保留场次编号/战斗上下文，不当作全新进程接管。"""
+    h = Harness(tmp_path)
+    drive_to_battle_active(h)
+    battle_id = h.machine.battle_id
+    assert battle_id is not None
+    autopilot_starts = h.autopilot.started
+    h.machine.request_pause("heartbeat_timeout")
+    assert h.machine.state is State.PAUSED
+    assert h.executor.gate_open is False
+    # 画面仍是战斗 HUD：恢复后回到 BATTLE_ACTIVE 并重新启动自动驾驶/行为
+    h.perception.detected = State.BATTLE_ACTIVE
+    h.controller.resume()
+    h.machine.request_resume()
+    h.step()
+    assert h.machine.state is State.BATTLE_ACTIVE
+    assert h.machine.battle_id == battle_id
+    assert h.autopilot.started > autopilot_starts
+    assert h.executor.gate_open is True
+    # 恢复时不重复创建随机档案
+    saved = len(h.events.saved_profiles)
+    h.step()
+    assert len(h.events.saved_profiles) == saved
+
+
+def test_resume_refuses_new_process_mid_battle(tmp_path: Path) -> None:
+    """新进程在战斗中：F11 不接管已有战斗，保持暂停并给出原因。"""
+    h = Harness(tmp_path)
+    h.machine.start()
+    h.perception.detected = State.BATTLE_ACTIVE
+    h.step()
+    assert h.machine.state is State.PAUSED
+    h.perception.detected = State.BATTLE_ACTIVE
+    h.machine.request_resume()
+    h.step()
+    assert h.machine.state is State.PAUSED
+    assert h.machine.pause_reason == "restart_mid_battle"
+    assert h.executor.gate_open is False
+    # 恢复失败后控制器重新写回暂停，避免主循环看到“无人暂停”却无法自动恢复
+    assert h.controller.paused
+
+
+def test_resume_to_port_aborts_unfinished_battle(tmp_path: Path) -> None:
+    """ISS-006：战斗上下文被暂停后回港，必须显式写中断记录，不能静默清空场次。"""
+    h = Harness(tmp_path)
+    drive_to_battle_active(h)
+    battle_id = h.machine.battle_id
+    assert battle_id is not None
+    h.machine.request_pause("window_lost")
+    h.perception.detected = State.PORT
+    h.controller.resume()
+    h.machine.request_resume()
+    h.step()
+    assert h.machine.state is State.PORT
+    assert h.machine.battle_id is None
+    assert h.events.battles and h.events.battles[-1][0] == "aborted"
+    assert h.battle_contexts[-1] is None
+
+
+def test_stop_while_in_battle_aborts_record(tmp_path: Path) -> None:
+    h = Harness(tmp_path)
+    drive_to_battle_active(h)
+    battle_id = h.machine.battle_id
+    assert battle_id is not None
+    h.machine.request_stop("emergency_stop", "F12")
+    assert h.machine.state is State.STOPPING
+    assert h.machine.battle_id is None
+    assert h.events.battles and h.events.battles[-1][0] == "aborted"
+    assert h.battle_contexts[-1] is None
+
+
+def test_resume_unknown_interface_keeps_paused(tmp_path: Path) -> None:
+    h = Harness(tmp_path)
+    drive_to_battle_active(h)
+    h.machine.request_pause("heartbeat_timeout")
+    h.perception.detected = None
+    h.controller.resume()
+    h.machine.request_resume()
+    h.step()
+    assert h.machine.state is State.PAUSED
+    assert h.machine.pause_reason == "resume_unknown"
+    assert h.controller.paused
+
+
+def test_battle_context_callback_tracks_battle(tmp_path: Path) -> None:
+    """ISS-010：创建战斗记录/结束/中断都更新回调场次编号。"""
+    h = Harness(tmp_path)
+    drive_to_battle_active(h)
+    battle_id = h.machine.battle_id
+    assert battle_id is not None
+    assert h.battle_contexts[-1] == battle_id
+    h.machine.request_stop("manual", "test")
+    assert h.battle_contexts[-1] is None
 
 
 def test_emergency_stop_finishes_session(tmp_path: Path) -> None:
@@ -718,7 +1062,7 @@ def test_account_rotator_disabled() -> None:
 
 
 def test_first_port_visit_skips_between_battle_wait(tmp_path: Path) -> None:
-    """会话开始后首次进港口不再等 15~60s 随机间隔；第二场之间才等待。"""
+    """本会话还没打完任何一场时（含暂停恢复）进港口不等待；两场之间才随机冷却。"""
     h = Harness(tmp_path)
     h.session.sample_between_battle_s = lambda: 30.0  # type: ignore[method-assign]
     h.machine.start()
@@ -727,8 +1071,12 @@ def test_first_port_visit_skips_between_battle_wait(tmp_path: Path) -> None:
     assert h.machine.state is State.PORT
     assert h.machine._port_wait_until == pytest.approx(h.clock.now())
     h.clock.advance(1.0)
+    h.machine._enter_port(h.clock.now(), "test_resume_visit")
+    assert h.machine._port_wait_until <= h.clock.now()  # 暂停恢复不等待
+    h.machine._battles_completed = 1
+    h.clock.advance(1.0)
     h.machine._enter_port(h.clock.now(), "test_second_visit")
-    assert h.machine._port_wait_until == pytest.approx(h.clock.now() + 30.0)
+    assert h.machine._port_wait_until == pytest.approx(h.clock.now() + 10.0)
 
 
 def test_paused_window_unavailable_auto_resumes_when_window_returns(tmp_path: Path) -> None:
@@ -748,3 +1096,86 @@ def test_paused_window_unavailable_auto_resumes_when_window_returns(tmp_path: Pa
     h.machine.update_window_info(restored)
     h.step()
     assert h.machine.state is State.INIT
+
+
+def test_delayed_continue_button_wins_over_early_return_button(tmp_path):
+    h = Harness(tmp_path)
+    drive_to_battle_active(h)
+    h.perception.features = {"battle_results": _match("battle_results"),
+                             "result_return_port_button": _match("result_return_port_button")}
+    h.step()
+    h.clock.advance(1)
+    actions = h.step()
+    assert h.machine.state is State.BATTLE_FINISHED
+    assert not any(action.label == "result_return_port" for action in actions)
+    h.clock.advance(2)
+    h.perception.features["result_continue_battle_button"] = _match("result_continue_battle_button")
+    actions = h.step()
+    assert any(action.label == "result_continue" for action in actions)
+
+
+@pytest.mark.parametrize("feature,state", [
+    ("queue_indicator", State.QUEUEING), ("loading_indicator", State.LOADING),
+    ("battle_hud_indicator", State.BATTLE_ACTIVE),
+])
+def test_continue_starts_next_battle_when_queue_or_loading_is_skipped(tmp_path, feature, state):
+    h = Harness(tmp_path)
+    drive_to_battle_active(h)
+    old_id = h.machine.battle_id
+    h.perception.features = {"battle_results": _match("battle_results"),
+                             "result_continue_battle_button": _match("result_continue_battle_button")}
+    h.step()
+    h.clock.advance(1)
+    h.step()
+    assert h.machine.state is State.EXITING
+    h.perception.features = {feature: _match(feature)}
+    h.step()
+    assert h.machine.state is State.START_COOP
+    h.step()
+    assert h.machine.state is state
+    assert h.machine.battle_id != old_id
+    assert h.machine.battles_completed == 1
+    assert h.session.battle_starts == 2
+    assert h.events.battles == [("finished", "none", None)]
+
+
+def test_death_returns_port_then_joins_next_battle_with_one_short_wait(tmp_path):
+    h = Harness(tmp_path)
+    drive_to_battle_active(h)
+    old_id = h.machine.battle_id
+    h.perception.death = _death_signals(h.clock.now())
+    h.step()
+    h.clock.advance(2.5)
+    h.perception.death = _death_signals(h.clock.now())
+    h.step()
+    h.perception.features = {"exit_confirm": _match("exit_confirm")}
+    h.step()
+    h.step()
+    assert h.machine.state is State.EXITING
+    h.perception.death = None
+    h.perception.features = {"port_indicator": _match("port_indicator")}
+    calls = []
+    h.session.sample_between_battle_s = lambda: calls.append(1) or 7
+    h.step()
+    h.step()
+    assert h.machine.state is State.PORT
+    deadline = h.machine._port_wait_until
+    assert deadline == h.clock.now() + 7
+    assert h.events.battles[-1][0] == "dead"
+    h.clock.advance(2)
+    h.machine.request_pause("manual")
+    h.controller.resume()
+    h.perception.detected = State.PORT
+    h.machine.request_resume()
+    h.step()
+    assert h.machine._port_wait_until == deadline
+    assert len(calls) == 1
+    h.clock.advance(5)
+    for _ in range(5):
+        h.step()
+    assert h.machine.state is State.START_COOP
+    assert h.session.successes == 2
+    h.perception.features = {"queue_indicator": _match("queue_indicator")}
+    h.step()
+    assert h.machine.state is State.QUEUEING
+    assert h.machine.battle_id != old_id

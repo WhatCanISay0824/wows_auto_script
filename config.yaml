@@ -38,16 +38,20 @@ map:
   expected_minimap_scale: null # 期望小地图缩放比例，null 表示按底图与小地图尺寸自动推导
 
 navigation:
-  # ===== 导航模式（用户简化需求）=====
-  # autopilot：开局在小地图上点“我方出生点关于地图中心的对称区域”，交给游戏自动驾驶，
-  #            之后不碰 WASD，也不识别地图/航线；只需要客户端小地图标定与自身标记模板。
+  # ===== 导航模式（用户简化需求 + ISS-001 修复口径）=====
+  # autopilot：默认目标基于当前小地图筛选安全水面（避开岛屿/海岸），再按 M 打开全屏战术
+  #            地图点选并交给游戏自动驾驶；不碰 WASD，也不识别地图/航线。水面图像不可用
+  #            或没有安全候选时不按 M、不点击，等待后重试。
   # waypoints：传统模式，需要地图包、地图识别、出生点与航线标定（保留可选）。
   mode: autopilot
-  autopilot_target: symmetric  # center=小地图中心；symmetric=对称敌区且横坐标固定到中线
+  autopilot_target: symmetric  # center=地图中心；symmetric=对称敌区且横坐标固定到中线
   autopilot_reclick_s: [60, 120]  # 周期重发航点间隔（到达/卡住后自动重发，避免停船）
   autopilot_overshoot: 0.6     # waypoints 旧模式预留，autopilot 不使用
   autopilot_offset: [0.0, 0.0] # 目标点相对归一化坐标微调（[dx, dy]，0 为不偏移）
-  surface: minimap             # 点击面：minimap（v1 只支持）
+  # 点击面（ISS-001，实现补充 10.1）：实机确认“先按 M 开全屏地图再点选”才会设置航向，
+  # 直接点战斗画面小地图无效。full_map=autopilot 默认；minimap 仅为旧兼容路径，
+  # 自动周期仍先做水面筛选；验证失败保留全屏地图路径并按间隔限频重试，不再降级到小地图。
+  surface: full_map
   arrival_m: 400               # waypoints 模式到达判定距离（世界米，仅作上限）
   overshoot_m: 800             # waypoints 模式越点判定距离
   overshoot_cos_threshold: -0.5  # 越点判定的方向余弦阈值
@@ -65,8 +69,29 @@ navigation:
   ship_lost_degrade_s: 3       # 自身位置丢失后进入降级模式的时间
   ship_lost_abandon_s: 10      # 自身位置丢失后放弃导航的时间
   route_end_action: wait       # waypoints 模式航线结束后行为：v1 仅支持 wait
-  full_map_rect: null          # 全屏地图归一化区域（v1 未实现）
-  full_map_toggle_key: full_map  # 全屏地图开关，对应 keys.yaml 动作名
+  # 全屏地图内容区（相对窗口客户区的归一化矩形；实现补充 10.1）。
+  # 标定依据：2026-10-30 实机 M 地图截图 211242.png / 211253.png（2559x1599，gitignored），
+  # 用 numpy/OpenCV 检测地图网格外边框：上边 y≈111.5、下边 y≈1399.5、左边 x 从顶部
+  # 656.7 收到底部 608.1、右边 x 从顶部 1902.0 展到底部 1950.5（截图坐标）；
+  # 归一化（按 2559x1599，2560x1600 客户区通用）后取外接矩形，不含网格字母/数字标签、
+  # 右侧教程面板；顶部比分栏是覆盖在地图上的 HUD，不改变内容区边界。
+  # 注意 1（待实机确认）：实机截图中全屏地图是“上窄下宽”的透视梯形，按矩形线性换算在
+  # 纵向有不超过内容区高度约 2%（≈24px）的残差；该假设（整图居中显示、不滚动/缩放）与
+  # 点击是否真的设置航向都必须实机验证，未验证前不得宣称已修复。
+  # 注意 2：顶部比分栏遮挡地图上缘；目标 v=1-own_y 通常 ≥0.05，代码另有边界内缩。
+  full_map_rect: [0.2376, 0.0698, 0.7622, 0.8752]
+  full_map_toggle_key: full_map  # 全屏地图开关，对应 keys.yaml 动作名（已有 full_map: m）
+  # M 全屏地图点选的时序与航向验证参数（默认值为初始假设，待实机确认；均可用配置调整）
+  full_map_open_wait_s: 1.0      # 按 M 后等待地图界面就绪（固定时序假设，非模板判断）
+  full_map_close_wait_s: 0.4     # 点击生效后等待再按 M 关图
+  full_map_verify_s: 8.0         # 关图后验证航向的观察窗口（自身标记位移或船速）
+  full_map_retry: 2              # 验证失败后的全屏地图重试次数（不含首次）；之后保留全屏图限频重试
+  autopilot_verify_min_move_px: 2.0   # 验证成功的最小自身标记位移（小地图内容区像素）
+  autopilot_verify_min_speed: 0.3     # 验证成功的最小船速（m/s）
+  # autopilot_verify_feature 仅表示识别到 HUD 激活提示，是辅助激活证据；
+  # 移动仍必须由关图后的新帧位移或船速满足阈值确认（该特征不能单独确认航向）。
+  autopilot_verify_feature: autopilot_indicator  # 辅助激活证据（null=只靠新帧位移/船速）
+
 
 behavior:
   camera_interval_s: [3, 15]           # 视角动作间隔范围（秒）
@@ -100,6 +125,10 @@ perception:
   template_scales: [0.95, 1.0, 1.05]   # 模板多尺度匹配的默认缩放
   feature_confirm_frames: 2            # 状态切换需要的连续命中帧数
   state_unknown_timeout_s: 2           # 连续无法识别状态后进入异常恢复的时间
+  # 截屏方式（2026-10-31 实机修复）：auto=无边框全屏且前台时优先桌面 DC 截屏
+  # （战舰世界实测窗口 BitBlt 黑屏、PrintWindow 返回冻结帧，导致装备页切换/战斗画面不更新）；
+  # window=旧行为（窗口 BitBlt → PrintWindow 兜底）；screen=强制桌面截屏（远程/特殊环境）
+  capture_method: auto
   orb_features_background: 2000        # 底图 ORB 特征数量
   orb_features_minimap: 1000           # 小地图 ORB 特征数量
   orb_ratio_test: 0.75                 # KNN Lowe 比例筛选
@@ -116,6 +145,12 @@ perception:
   map_refresh_inlier_gain: 0.20        # 刷新时新结果内点数需提升的相对比例
   map_refresh_translation_px: 5.0      # 刷新时新结果允许的平移差上限
   death:
+    # ISS-002（评审 10.2）：hp_zero 由感知层的“颜色无关血条填充列比例”推导
+    # （阈值/连续帧/TTL 在 profiles/<client>/profile.yaml 的 battle_hud 段：
+    #  hp_bar_empty_max_ratio / hp_bar_alive_min_ratio / hp_bar_confirm_frames /
+    #  hp_bar_evidence_ttl_s）。下面的权重/阈值只用于死亡投票与日志，
+    #  banner / hp_bar_absent / marker_lost / spectator_ui 不能单独授权提前退出；
+    #  提前退出的唯一授权是感知层 exit_authorized（血条区域有效+连续帧归零+证据新鲜）。
     weights:                           # 死亡信号权重（详细设计 5.9）
       hp_bar_absent: 0.35
       hp_zero: 0.25
@@ -124,9 +159,9 @@ perception:
       spectator_ui: 0.05
     score_threshold: 0.65              # 综合得分阈值（0.75 在 hp_zero 不可用时不可达）
     stable_s: 1.0                      # 综合判定稳定时间
-    strong_stable_s: 1.5               # 强信号直接判定的稳定时间
+    strong_stable_s: 1.5               # 强信号直接判定的稳定时间（只用于日志/统计）
     marker_lost_stable_s: 3.0          # 自身标记消失信号的稳定时间
-    ignore_start_s: 5.0                # 战斗开始后不判定死亡的时长
+    ignore_start_s: 5.0                # 战斗开始后不判定死亡的时长（也不授权退出）
     banner_latch_s: 5.0                # 死亡提示命中后的锁存时间（提示可能只显示数秒）
 
 input:
@@ -150,8 +185,67 @@ safety:
   restart_wait_s: 30                   # 自动重启前等待
   restart_max_attempts: 2              # 自动重启最大尝试次数
 
+overload:
+  # ===== 性能采样与过载保护（2026-10-31 确认阈值；无第三方依赖）=====
+  # 采样：ctypes 调 GetSystemTimes / GetPerformanceInfo(psapi) / GlobalMemoryStatusEx /
+  #       GetProcessMemoryInfo / GetProcessTimes / GetTickCount64 / QueryUnbiasedInterruptTime。
+  # 所有 MB 阈值语义 = max(下限, 比例 × 总量/上限)，16G/32G/64G 机器按同一相对口径预警。
+  # 判定窗口 1 Hz 采样、30/60/120s 滚动；有效覆盖率 <90% 不判定（样本缺失/首拍/越界丢弃）；
+  # 睡眠/挂起用 GetTickCount64−QueryUnbiasedInterruptTime 识别：清窗+宽限且不计迟到。
+  # 安全口径：CPU / 物理可用 / 心跳 / 帧龄 / 脚本内存只告警，绝不单独触发暂停或停止。
+  mode: monitor                 # off=关闭；monitor=只记录本应暂停/停止；pause_stop=先暂停、必要时停止；stop=直接停止
+  sample_hz: 1                  # 采样频率（1 Hz）
+  window_warn_s: 60             # W/T1 判定持续窗口（秒）
+  window_long_s: 120            # 长观察窗口（迟到事件统计）
+  window_stop_after_pause_s: 180  # 暂停后继续观察迟到事件的窗口
+  window_resume_s: 60           # 恢复条件观察窗口
+  min_coverage: 0.9             # 窗口有效样本覆盖率下限
+  # --- W 告警（只记录，不动作）---
+  cpu_warn_pct: 90              # 全机 CPU ≥ 该值持续 60s 告警
+  physical_warn_floor_mb: 2500  # 物理可用内存下限（MB）
+  physical_warn_limit_ratio: 0.08  # 物理可用内存 < 8% 总内存告警
+  commit_warn_floor_mb: 6000    # Commit 余量下限（MB）
+  commit_warn_limit_ratio: 0.12  # Commit 余量 < 12% Commit 上限告警
+  script_private_warn_floor_mb: 1024  # 脚本进程私有内存下限（MB）
+  script_private_baseline_ratio: 2.0   # 超过 2× 预热基线也告警
+  script_warmup_s: 120          # 启动预热窗口（秒），期间的进程内存峰值作为基线
+  # --- T1 暂停（可恢复，仅“脚本控制中”生效）---
+  commit_pause_floor_mb: 2000   # Commit 余量暂停下限（MB）
+  commit_pause_limit_ratio: 0.05   # Commit 余量 < 5% 上限
+  commit_pause_occupancy: 0.8   # 60s 窗口内低于暂停阈值的占比 ≥80%
+  # --- T2 停止（终态）---
+  commit_stop_floor_mb: 1200    # 已暂停后 Commit 余量停止下限（MB）
+  commit_stop_limit_ratio: 0.025   # 已暂停后 Commit 余量 < 2.5% 上限
+  commit_stop_window_s: 30      # 已暂停后停止判定窗口（秒）
+  commit_stop_occupancy: 0.9    # 30s 窗口内低于停止阈值的占比 ≥90%
+  commit_fast_stop_floor_mb: 400   # 快速停止 Commit 余量下限（MB）
+  commit_fast_stop_limit_ratio: 0.01  # 快速停止 Commit 余量 < 1% 上限
+  commit_fast_stop_sustained_s: 10    # 快速通道连续持续秒数
+  # --- 清醒采样迟到（系统卡顿/看门狗线程饿死）---
+  starvation_lateness_s: 2.5    # 清醒采样迟到阈值（实际间隔超出 1s 的部分）
+  starvation_pause_events: 3    # 120s 内迟到事件 ≥3 次 → 暂停
+  starvation_stop_events: 3     # 暂停后 180s 内迟到事件仍 ≥3 次 → 停止
+  starvation_window_s: 120      # 迟到事件统计窗口
+  starvation_stop_window_s: 180  # 暂停后迟到事件统计窗口
+  # --- 睡眠/挂起与系统时间跳变 ---
+  sleep_detect_s: 1.0           # 睡眠覆盖最小秒数（GTC64-QUT 偏移增量 ≥ 该值与迟到比例中的较大者）
+  sleep_cover_ratio: 0.5        # 睡眠覆盖判定：偏移增量 ≥ 0.5×当拍迟到也视为睡眠
+  sleep_grace_s: 120            # 睡眠/唤醒后宽限（秒），期间的迟到不计数、不判定暂停/恢复
+  clock_jump_s: 2               # 墙上时间与单调时间差 > 该值视为系统时间调整（清窗）
+  # --- 告警滞回与限频 ---
+  warn_clear_ratio: 0.8         # 退出告警需恢复幅度（上界 <阈值×0.8；下界 >阈值/0.8）
+  warn_clear_s: 60              # 满足退出条件需持续的秒数
+  warn_repeat_interval_s: 300   # 同类告警最多每 5 分钟一条
+  # --- 自动恢复 ---
+  pause_min_s: 60               # 暂停至少持续该秒数才允许自动恢复
+  resume_commit_ratio: 1.5      # Commit 余量 >1.5×暂停阈值才允许恢复
+  resume_occupancy: 0.9         # 恢复条件 60s 窗口占比 ≥90%
+  resume_quiet_s: 120           # 恢复前要求无迟到事件的窗口
+  auto_resume_max: 2            # 每个会话最多自动恢复次数（超过后交给人工）
+  auto_resume_repeat_window_s: 600  # 10 分钟内反复暂停则停止自动恢复
+
 session:
-  between_battle_s: [15, 60]           # 两场之间的随机等待
+  between_battle_s: [3, 10]            # 回港后两场之间随机等待 3～10 秒
   daily_battle_cap: 30                 # 每日场次上限（跨进程累计）
   allowed_hours: null                  # 允许运行的时段，例如 ["08:00", "23:00"]；null 表示不限
   max_consecutive_start_failures: 2    # 连续开局失败多少次后暂停
@@ -160,7 +254,7 @@ session:
 timeouts:
   queue_s: 600                         # 匹配排队
   loading_s: 300                       # 战斗加载
-  exit_menu_s: 5                       # 打开退出菜单
+  exit_menu_s: 8                       # 打开退出菜单（2026-10-31：死亡镜头期间 ESC 可能被吞，放宽到 8s）
   exit_confirm_s: 5                    # 退出确认框
   exit_s: 180                          # 退出到港口
   port_s: 180                          # 回港确认

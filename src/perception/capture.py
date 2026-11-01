@@ -10,6 +10,12 @@
 - 截屏后断言 ``image.shape == (client_rect.h, client_rect.w, 3)``，不一致直接视为
   ``CaptureUnavailable``；黑屏（灰度均值/方差接近 0）先尝试 ``PrintWindow`` 兜底，
   仍不可用则抛 ``CaptureUnavailable``，绝不把黑帧当有效画面返回。
+- **桌面 DC 截屏（2026-10-31 实机修复）**：部分无边框全屏游戏窗口的 ``BitBlt`` 恒黑、
+  ``PrintWindow`` 能出一帧却**冻结不更新**（战舰世界实测：切换装备页后仍返回旧港口画面）。
+  当客户区覆盖整个虚拟屏幕、游戏在前台时，优先用桌面 DC（``GetDC(0)``）按客户区位置
+  ``BitBlt``，得到与真实屏幕一致的画面；非全屏窗口仍走原窗口 BitBlt/PrintWindow 路径。
+  ``capture_method`` 可取 ``auto``（默认，全屏自动用桌面截屏）/``window``（旧行为）/
+  ``screen``（强制桌面截屏，供远程/特殊环境使用）。
 - 内存 DC / DIB 在窗口句柄和客户区尺寸不变时复用，尺寸变化时重建；每次截屏记录
   耗时，超过预算（默认 300 ms）写警告。
 
@@ -35,7 +41,7 @@ import numpy as np
 from ..common.clock import Clock, SystemClock
 from ..common.errors import CaptureUnavailable, WindowUnavailable
 from ..common.types import Rect, WindowInfo
-from ..common.window import is_dpi_aware, set_dpi_awareness
+from ..common.window import is_dpi_aware, set_dpi_awareness, virtual_screen_rect
 
 _IS_WINDOWS = sys.platform == "win32"
 _log = logging.getLogger(__name__)
@@ -54,6 +60,12 @@ CAPTUREBLT = 0x40000000
 DIB_RGB_COLORS = 0
 BI_RGB = 0
 PW_RENDERFULLCONTENT = 0x00000002
+#: 客户区覆盖虚拟屏幕的比例达到该值时，视为无边框全屏（可用桌面 DC 截屏）
+SCREEN_COVERAGE_RATIO = 0.95
+#: 客户区原点与虚拟屏幕原点允许的像素误差（DPI/窗口边框取整）
+SCREEN_ORIGIN_TOLERANCE_PX = 2
+#: 截屏方式：auto=全屏自动用桌面截屏；window=旧窗口 BitBlt/PrintWindow；screen=强制桌面截屏
+CAPTURE_METHODS: tuple[str, ...] = ("auto", "window", "screen")
 
 
 # ---------------------------------------------------------------------------
@@ -233,8 +245,31 @@ def frame_invalid_reason(
     return None
 
 
-def frame_is_valid(
-    image: np.ndarray | None,
+def is_fullscreen_client_rect(client_rect: Rect, virtual_rect: Rect) -> bool:
+    """客户区是否覆盖（几乎）整个虚拟屏幕：可安全改用桌面 DC 截屏。
+
+    判据：客户区与虚拟屏幕的交集面积占虚拟屏幕 ≥ ``SCREEN_COVERAGE_RATIO``，
+    且客户区原点与虚拟屏幕原点误差 ≤ ``SCREEN_ORIGIN_TOLERANCE_PX`` 像素。
+    这样多显示器下只占主屏的窗口不会被误判为全屏（避免截到其它显示器内容）。
+    """
+    if client_rect.w <= 0 or client_rect.h <= 0 or virtual_rect.w <= 0 or virtual_rect.h <= 0:
+        return False
+    if (
+        abs(client_rect.x - virtual_rect.x) > SCREEN_ORIGIN_TOLERANCE_PX
+        or abs(client_rect.y - virtual_rect.y) > SCREEN_ORIGIN_TOLERANCE_PX
+    ):
+        return False
+    left = max(client_rect.x, virtual_rect.x)
+    top = max(client_rect.y, virtual_rect.y)
+    right = min(client_rect.right, virtual_rect.right)
+    bottom = min(client_rect.bottom, virtual_rect.bottom)
+    if right <= left or bottom <= top:
+        return False
+    coverage = ((right - left) * (bottom - top)) / float(virtual_rect.w * virtual_rect.h)
+    return coverage >= SCREEN_COVERAGE_RATIO
+
+
+def frame_is_valid(image: np.ndarray | None,
     *,
     mean_threshold: float = DEFAULT_BLACK_MEAN_THRESHOLD,
     std_threshold: float = DEFAULT_BLACK_STD_THRESHOLD,
@@ -392,6 +427,25 @@ def _gdi_bitblt(dst_dc: int, width: int, height: int, src_dc: int) -> bool:
     return bool(ok)
 
 
+def _gdi_bitblt_from(
+    dst_dc: int, width: int, height: int, src_dc: int, src_x: int, src_y: int
+) -> bool:
+    """桌面 DC BitBlt：从源 DC 的 ``(src_x, src_y)`` 复制到目标 DC 左上角。"""
+    gdi32, _ = _load_win32()
+    ok = gdi32.BitBlt(
+        ctypes.c_void_p(int(dst_dc)),
+        0,
+        0,
+        int(width),
+        int(height),
+        ctypes.c_void_p(int(src_dc)),
+        int(src_x),
+        int(src_y),
+        SRCCOPY | CAPTUREBLT,
+    )
+    return bool(ok)
+
+
 def _gdi_print_window(hwnd: int, hdc: int) -> bool:
     _, user32 = _load_win32()
     return bool(user32.PrintWindow(wintypes.HWND(int(hwnd)), wintypes.HDC(int(hdc)), PW_RENDERFULLCONTENT))
@@ -406,6 +460,7 @@ class GdiFrameSource:
     """真实 GDI 截屏：``CreateDIBSection`` + ``BitBlt``，内存 DC/位图按尺寸复用。"""
 
     supports_print_window = True
+    supports_screen_capture = True
 
     def __init__(self, *, dpi_aware: bool = True) -> None:
         # 兜底声明 DPI 感知：main 一般已经声明，此处只记录实际生效模式
@@ -485,6 +540,26 @@ class GdiFrameSource:
             raise CaptureUnavailable("PrintWindow 失败")
         return dib_section_to_bgr(self._bits, rect.w, rect.h)
 
+    def grab_screen(self, rect: Rect) -> np.ndarray:
+        """桌面 DC 截屏：从屏幕 ``(rect.x, rect.y)`` 复制 ``rect.w × rect.h``。
+
+        用于无边框全屏游戏：窗口 BitBlt 黑屏且 PrintWindow 返回冻结帧时，
+        桌面 DC 得到的是真实屏幕内容。要求窗口覆盖整个屏幕且处于前台。
+        """
+        if rect.w <= 0 or rect.h <= 0:
+            raise CaptureUnavailable(f"客户区尺寸无效: {rect.w}x{rect.h}")
+        self._ensure_resources(0, rect)  # hwnd=0 表示桌面屏幕 DC
+        source_dc = _gdi_get_dc(0)
+        if not source_dc:
+            raise CaptureUnavailable("GetDC(桌面) 失败")
+        try:
+            ok = _gdi_bitblt_from(self._mem_dc, rect.w, rect.h, source_dc, rect.x, rect.y)
+        finally:
+            _gdi_release_dc(0, source_dc)
+        if not ok:
+            raise CaptureUnavailable("桌面 BitBlt 失败，无法复制屏幕画面")
+        return dib_section_to_bgr(self._bits, rect.w, rect.h)
+
     def _release(self) -> None:
         if self._mem_dc and self._old_bitmap:
             _gdi_select_object(self._mem_dc, self._old_bitmap)
@@ -552,9 +627,12 @@ class GdiCapture:
         black_mean_threshold: float = DEFAULT_BLACK_MEAN_THRESHOLD,
         black_std_threshold: float = DEFAULT_BLACK_STD_THRESHOLD,
         enable_print_window: bool = True,
+        capture_method: str = "auto",
         history_size: int = 240,
         perf_counter: Callable[[], float] | None = None,
     ) -> None:
+        if capture_method not in CAPTURE_METHODS:
+            raise ValueError(f"capture_method 必须是 {CAPTURE_METHODS} 之一，当前 {capture_method!r}")
         self._locator = locator
         self._clock = clock or SystemClock()
         self._source: FrameSource = source if source is not None else GdiFrameSource()
@@ -563,6 +641,7 @@ class GdiCapture:
         self._black_mean_threshold = float(black_mean_threshold)
         self._black_std_threshold = float(black_std_threshold)
         self._enable_print_window = bool(enable_print_window)
+        self._capture_method = str(capture_method)
         self._perf_counter = perf_counter or time.perf_counter
         self._durations: deque[float] = deque(maxlen=max(1, int(history_size)))
 
@@ -577,6 +656,9 @@ class GdiCapture:
         # 首次兜底成功后固定使用 PrintWindow，避免每帧先黑屏再兜底（省一半耗时、不刷日志）
         self._print_window_only = False
         self._print_window_notice_logged = False
+        # 无边框全屏下 PrintWindow 可能返回冻结帧（2026-10-31 实机）：桌面 DC 成功一次后固定使用
+        self._screen_only = False
+        self._screen_notice_logged = False
 
     # --- 查询 ---------------------------------------------------------
     @property
@@ -636,11 +718,24 @@ class GdiCapture:
 
     def _capture_once(self) -> Frame:
         hwnd, rect = self._resolve_window()
-        if self._print_window_only:
-            image = self._grab_print_window(hwnd, rect)
+        if self._capture_method == "screen" or self._screen_only:
+            image = self._grab_screen(rect)
+        elif self._capture_method == "auto" and self._screen_capture_eligible(rect):
+            # 无边框全屏 + 前台：优先桌面 DC 截屏。
+            # 实机发现窗口 BitBlt 可能返回“有效但冻结”的旧帧（不黑屏，无法靠画面校验识别），
+            # 因此不能等到黑屏后才兜底，必须优先用桌面画面。
+            try:
+                image = self._grab_screen(rect)
+            except CaptureUnavailable as exc:
+                _log.warning("桌面 DC 截屏不可用（%s），回退窗口 BitBlt/PrintWindow", exc)
+                image = self._capture_window(hwnd, rect)
+            else:
+                self._screen_only = True
+                if not self._screen_notice_logged:
+                    _log.info("无边框全屏：使用桌面 DC 截屏（画面与真实屏幕一致）")
+                    self._screen_notice_logged = True
         else:
-            image = self._source.grab(hwnd, rect)
-            image = self._validate_image(image, hwnd, rect)
+            image = self._capture_window(hwnd, rect)
         self._frame_id += 1
         frame = Frame(
             image=image,
@@ -650,6 +745,46 @@ class GdiCapture:
         )
         self._last_frame = frame
         return frame
+
+    def _capture_window(self, hwnd: int, rect: Rect) -> np.ndarray:
+        """旧路径：窗口 BitBlt，黑屏/无效时 PrintWindow 兜底。"""
+        if self._print_window_only:
+            return self._grab_print_window(hwnd, rect)
+        image = self._source.grab(hwnd, rect)
+        return self._validate_image(image, hwnd, rect)
+
+    def _grab_screen(self, rect: Rect) -> np.ndarray:
+        """桌面 DC 截屏 + 尺寸/画面校验；失败抛 ``CaptureUnavailable``。"""
+        fallback = getattr(self._source, "grab_screen", None) if self._capture_method != "window" else None
+        if not callable(fallback):
+            raise CaptureUnavailable("当前截屏源不支持桌面截屏")
+        recovered = fallback(rect)
+        expected = (rect.h, rect.w, 3)
+        if not isinstance(recovered, np.ndarray) or recovered.shape != expected:
+            raise CaptureUnavailable("桌面截屏返回的数据尺寸异常")
+        reason = frame_invalid_reason(
+            recovered,
+            mean_threshold=self._black_mean_threshold,
+            std_threshold=self._black_std_threshold,
+        )
+        if reason is not None:
+            raise CaptureUnavailable(f"桌面截屏画面不可用: {reason}")
+        return recovered
+
+    def _screen_capture_eligible(self, rect: Rect) -> bool:
+        """判断是否可改用桌面 DC 截屏（无边框全屏 + 前台）。"""
+        if self._capture_method == "window":
+            return False
+        if self._capture_method == "auto" and not self._require_foreground:
+            # 不要求前台时，桌面截屏可能抓到被遮挡的其它窗口，保持旧路径更安全
+            return False
+        if not callable(getattr(self._source, "grab_screen", None)):
+            return False
+        try:
+            virtual = virtual_screen_rect()
+        except WindowUnavailable:
+            return False
+        return is_fullscreen_client_rect(rect, virtual)
 
     def _grab_print_window(self, hwnd: int, rect: Rect) -> np.ndarray:
         """PrintWindow 固定模式：直接取图并校验，失败抛 CaptureUnavailable。"""
@@ -718,6 +853,21 @@ class GdiCapture:
         )
         if reason is None:
             return image
+        # 无边框全屏优先尝试桌面 DC 截屏：窗口 BitBlt 黑屏且 PrintWindow 可能返回冻结帧
+        if self._screen_capture_eligible(rect):
+            try:
+                recovered = self._grab_screen(rect)
+            except CaptureUnavailable as screen_exc:
+                _log.debug("桌面 DC 截屏不可用（%s），继续 PrintWindow 兜底", screen_exc)
+            else:
+                self._screen_only = True
+                if not self._screen_notice_logged:
+                    _log.info(
+                        "窗口 BitBlt 不可用（%s），改用桌面 DC 截屏（无边框全屏，画面与屏幕一致）",
+                        reason,
+                    )
+                    self._screen_notice_logged = True
+                return recovered
         if self._print_window_notice_logged:
             _log.debug("GDI 截屏仍不可用（%s），继续使用 PrintWindow", reason)
         else:

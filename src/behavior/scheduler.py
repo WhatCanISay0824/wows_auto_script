@@ -198,6 +198,20 @@ class BehaviorScheduler:
 
         return actions
 
+    def resume(self, now: float) -> None:
+        """同场恢复：重新安排下一次动作，保留本场随机流和消耗品计数。"""
+        if self._profile is None:
+            return
+        self._running = True
+        self._stopped = False
+        self._quiet_until = now
+        self._next_camera = now + self._sample_camera_interval()
+        self._next_attack = now + self._sample_attack_interval()
+        self._watchdog_deferred_until = 0.0
+        self._last_activity = now
+        self._emit("behavior_resume", now, next_camera_at=round(self._next_camera, 2),
+                   next_attack_at=round(self._next_attack, 2), consumables_used=self._consumables_used)
+
     def notify_activity(self, now: float) -> None:
         """外部活动（例如导航点击）刷新看门狗计时。"""
         self._touch(now)

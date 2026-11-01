@@ -53,6 +53,7 @@ from .models import (
     MapPack,
     MinimapConfig,
     NavigationConfig,
+    OverloadConfig,
     PathsConfig,
     PerceptionConfig,
     Route,
@@ -117,6 +118,11 @@ FORBIDDEN_ACCOUNT_KEY_PARTS: tuple[str, ...] = (
     "验证码",
     "密码",
     "令牌",
+)
+# 过载保护配置（config.yaml overload 段）：未知键按 error 处理，避免拼写错误被静默忽略
+OVERLOAD_KEYS: frozenset[str] = frozenset(item.name for item in fields(OverloadConfig))
+OVERLOAD_INT_FIELDS: frozenset[str] = frozenset(
+    {"starvation_pause_events", "starvation_stop_events", "auto_resume_max"}
 )
 
 IssueSink = list[ValidationIssue]
@@ -739,6 +745,55 @@ def load_global(
             collected,
             nav_loc,
         ),
+        full_map_open_wait_s=_float_value(
+            navigation_raw,
+            "full_map_open_wait_s",
+            defaults.navigation.full_map_open_wait_s,
+            collected,
+            nav_loc,
+        ),
+        full_map_close_wait_s=_float_value(
+            navigation_raw,
+            "full_map_close_wait_s",
+            defaults.navigation.full_map_close_wait_s,
+            collected,
+            nav_loc,
+        ),
+        full_map_verify_s=_float_value(
+            navigation_raw,
+            "full_map_verify_s",
+            defaults.navigation.full_map_verify_s,
+            collected,
+            nav_loc,
+        ),
+        full_map_retry=_int_value(
+            navigation_raw,
+            "full_map_retry",
+            defaults.navigation.full_map_retry,
+            collected,
+            nav_loc,
+        ),
+        autopilot_verify_min_move_px=_float_value(
+            navigation_raw,
+            "autopilot_verify_min_move_px",
+            defaults.navigation.autopilot_verify_min_move_px,
+            collected,
+            nav_loc,
+        ),
+        autopilot_verify_min_speed=_float_value(
+            navigation_raw,
+            "autopilot_verify_min_speed",
+            defaults.navigation.autopilot_verify_min_speed,
+            collected,
+            nav_loc,
+        ),
+        autopilot_verify_feature=_opt_str(
+            navigation_raw,
+            "autopilot_verify_feature",
+            defaults.navigation.autopilot_verify_feature,
+            collected,
+            nav_loc,
+        ),
     )
 
     behavior_raw = section("behavior")
@@ -885,6 +940,37 @@ def load_global(
             safety_raw, "restart_max_attempts", defaults.safety.restart_max_attempts, collected, safe_loc
         ),
     )
+
+    # --- 过载保护（config.yaml overload 段；未知键 error） -------------------
+    overload_raw = section("overload")
+    ol_loc = f"{label}: overload"
+    unknown_overload = sorted(set(overload_raw) - OVERLOAD_KEYS)
+    for key in unknown_overload:
+        _error(
+            collected,
+            "unknown_key",
+            f"{ol_loc}.{key}",
+            f"overload 段存在未知配置键 {key!r}（允许: {', '.join(sorted(OVERLOAD_KEYS))}）",
+        )
+    overload_values: dict[str, Any] = {}
+    for item in fields(OverloadConfig):
+        if item.name == "mode":
+            overload_values["mode"] = _str_value(
+                overload_raw, "mode", defaults.overload.mode, collected, ol_loc
+            )
+        elif item.name in OVERLOAD_INT_FIELDS:
+            overload_values[item.name] = _int_value(
+                overload_raw, item.name, int(getattr(defaults.overload, item.name)), collected, ol_loc
+            )
+        else:
+            overload_values[item.name] = _float_value(
+                overload_raw,
+                item.name,
+                float(getattr(defaults.overload, item.name)),
+                collected,
+                ol_loc,
+            )
+    overload = OverloadConfig(**overload_values)
 
     session_raw = section("session")
     sess_loc = f"{label}: session"
@@ -1033,6 +1119,13 @@ def load_global(
             collected,
             per_loc,
         ),
+        capture_method=_str_value(
+            perception_raw,
+            "capture_method",
+            defaults.perception.capture_method,
+            collected,
+            per_loc,
+        ),
         orb_features_background=_int_value(
             perception_raw,
             "orb_features_background",
@@ -1158,6 +1251,7 @@ def load_global(
         ship=ship_config,
         safety=safety,
         session=session,
+        overload=overload,
         timeouts=timeouts,
         input=input_config,
         logging=logging_config,
@@ -1469,11 +1563,30 @@ def load_profile(
         hp_fill_hsv_lower=_int_triple(battle_hud_raw, "hp_fill_hsv_lower", None, collected, hud_loc),
         hp_fill_hsv_upper=_int_triple(battle_hud_raw, "hp_fill_hsv_upper", None, collected, hud_loc),
         hp_fill_zero_ratio=_float_value(battle_hud_raw, "hp_fill_zero_ratio", 0.03, collected, hud_loc),
+        # ISS-002（评审 10.2）：颜色无关的血条填充列比例判定与退出授权参数
+        hp_bar_empty_max_ratio=_float_value(
+            battle_hud_raw, "hp_bar_empty_max_ratio", 0.02, collected, hud_loc
+        ),
+        hp_bar_alive_min_ratio=_float_value(
+            battle_hud_raw, "hp_bar_alive_min_ratio", 0.10, collected, hud_loc
+        ),
+        hp_bar_confirm_frames=_int_value(
+            battle_hud_raw, "hp_bar_confirm_frames", 2, collected, hud_loc
+        ),
+        hp_bar_evidence_ttl_s=_float_value(
+            battle_hud_raw, "hp_bar_evidence_ttl_s", 1.0, collected, hud_loc
+        ),
         spectator_features=_str_list(battle_hud_raw, "spectator_features", (), collected, hud_loc),
         death_banner_feature=_str_value(
             battle_hud_raw, "death_banner_feature", "death_banner", collected, hud_loc
         ),
         result_feature=_str_value(battle_hud_raw, "result_feature", "battle_results", collected, hud_loc),
+        result_continue_feature=_opt_str(
+            battle_hud_raw, "result_continue_feature", None, collected, hud_loc
+        ),
+        result_return_feature=_opt_str(
+            battle_hud_raw, "result_return_feature", "result_return_port_button", collected, hud_loc
+        ),
     )
 
     camera_raw = _section(raw, "camera", collected, label)
@@ -1662,6 +1775,20 @@ def load_ship(
     card_path = resolve_path(card_template, ship_dir) if card_template else None
     hp_bar_template = _opt_str(raw, "hp_bar_template", None, collected, label)
     hp_bar_path = resolve_path(hp_bar_template, ship_dir) if hp_bar_template else None
+    card_search_region = _normalized_rect(raw, "card_search_region", None, collected, label)
+    # 已选中证据（ISS-007）：selected_feature 是目标船选中态模板文件名（含选中高亮/边框）；
+    # 搜索区域缺省回退 card_search_region。模板缺失时 selected_path=None，运行期保守失败。
+    selected_feature = _opt_str(raw, "selected_feature", None, collected, label)
+    selected_template_path = resolve_path(selected_feature, ship_dir) if selected_feature else None
+    selected_region = _normalized_rect(raw, "selected_region", None, collected, label)
+    if selected_region is None:
+        selected_region = card_search_region
+    # 右侧详情面板船名模板（ISS-007 实机补充 2026-10-31）：与选中态模板互为兜底
+    selected_name_feature = _opt_str(raw, "selected_name_feature", None, collected, label)
+    selected_name_template_path = (
+        resolve_path(selected_name_feature, ship_dir) if selected_name_feature else None
+    )
+    selected_name_region = _normalized_rect(raw, "selected_name_region", None, collected, label)
     loadout_slots_raw = raw.get("loadout_slots")
     slots: list[LoadoutSlotDef] = []
     if loadout_slots_raw is None:
@@ -1700,17 +1827,43 @@ def load_ship(
         ship_id=_str_value(raw, "ship_id", "", collected, label),
         display_name=_str_value(raw, "display_name", "", collected, label),
         card_template=card_template,
-        card_search_region=_normalized_rect(raw, "card_search_region", None, collected, label),
+        card_search_region=card_search_region,
+        selected_feature=selected_feature,
+        selected_region=selected_region,
+        selected_threshold=_float_value(raw, "selected_threshold", 0.78, collected, label),
+        selected_name_feature=selected_name_feature,
+        selected_name_region=selected_name_region,
+        selected_name_threshold=_float_value(raw, "selected_name_threshold", 0.78, collected, label),
         hp_bar_template=hp_bar_template,
         loadout_preset_feature=_opt_str(raw, "loadout_preset_feature", None, collected, label),
         loadout_slots=tuple(slots),
         max_scrolls=_int_value(raw, "max_scrolls", 20, collected, label),
         scroll_direction=_str_value(raw, "scroll_direction", "down", collected, label),
         scroll_clicks=_int_value(raw, "scroll_clicks", 1, collected, label),
+        cover_list_start=_bool_value(raw, "cover_list_start", True, collected, label),
+        max_position_scrolls=_int_value(raw, "max_position_scrolls", 10, collected, label),
+        scroll_settle_s=_float_value(raw, "scroll_settle_s", 0.4, collected, label),
+        confirm_frames=_int_value(raw, "confirm_frames", 2, collected, label),
+        confirm_timeout_s=_float_value(raw, "confirm_timeout_s", 3.0, collected, label),
+        max_click_attempts=_int_value(raw, "max_click_attempts", 2, collected, label),
+        endpoint_stable_scrolls=_int_value(raw, "endpoint_stable_scrolls", 2, collected, label),
+        endpoint_diff_ratio=_float_value(raw, "endpoint_diff_ratio", 0.02, collected, label),
+        candidate_merge_px=_int_value(raw, "candidate_merge_px", 8, collected, label),
+        selection_timeout_s=_float_value(raw, "selection_timeout_s", 60.0, collected, label),
         notes=_str_value(raw, "notes", "", collected, label),
         ship_dir=ship_dir,
         card_path=card_path if card_path is not None and card_path.is_file() else None,
         hp_bar_path=hp_bar_path if hp_bar_path is not None and hp_bar_path.is_file() else None,
+        selected_path=(
+            selected_template_path
+            if selected_template_path is not None and selected_template_path.is_file()
+            else None
+        ),
+        selected_name_path=(
+            selected_name_template_path
+            if selected_name_template_path is not None and selected_name_template_path.is_file()
+            else None
+        ),
     )
 
 

@@ -17,7 +17,7 @@ from src.config.loader import (
     load_ship,
     probe_png_size,
 )
-from src.config.validate import validate_app
+from src.config.validate import validate_app, validate_project
 
 from tests.fixtures.configs import builder as fx
 
@@ -105,7 +105,7 @@ def test_load_profile_real_cn360(project_root: Path) -> None:
     assert profile.client_id == "cn360"
     assert profile.display_name
     assert profile.reference_resolution == (2560, 1600)
-    assert len(profile.features) == 17
+    assert len(profile.features) == 19  # 18 个界面模板 + 2026-10-31 新增 result_continue_battle_button
     # 2026-10-30 实机截图已全部提取（含退出菜单/确认框/装备页/标签页）
     assert all(feature.template_path is not None for feature in profile.features.values())
     assert profile.battle_hud.spectator_features == ()
@@ -118,16 +118,21 @@ def test_load_profile_real_cn360(project_root: Path) -> None:
     assert feature.region.to_list() == [0.40, 0.0, 0.56, 0.06]
     assert profile.minimap is not None
     assert profile.minimap.marker_template == "marker/marker.png"
-    assert profile.minimap.rect.to_list() == [0.798, 0.677, 0.999, 0.994]
+    assert profile.minimap.rect.to_list() == [0.853125, 0.765, 1.0, 1.0]
     assert profile.minimap.marker_hsv_lower == (0, 0, 200)
     assert profile.battle_hud.hp_fill_zero_ratio == 0.05
     assert profile.exit.menu_key == "escape"
     assert profile.exit.confirm_feature == "exit_confirm_yes"
     assert len(profile.start_sequence) == 4
     assert len(profile.start_sequence_full) == 3
-    assert len(profile.result_sequence) == 2
+    # 2026-10-31：结算页不再固定点“回到港口”，由状态机按“继续战斗优先”选择按钮
+    assert len(profile.result_sequence) == 1
+    assert profile.result_sequence[0].feature == "battle_results"
+    assert profile.battle_hud.result_continue_feature == "result_continue_battle_button"
+    assert profile.battle_hud.result_return_feature == "result_return_port_button"
     assert profile.ship_selection_sequence == ()
-    assert len(profile.ship_check_sequence) == 2
+    # 2026-10-31 用户确认：取消装备页/信号旗/加成卡检测
+    assert profile.ship_check_sequence == ()
     assert profile.loadout_verify_features == ()
     assert profile.state_features["PORT"][0] == "port_indicator"
     assert profile.profile_dir == project_root / "profiles" / "cn360"
@@ -164,7 +169,7 @@ def test_load_ship_real(project_root: Path) -> None:
     assert ship.scroll_direction == "down"
     assert ship.scroll_clicks == 2
     assert ship.max_scrolls == 20
-    assert ship.loadout_slots == ()  # 信号旗校验改由 profile.ship_check_sequence 完成
+    assert ship.loadout_slots == ()  # 2026-10-31 起不再校验装备/信号旗
     assert ship.ship_dir == path.parent
 
 
@@ -343,3 +348,114 @@ def test_map_pack_orientation_and_background(tmp_path: Path) -> None:
     image_x, image_y = transform.world_to_image(0.0, 0.0)
     assert 20 <= image_x <= 780
     assert 20 <= image_y <= 780
+
+
+# ---------------------------------------------------------------------------
+# 过载保护（overload 段；未知键 error、缺省用模型默认值）
+# ---------------------------------------------------------------------------
+
+
+def test_load_global_overload_from_real_config(project_root: Path) -> None:
+    issues: list = []
+    config = load_global(project_root / "config.yaml", project_root=project_root, issues=issues)
+    assert issues == []
+    overload = config.overload
+    assert overload.mode == "monitor"
+    assert overload.sample_hz == 1.0
+    assert overload.cpu_warn_pct == 90.0
+    assert overload.physical_warn_floor_mb == 2500.0
+    assert overload.physical_warn_limit_ratio == 0.08
+    assert overload.commit_warn_floor_mb == 6000.0
+    assert overload.commit_warn_limit_ratio == 0.12
+    assert overload.commit_pause_floor_mb == 2000.0
+    assert overload.commit_pause_limit_ratio == 0.05
+    assert overload.commit_pause_occupancy == 0.8
+    assert overload.commit_stop_floor_mb == 1200.0
+    assert overload.commit_stop_limit_ratio == 0.025
+    assert overload.commit_stop_window_s == 30.0
+    assert overload.commit_stop_occupancy == 0.9
+    assert overload.commit_fast_stop_floor_mb == 400.0
+    assert overload.commit_fast_stop_limit_ratio == 0.01
+    assert overload.commit_fast_stop_sustained_s == 10.0
+    assert overload.starvation_lateness_s == 2.5
+    assert overload.starvation_pause_events == 3
+    assert overload.starvation_stop_events == 3
+    assert overload.script_private_warn_floor_mb == 1024.0
+    assert overload.script_private_baseline_ratio == 2.0
+    assert overload.sleep_detect_s == 1.0
+    assert overload.sleep_cover_ratio == 0.5
+    assert overload.sleep_grace_s == 120.0
+    assert overload.clock_jump_s == 2.0
+    assert overload.auto_resume_max == 2
+    assert overload.auto_resume_repeat_window_s == 600.0
+
+
+def test_load_global_overload_defaults_when_section_missing(tmp_path: Path) -> None:
+    fx.write_yaml(tmp_path / "config.yaml", {"runtime": {"loop_hz": 10}})
+    issues: list = []
+    config = load_global(tmp_path / "config.yaml", project_root=tmp_path, issues=issues)
+    assert issues == []
+    assert config.overload.mode == "monitor"
+    assert config.overload.commit_pause_floor_mb == 2000.0
+
+
+def test_load_global_overload_overrides(tmp_path: Path) -> None:
+    fx.write_yaml(
+        tmp_path / "config.yaml",
+        {
+            "overload": {
+                "mode": "pause_stop",
+                "sample_hz": 2,
+                "commit_pause_floor_mb": 3000,
+                "commit_pause_limit_ratio": 0.06,
+                "auto_resume_max": 1,
+                "starvation_pause_events": 5,
+            }
+        },
+    )
+    issues: list = []
+    config = load_global(tmp_path / "config.yaml", project_root=tmp_path, issues=issues)
+    assert issues == []
+    overload = config.overload
+    assert overload.mode == "pause_stop"
+    assert overload.sample_hz == 2.0
+    assert overload.commit_pause_floor_mb == 3000.0
+    assert overload.commit_pause_limit_ratio == 0.06
+    assert overload.auto_resume_max == 1
+    assert overload.starvation_pause_events == 5
+
+
+def test_load_global_overload_unknown_key_is_error(tmp_path: Path) -> None:
+    fx.write_yaml(
+        tmp_path / "config.yaml",
+        {"overload": {"mode": "monitor", "commit_pause_floor": 1234}},
+    )
+    issues: list = []
+    config = load_global(tmp_path / "config.yaml", project_root=tmp_path, issues=issues)
+    unknown = [issue for issue in issues if issue.code == "unknown_key"]
+    assert len(unknown) == 1
+    assert "overload.commit_pause_floor" in unknown[0].location
+    assert config.overload.commit_pause_floor_mb == 2000.0  # 未知键不影响默认值
+
+
+def test_load_global_overload_type_errors_fall_back(tmp_path: Path) -> None:
+    fx.write_yaml(
+        tmp_path / "config.yaml",
+        {"overload": {"mode": 3, "sample_hz": "fast", "auto_resume_max": 1.5}},
+    )
+    issues: list = []
+    config = load_global(tmp_path / "config.yaml", project_root=tmp_path, issues=issues)
+    codes = {issue.code for issue in issues}
+    assert "type" in codes
+    assert config.overload.mode == "monitor"
+    assert config.overload.sample_hz == 1.0
+    assert config.overload.auto_resume_max == 2
+
+
+def test_overload_unknown_key_fails_validate_project(tmp_path: Path) -> None:
+    """validate_project 会收集 loader 的 unknown_key，作为 error 阻止启动。"""
+    project = fx.build_valid_project(tmp_path)
+    fx.edit_yaml_file(tmp_path / "config.yaml", "overload.mode", "monitor")
+    fx.edit_yaml_file(tmp_path / "config.yaml", "overload.commit_pause_floor", 1234)
+    report = validate_project(tmp_path, project.client_id)
+    assert any(issue.code == "unknown_key" for issue in report.errors)

@@ -37,6 +37,7 @@ from .loader import (
     relative_label,
 )
 from .models import (
+    OVERLOAD_MODES,
     AccountsConfig,
     AppConfig,
     BehaviorConfig,
@@ -46,6 +47,7 @@ from .models import (
     KeyMap,
     MapPack,
     NavigationConfig,
+    OverloadConfig,
     PerceptionConfig,
     ShipProfile,
     StepDef,
@@ -279,13 +281,28 @@ def validate_global_config(config: GlobalConfig) -> list[ValidationIssue]:
                     _loc(location, f"navigation.autopilot_offset[{index}]"),
                     "目标偏移应在 -1～1（相对小地图内容区）",
                 )
-    if nav.surface != "minimap":
+    if nav.surface not in ("minimap", "full_map"):
         _error(
             issues,
-            "unsupported",
+            "enum",
             _loc(location, "navigation.surface"),
-            f"v1 只支持 minimap 导航，full_map 未实现（当前 {nav.surface!r}）",
+            f"未知点击面 {nav.surface!r}（minimap / full_map）",
         )
+    elif nav.surface == "full_map":
+        if nav.mode == "waypoints":
+            _error(
+                issues,
+                "dependency",
+                _loc(location, "navigation.surface"),
+                "waypoints 模式只支持 surface=minimap；full_map 仅用于 autopilot（实现补充 10.1）",
+            )
+        if nav.full_map_rect is None:
+            _error(
+                issues,
+                "missing",
+                _loc(location, "navigation.full_map_rect"),
+                "surface=full_map 时必须配置全屏地图内容区矩形 navigation.full_map_rect",
+            )
     if nav.route_end_action != "wait":
         _error(
             issues,
@@ -322,6 +339,9 @@ def validate_global_config(config: GlobalConfig) -> list[ValidationIssue]:
     _check_int_non_negative(
         issues, safety.restart_max_attempts, _loc(location, "safety.restart_max_attempts"), "重启次数"
     )
+
+    # --- overload（性能采样与过载保护） ---
+    _validate_overload(issues, config.overload, location)
 
     # --- session ---
     session = config.session
@@ -408,6 +428,132 @@ def validate_global_config(config: GlobalConfig) -> list[ValidationIssue]:
     return issues
 
 
+def _validate_overload(issues: list[ValidationIssue], overload: OverloadConfig, location: str) -> None:
+    """过载保护参数范围与单调性校验（阈值全部来自配置，禁止把停止阈值配得比告警还宽）。"""
+
+    def loc(name: str) -> str:
+        return _loc(location, f"overload.{name}")
+
+    if overload.mode not in OVERLOAD_MODES:
+        _error(
+            issues,
+            "enum",
+            loc("mode"),
+            f"未知过载保护模式 {overload.mode!r}（允许 {sorted(OVERLOAD_MODES)}）",
+        )
+    if not 0.2 <= overload.sample_hz <= 10.0:
+        _error(issues, "range", loc("sample_hz"), f"采样频率应在 0.2～10 Hz，当前 {overload.sample_hz}")
+    if not 0.0 < overload.cpu_warn_pct <= 100.0:
+        _error(issues, "range", loc("cpu_warn_pct"), f"CPU 告警阈值应在 (0, 100]，当前 {overload.cpu_warn_pct}")
+
+    for name in (
+        "physical_warn_floor_mb",
+        "commit_warn_floor_mb",
+        "commit_pause_floor_mb",
+        "commit_stop_floor_mb",
+        "commit_fast_stop_floor_mb",
+        "script_private_warn_floor_mb",
+        "window_warn_s",
+        "window_long_s",
+        "window_stop_after_pause_s",
+        "window_resume_s",
+        "commit_stop_window_s",
+        "commit_fast_stop_sustained_s",
+        "starvation_lateness_s",
+        "sleep_detect_s",
+        "sleep_grace_s",
+        "clock_jump_s",
+        "warn_clear_s",
+        "warn_repeat_interval_s",
+        "pause_min_s",
+        "script_warmup_s",
+        "auto_resume_repeat_window_s",
+    ):
+        _check_positive(issues, float(getattr(overload, name)), loc(name), name)
+
+    for name in (
+        "physical_warn_limit_ratio",
+        "commit_warn_limit_ratio",
+        "commit_pause_limit_ratio",
+        "commit_stop_limit_ratio",
+        "commit_fast_stop_limit_ratio",
+        "min_coverage",
+        "commit_pause_occupancy",
+        "commit_stop_occupancy",
+        "warn_clear_ratio",
+        "resume_occupancy",
+        "sleep_cover_ratio",
+    ):
+        _check_probability(issues, float(getattr(overload, name)), loc(name), name)
+
+    if overload.script_private_baseline_ratio <= 1.0:
+        _error(
+            issues,
+            "range",
+            loc("script_private_baseline_ratio"),
+            f"脚本内存基线倍数必须大于 1，当前 {overload.script_private_baseline_ratio}",
+        )
+    if overload.resume_commit_ratio <= 1.0:
+        _error(
+            issues,
+            "range",
+            loc("resume_commit_ratio"),
+            f"恢复 Commit 倍数必须大于 1（相对暂停阈值），当前 {overload.resume_commit_ratio}",
+        )
+    if overload.starvation_pause_events < 1:
+        _error(issues, "range", loc("starvation_pause_events"), "迟到暂停事件数必须 ≥1")
+    if overload.starvation_stop_events < 1:
+        _error(issues, "range", loc("starvation_stop_events"), "迟到停止事件数必须 ≥1")
+    if overload.auto_resume_max < 0:
+        _error(issues, "range", loc("auto_resume_max"), "自动恢复次数不能为负")
+
+    # 阈值必须逐级收紧：快速停止 < 停止 < 暂停 < 告警（余量下限）
+    ordered_floors = (
+        ("commit_fast_stop_floor_mb", overload.commit_fast_stop_floor_mb),
+        ("commit_stop_floor_mb", overload.commit_stop_floor_mb),
+        ("commit_pause_floor_mb", overload.commit_pause_floor_mb),
+        ("commit_warn_floor_mb", overload.commit_warn_floor_mb),
+    )
+    ordered_ratios = (
+        ("commit_fast_stop_limit_ratio", overload.commit_fast_stop_limit_ratio),
+        ("commit_stop_limit_ratio", overload.commit_stop_limit_ratio),
+        ("commit_pause_limit_ratio", overload.commit_pause_limit_ratio),
+        ("commit_warn_limit_ratio", overload.commit_warn_limit_ratio),
+    )
+    for ordered, label in ((ordered_floors, "Commit 余量下限"), (ordered_ratios, "Commit 上限比例")):
+        for (lower_name, lower), (upper_name, upper) in zip(ordered, ordered[1:], strict=False):
+            if not (0.0 <= lower < upper):
+                _error(
+                    issues,
+                    "range",
+                    loc(lower_name),
+                    f"{label}必须逐级收紧：{lower_name}={lower} 应小于 {upper_name}={upper}",
+                )
+    if overload.commit_fast_stop_limit_ratio >= 1.0 or overload.commit_warn_limit_ratio >= 1.0:
+        _error(issues, "range", loc("commit_warn_limit_ratio"), "Commit 比例阈值必须小于 1")
+
+    if overload.window_long_s < overload.window_warn_s:
+        _error(issues, "range", loc("window_long_s"), "长窗口不能短于告警窗口")
+    if overload.window_stop_after_pause_s < overload.starvation_stop_window_s:
+        _error(
+            issues,
+            "range",
+            loc("window_stop_after_pause_s"),
+            "暂停后停止观察窗口不能短于迟到停止窗口",
+        )
+    if overload.commit_stop_window_s >= overload.window_warn_s:
+        _error(issues, "range", loc("commit_stop_window_s"), "Commit 停止窗口应短于暂停/告警窗口")
+    if overload.commit_fast_stop_sustained_s >= overload.commit_stop_window_s:
+        _error(
+            issues,
+            "range",
+            loc("commit_fast_stop_sustained_s"),
+            "快速停止持续时间应短于 Commit 停止窗口",
+        )
+    if overload.warn_clear_s > overload.window_long_s:
+        _error(issues, "range", loc("warn_clear_s"), "告警退出持续时间不能超过长窗口")
+
+
 def _validate_navigation(issues: list[ValidationIssue], nav: NavigationConfig, location: str) -> None:
     def loc(name: str) -> str:
         return _loc(location, f"navigation.{name}")
@@ -441,6 +587,25 @@ def _validate_navigation(issues: list[ValidationIssue], nav: NavigationConfig, l
         )
     if not nav.full_map_toggle_key:
         _error(issues, "missing", loc("full_map_toggle_key"), "全屏地图开关动作名不能为空")
+    # ISS-001：M 全屏地图点选时序与验证参数（实现补充 10.1）
+    _check_non_negative(issues, nav.full_map_open_wait_s, loc("full_map_open_wait_s"), "全屏地图开图等待")
+    _check_non_negative(issues, nav.full_map_close_wait_s, loc("full_map_close_wait_s"), "全屏地图关图等待")
+    _check_positive(issues, nav.full_map_verify_s, loc("full_map_verify_s"), "航向验证窗口")
+    _check_int_non_negative(issues, nav.full_map_retry, loc("full_map_retry"), "全屏地图重试次数")
+    _check_positive(
+        issues,
+        nav.autopilot_verify_min_move_px,
+        loc("autopilot_verify_min_move_px"),
+        "航向验证最小位移",
+    )
+    _check_positive(
+        issues,
+        nav.autopilot_verify_min_speed,
+        loc("autopilot_verify_min_speed"),
+        "航向验证最小船速",
+    )
+    if nav.autopilot_verify_feature is not None and not nav.autopilot_verify_feature.strip():
+        _error(issues, "missing", loc("autopilot_verify_feature"), "航向验证特征名不能为空字符串（null 表示不用特征）")
 
 
 def _validate_behavior(issues: list[ValidationIssue], behavior: BehaviorConfig, location: str) -> None:
@@ -512,6 +677,13 @@ def _validate_perception(
         issues, perception.feature_confirm_frames, loc("feature_confirm_frames"), "状态确认帧数"
     )
     _check_positive(issues, perception.state_unknown_timeout_s, loc("state_unknown_timeout_s"), "状态未知超时")
+    if perception.capture_method not in ("auto", "window", "screen"):
+        _error(
+            issues,
+            "enum",
+            loc("capture_method"),
+            f"未知截屏方式 {perception.capture_method!r}（auto / window / screen）",
+        )
     _check_int_positive(issues, perception.orb_features_background, loc("orb_features_background"), "底图特征数")
     _check_int_positive(issues, perception.orb_features_minimap, loc("orb_features_minimap"), "小地图特征数")
     if not 0.0 < perception.orb_ratio_test < 1.0:
@@ -880,6 +1052,27 @@ def validate_profile(
         _warn(issues, "missing", f"{hud_loc}.hp_bar_region", "未配置己方血条区域，死亡判定缺少血条信号")
     _validate_hsv_pair(issues, hud.hp_fill_hsv_lower, hud.hp_fill_hsv_upper, f"{hud_loc}.hp_fill_hsv", required=False)
     _check_probability(issues, hud.hp_fill_zero_ratio, f"{hud_loc}.hp_fill_zero_ratio", "血条填充比例阈值")
+    # ISS-002（评审 10.2）：颜色无关填充列比例的空条/存活阈值与退出授权参数
+    _check_probability(
+        issues, hud.hp_bar_empty_max_ratio, f"{hud_loc}.hp_bar_empty_max_ratio", "空条填充比例上限"
+    )
+    _check_probability(
+        issues, hud.hp_bar_alive_min_ratio, f"{hud_loc}.hp_bar_alive_min_ratio", "存活填充比例下限"
+    )
+    if hud.hp_bar_empty_max_ratio >= hud.hp_bar_alive_min_ratio:
+        _error(
+            issues,
+            "range",
+            f"{hud_loc}.hp_bar_alive_min_ratio",
+            "存活下限必须大于空条上限："
+            f"{hud.hp_bar_alive_min_ratio} <= {hud.hp_bar_empty_max_ratio}",
+        )
+    _check_int_positive(
+        issues, hud.hp_bar_confirm_frames, f"{hud_loc}.hp_bar_confirm_frames", "血条归零确认帧数"
+    )
+    _check_positive(
+        issues, hud.hp_bar_evidence_ttl_s, f"{hud_loc}.hp_bar_evidence_ttl_s", "血条归零证据有效期"
+    )
     for feature_id in hud.spectator_features:
         if feature_id not in known_features and feature_id not in runtime_features:
             _error(
@@ -891,8 +1084,10 @@ def validate_profile(
     for name, value in (
         ("death_banner_feature", hud.death_banner_feature),
         ("result_feature", hud.result_feature),
+        ("result_continue_feature", hud.result_continue_feature),
+        ("result_return_feature", hud.result_return_feature),
     ):
-        if value not in known_features and value not in runtime_features:
+        if value and value not in known_features and value not in runtime_features:
             _error(issues, "unknown_feature", f"{hud_loc}.{name}", f"引用的界面特征不存在: {value}")
 
     # 视角与退出
@@ -987,6 +1182,60 @@ def validate_ship(ship: ShipProfile, *, location: str | None = None) -> list[Val
     _check_int_positive(issues, ship.max_scrolls, _loc(location, "max_scrolls"), "最大滚动次数")
     if ship.scroll_clicks == 0:
         _error(issues, "range", _loc(location, "scroll_clicks"), "每次滚动格数不能为 0")
+    # --- 已选中证据与选船查找参数（ISS-007 / 实现补充 10.7） ---
+    if ship.selected_feature:
+        if ship.ship_dir is not None and not (ship.ship_dir / ship.selected_feature).is_file():
+            _warn(
+                issues,
+                "file_missing",
+                _loc(location, "selected_feature"),
+                "选中态模板缺失（待实机标定）：运行时会保守失败并提示补标定，"
+                "不会把“目标船卡片可见”当作已选中",
+            )
+        _check_probability(
+            issues, ship.selected_threshold, _loc(location, "selected_threshold"), "选中态模板阈值"
+        )
+    if ship.selected_name_feature:
+        if ship.ship_dir is not None and not (ship.ship_dir / ship.selected_name_feature).is_file():
+            _warn(
+                issues,
+                "file_missing",
+                _loc(location, "selected_name_feature"),
+                "右侧详情面板船名模板缺失（待标定）：不能只凭该证据确认已选中，仍可用选中态模板",
+            )
+        _check_probability(
+            issues,
+            ship.selected_name_threshold,
+            _loc(location, "selected_name_threshold"),
+            "右侧船名模板阈值",
+        )
+        if ship.selected_name_region is None:
+            _warn(
+                issues,
+                "missing",
+                _loc(location, "selected_name_region"),
+                "未配置右侧船名模板搜索区域：运行时回退到右侧面板默认区域",
+            )
+    _check_int_positive(
+        issues, ship.max_position_scrolls, _loc(location, "max_position_scrolls"), "起点定位最大滚动次数"
+    )
+    _check_non_negative(issues, ship.scroll_settle_s, _loc(location, "scroll_settle_s"), "滚动后等待时间")
+    _check_int_positive(issues, ship.confirm_frames, _loc(location, "confirm_frames"), "点击后确认等待帧数")
+    _check_positive(issues, ship.confirm_timeout_s, _loc(location, "confirm_timeout_s"), "点击后确认超时")
+    _check_int_positive(issues, ship.max_click_attempts, _loc(location, "max_click_attempts"), "重复点击上限")
+    _check_int_positive(
+        issues,
+        ship.endpoint_stable_scrolls,
+        _loc(location, "endpoint_stable_scrolls"),
+        "列表端点判定次数",
+    )
+    _check_probability(
+        issues, ship.endpoint_diff_ratio, _loc(location, "endpoint_diff_ratio"), "端点画面差异比例"
+    )
+    _check_int_non_negative(
+        issues, ship.candidate_merge_px, _loc(location, "candidate_merge_px"), "候选去重距离"
+    )
+    _check_positive(issues, ship.selection_timeout_s, _loc(location, "selection_timeout_s"), "选船查找超时")
     if not ship.loadout_slots:
         _warn(issues, "empty", _loc(location, "loadout_slots"), "未配置空装备槽校验，无法确认未带信号旗/加成卡")
     seen_slots: set[str] = set()

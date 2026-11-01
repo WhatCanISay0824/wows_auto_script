@@ -133,6 +133,16 @@ def set_dpi_awareness() -> str:
     return "none"
 
 
+def is_process_foreground() -> bool:
+    """前台窗口是否属于当前进程，供本地 GUI 协作使用。"""
+    if not _IS_WINDOWS:
+        return False
+    hwnd = user32.GetForegroundWindow()
+    pid = wintypes.DWORD()
+    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    return bool(hwnd) and pid.value == os.getpid()
+
+
 def is_dpi_aware() -> bool:
     if not _IS_WINDOWS:
         return False

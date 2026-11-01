@@ -137,7 +137,7 @@ def test_daily_count_is_cached_and_invalidated_after_battle() -> None:
     for _ in range(5):
         assert controller.check_stop() is None
     assert len(calls) == 1  # 5 次检查（每 tick 一次）只查一次数据库
-    clock.advance(6.0)
+    clock.advance(31.0)
     controller.check_stop()
     assert len(calls) == 2  # 缓存过期后重新查询
     controller.begin_battle()
@@ -220,7 +220,7 @@ def test_between_battle_sampling_and_sleeper() -> None:
     controller, clock, _ = make_controller(rng=random.Random(11))
     controller.start()
     seconds = controller.wait_between_battles()
-    assert 15.0 <= seconds <= 60.0
+    assert 3.0 <= seconds <= 10.0
     assert clock.now() == pytest.approx(seconds)
 
 
@@ -230,7 +230,7 @@ def test_between_battle_sampling_reproducible() -> None:
     first_values = [first.sample_between_battle_s() for _ in range(5)]
     second_values = [second.sample_between_battle_s() for _ in range(5)]
     assert first_values == second_values
-    assert all(15.0 <= value <= 60.0 for value in first_values)
+    assert all(3.0 <= value <= 10.0 for value in first_values)
 
 
 def test_consecutive_start_failure_threshold() -> None:

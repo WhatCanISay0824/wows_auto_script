@@ -1,35 +1,53 @@
-"""死亡判定：多信号加权投票（详细设计 5.9，评审 P0-7 修正版）。
+"""死亡判定：多信号加权投票 + 血条归零证据与提前退出授权（详细设计 5.9，
+评审 P0-7 / 10.2 修正版）。
 
 输入是上游感知给出的 5 个布尔信号（``hp_bar_absent`` / ``hp_zero`` / ``banner`` /
 ``marker_lost`` / ``spectator_ui``），输出带得分、稳定时间与逐信号投票的
 ``DeathSignals``。判定规则：
 
 - **开局静默**：战斗开始后 ``ignore_start_s`` 秒内不判定（默认 5 秒），避免加载残留
-  画面误判；静默期内不累积任何稳定计时。
+  画面误判；静默期内不累积任何稳定计时，也不授权提前退出。
 - **强信号直判**：``hp_bar_absent`` 或 ``hp_zero`` 连续稳定 ``strong_stable_s``
-  （默认 1.5 秒）后直接判定死亡。
+  （默认 1.5 秒）后直接判定死亡。注意：判定/投票结果只用于日志与统计，
+  **不能单独作为提前退出授权**（见下一条）。
 - **死亡提示锁存**：``banner`` 命中后锁存 ``banner_latch_s`` 秒（提示文字只显示数秒，
   消失后投票不应立刻回落）。
 - **观战模式**：``spectator_ui`` 命中后进入观战模式，此后己方血条信号
-  （``hp_bar_absent`` / ``hp_zero``）不再参与投票，也不再触发强信号直判。
+  （``hp_bar_absent`` / ``hp_zero``）不再参与投票、不触发强信号直判，
+  且血条归零证据直接失效（观战界面看到的不是己方血条）。
 - **加权投票（辅助）**：各信号先满足自己的稳定时间（普通信号 ``stable_s``，
   ``marker_lost`` 用 ``marker_lost_stable_s``）后按 ``cfg.weights`` 累加；
   得分 >= ``score_threshold`` 且该条件连续保持 ``stable_s`` 秒时判定死亡。
 - **矛盾只清对应信号**：某个信号由真变假时只重置它自己的稳定计时，不清空其他信号
   的计时（评审 P0-7；详细设计 5.9 原文“清零投票”按评审修订为逐信号处理）。
 
+血条归零证据与退出授权（ISS-002 / 评审 10.2）
+---------------------------------------------
+状态机的 ``BATTLE_ACTIVE -> DEAD_PENDING_EXIT`` 与“按 ESC/离开战斗”前的二次校验
+**只认** ``DeathSignals.exit_authorized``。它由感知上游（``PerceptionEngine``）给出的
+颜色无关血条填充分析驱动：
+
+- ``hp_evidence == "zero"``：血条区域有效且填充列比例低于 ``hp_bar_empty_max_ratio``；
+- 连续 ``hp_bar_confirm_frames`` 个**新帧**（同一帧被 10Hz 主循环重复消费只计一次）
+  都是 ``zero``；
+- 最近一次归零证据在 ``hp_bar_evidence_ttl_s`` 内（超时或没有新帧即撤销）；
+- 出现 ``alive`` / ``unknown`` / ``unavailable`` 矛盾证据立即撤销。
+
+``banner`` / ``hp_bar_absent`` / ``marker_lost`` / ``spectator_ui`` 仍参与投票与日志，
+但**不能单独授权提前退出**。无法证明归零时状态机等待自然结算（BATTLE_FINISHED）。
+
 与公共类型 / 状态机的约定
 --------------------------
-- 引擎与状态机目前通过 ``DeathSignals.dead`` 这一便捷属性消费死亡结果（
-  ``score >= 0.75 and stable_ms >= 1000``，见 ``common.types`` 与
-  ``state_machine.machine``）。为兼容该消费方式：**判定成立后**输出的
-  ``DeathSignals.score`` 取下限 ``DEAD_SIGNAL_SCORE_FLOOR``（0.75），
-  ``stable_ms`` 为实际稳定时间（强信号 1500ms、投票 1000ms，默认配置下均 >= 1000），
-  因此 ``DeathSignals.dead`` 在判定后为 True；原始加权得分通过
-  ``DeathDetector.decision_raw_score`` / ``last_raw_score`` 保留，便于日志分析。
+- ``DeathSignals.dead`` 是历史便捷属性（``score >= 0.75 and stable_ms >= 1000``），
+  只为兼容日志/旧消费方保留；**退出授权必须以 ``exit_authorized`` 为准**。
+  判定成立后输出 ``score`` 取下限 ``DEAD_SIGNAL_SCORE_FLOOR``（0.75），原始加权得分
+  通过 ``DeathDetector.decision_raw_score`` / ``last_raw_score`` 保留。
 - 权威判定仍是 ``DeathDetector.decided``（判定后锁存到 reset）；若把配置里的
   ``stable_s`` 调到 1.0 秒以下，``DeathSignals.dead`` 的 1000ms 阈值可能不满足，
   此时调用方应以 ``decided`` 为准。
+- ``update()`` 的 ``hp_fill_ratio`` / ``hp_evidence`` / ``frame_id`` 是关键字参数：
+  引擎每帧传入；不传时沿用 ``votes`` 里的 ``hp_zero``（兼容手工调用/单元测试），
+  但此时 ``exit_authorized`` 恒为 False。
 """
 
 from __future__ import annotations
@@ -38,8 +56,8 @@ import logging
 import math
 from collections.abc import Mapping
 
-from ..common.types import DeathSignals
-from ..config.models import DeathConfig
+from ..common.types import HP_EVIDENCE_LEVELS, DeathSignals
+from ..config.models import BattleHudConfig, DeathConfig
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +76,32 @@ SIGNAL_NAMES: tuple[str, ...] = (
 STRONG_SIGNALS: tuple[str, ...] = ("hp_bar_absent", "hp_zero")
 #: 观战模式下不再参与投票的信号（己方血条）。
 HP_SIGNALS: tuple[str, ...] = ("hp_bar_absent", "hp_zero")
+#: 可以确认“归零”的证据等级（其余等级都会撤销退出授权）。
+_ZERO_EVIDENCE = "zero"
+
+
+def _normalize_hp_evidence(value: str | None) -> str:
+    """把外部传入的血条证据等级规范化为 ``HP_EVIDENCE_LEVELS`` 之一（未知值保守降为 unknown）。"""
+    if value is None:
+        return "unavailable"
+    text_value = str(value)
+    if text_value in HP_EVIDENCE_LEVELS:
+        return text_value
+    logger.warning("未知血条证据等级 %r，按 unknown 处理（不授权退出）", value)
+    return "unknown"
+
+
+def _normalize_fill_ratio(value: float | None) -> float | None:
+    """规范化填充列比例：非法/NaN/越界按“无数据”处理，避免脏数据触发误授权。"""
+    if value is None:
+        return None
+    try:
+        ratio = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(ratio):
+        return None
+    return min(1.0, max(0.0, ratio))
 
 
 class DeathDetector:
@@ -73,8 +117,18 @@ class DeathDetector:
     ``update`` 可以每帧（约 2 Hz）调用；同一实例内计时连续，``reset`` 用于复用实例。
     """
 
-    def __init__(self, cfg: DeathConfig, battle_started_at: float) -> None:
+    def __init__(
+        self,
+        cfg: DeathConfig,
+        battle_started_at: float,
+        *,
+        hud: BattleHudConfig | None = None,
+    ) -> None:
         self._cfg = cfg
+        # 血条归零证据的连续帧/TTL 配置属于客户端 battle_hud 标定（评审 10.2）。
+        self._hud = hud if hud is not None else BattleHudConfig()
+        self._hp_confirm_frames = max(1, int(self._hud.hp_bar_confirm_frames))
+        self._hp_evidence_ttl_s = max(0.0, float(self._hud.hp_bar_evidence_ttl_s))
         self._battle_started_at = float(battle_started_at)
         self._weights: dict[str, float] = {
             name: float(cfg.weights.get(name, 0.0)) for name in SIGNAL_NAMES
@@ -90,6 +144,12 @@ class DeathDetector:
         self._decision_stable_ms = 0
         self._last_signals: DeathSignals | None = None
         self._last_raw_score = 0.0
+        # --- ISS-002 血条归零证据状态 -----------------------------------
+        self._hp_evidence: str = "unavailable"
+        self._hp_fill_ratio: float | None = None
+        self._hp_zero_frames = 0
+        self._evidence_at = 0.0
+        self._hp_frame_id: int | None = None
 
     # ------------------------------------------------------------------
     # 公开状态
@@ -131,6 +191,16 @@ class DeathDetector:
     def battle_started_at(self) -> float:
         return self._battle_started_at
 
+    @property
+    def hp_evidence(self) -> str:
+        """最近一帧的血条证据等级（alive / zero / unknown / unavailable）。"""
+        return self._hp_evidence
+
+    @property
+    def evidence_at(self) -> float:
+        """最近一次“确认归零”证据的时间戳（单调时钟秒；0 表示从未确认）。"""
+        return self._evidence_at
+
     # ------------------------------------------------------------------
     # 公开接口
     # ------------------------------------------------------------------
@@ -148,34 +218,85 @@ class DeathDetector:
         self._decision_stable_ms = 0
         self._last_signals = None
         self._last_raw_score = 0.0
+        self._reset_hp_evidence()
 
-    def update(self, votes: Mapping[str, bool], timestamp: float) -> DeathSignals:
-        """输入一帧投票并返回当前死亡信号。
+    def _reset_hp_evidence(self) -> None:
+        self._hp_evidence = "unavailable"
+        self._hp_fill_ratio = None
+        self._hp_zero_frames = 0
+        self._evidence_at = 0.0
+        self._hp_frame_id = None
+
+    def update(
+        self,
+        votes: Mapping[str, bool],
+        timestamp: float,
+        *,
+        hp_fill_ratio: float | None = None,
+        hp_evidence: str | None = None,
+        frame_id: int | None = None,
+    ) -> DeathSignals:
+        """输入一帧投票与血条归零证据并返回当前死亡信号。
 
         参数：
             votes: 信号名 -> 是否命中；缺失的键按 False 处理，多余键忽略。
             timestamp: 该帧时间戳（单调时钟秒，与 ``battle_started_at`` 同一时钟）。
+            hp_fill_ratio: 血条填充列比例（0~1，引擎按颜色无关算法给出）；None 表示无数据。
+            hp_evidence: 血条证据等级（``alive``/``zero``/``unknown``/``unavailable``）。
+                None 表示调用方未提供血条证据：此时沿用 ``votes["hp_zero"]`` 的旧语义，
+                但 ``exit_authorized`` 恒为 False（兼容手工调用，绝不放宽退出门禁）。
+            frame_id: 帧序号；10Hz 主循环复用同一张 2Hz 帧时只计一次“连续帧”。
         """
         timestamp = float(timestamp)
         raw = {name: bool(votes.get(name, False)) for name in SIGNAL_NAMES}
+        hp_supplied = hp_evidence is not None
+        hp_level = _normalize_hp_evidence(hp_evidence)
+        fill_ratio = _normalize_fill_ratio(hp_fill_ratio)
+        if hp_level in ("alive", "zero") and fill_ratio is None:
+            # 没有填充比例时不能声称已判读血条，保守降为 unknown（不授权）。
+            hp_level = "unknown"
         if self._in_ignore_window(timestamp):
             self._clear_evidence()
             signals = self._compose(
-                effective=raw, score=0.0, stable_ms=0, timestamp=timestamp
+                effective=raw,
+                score=0.0,
+                stable_ms=0,
+                timestamp=timestamp,
+                hp_fill_ratio=fill_ratio if hp_supplied else None,
+                hp_evidence=hp_level if hp_supplied else "unavailable",
+                exit_authorized=False,
+                evidence_at=0.0,
             )
             self._last_signals = signals
             self._last_raw_score = 0.0
             return signals
         effective = self._apply_latches(raw, timestamp)
+        applied_level, _applied_ratio = self._update_hp_evidence(
+            hp_level if hp_supplied else "unavailable",
+            fill_ratio if hp_supplied else None,
+            timestamp,
+            frame_id if hp_supplied else None,
+        )
+        if hp_supplied:
+            # 引擎传入血条证据时，hp_zero 投票严格由证据推导（alive/unknown 均为 False）。
+            effective["hp_zero"] = applied_level == _ZERO_EVIDENCE
         self._update_signal_timers(effective, timestamp)
         score = self._weighted_score(timestamp)
         self._last_raw_score = score
+        exit_authorized = self._authorized_at(timestamp)
         if self._decided:
             stable_ms = self._decision_stable_ms + int(
                 max(0.0, timestamp - (self._decided_at or timestamp)) * 1000
             )
             signals = self._compose(
-                effective=effective, score=score, stable_ms=stable_ms, timestamp=timestamp
+                effective=effective,
+                score=score,
+                stable_ms=stable_ms,
+                timestamp=timestamp,
+                hp_fill_ratio=self._hp_fill_ratio,
+                hp_evidence=self._hp_evidence,
+                exit_authorized=exit_authorized,
+                evidence_at=self._reported_evidence_at(),
             )
             self._last_signals = signals
             return signals
@@ -194,10 +315,61 @@ class DeathDetector:
             self._decision_stable_ms if self._decided else self._evidence_stable_ms(timestamp)
         )
         signals = self._compose(
-            effective=effective, score=score, stable_ms=stable_ms, timestamp=timestamp
+            effective=effective,
+            score=score,
+            stable_ms=stable_ms,
+            timestamp=timestamp,
+            hp_fill_ratio=self._hp_fill_ratio,
+            hp_evidence=self._hp_evidence,
+            exit_authorized=exit_authorized,
+            evidence_at=self._reported_evidence_at(),
         )
         self._last_signals = signals
         return signals
+
+    # ------------------------------------------------------------------
+    # 内部：血条归零证据与提前退出授权（ISS-002 / 评审 10.2）
+    # ------------------------------------------------------------------
+    def _update_hp_evidence(
+        self,
+        evidence: str,
+        fill_ratio: float | None,
+        timestamp: float,
+        frame_id: int | None,
+    ) -> tuple[str, float | None]:
+        """累计连续“确认归零”帧，返回本帧实际生效的 (证据等级, 填充比例)。"""
+        if self._spectator_mode:
+            # 观战界面显示的不是己方血条：己方血条证据一律不可用。
+            evidence = "unavailable"
+            fill_ratio = None
+        if frame_id is not None and self._hp_frame_id is not None and frame_id == self._hp_frame_id:
+            # 同一张帧被 10Hz 主循环重复消费：不重复累计，也不刷新证据时间戳。
+            return self._hp_evidence, self._hp_fill_ratio
+        self._hp_frame_id = frame_id
+        self._hp_evidence = evidence
+        self._hp_fill_ratio = fill_ratio
+        if evidence == _ZERO_EVIDENCE:
+            self._hp_zero_frames += 1
+            self._evidence_at = timestamp
+        else:
+            # 存活/未知/不可用都属于矛盾证据：立即撤销尚未执行的退出授权。
+            self._hp_zero_frames = 0
+            self._evidence_at = 0.0
+        return self._hp_evidence, self._hp_fill_ratio
+
+    def _authorized_at(self, timestamp: float) -> bool:
+        """当前时刻是否满足提前退出授权（连续帧归零 + 证据在 TTL 内 + 无矛盾证据）。"""
+        if self._hp_evidence != _ZERO_EVIDENCE:
+            return False
+        if self._hp_zero_frames < self._hp_confirm_frames:
+            return False
+        return (timestamp - self._evidence_at) <= self._hp_evidence_ttl_s
+
+    def _reported_evidence_at(self) -> float:
+        """输出“最近一次确认归零”的时间戳；未达到连续帧要求时输出 0。"""
+        if self._hp_zero_frames < self._hp_confirm_frames:
+            return 0.0
+        return self._evidence_at
 
     # ------------------------------------------------------------------
     # 内部：时间与锁存
@@ -219,6 +391,8 @@ class DeathDetector:
         self._decision_mode = None
         self._decision_score = 0.0
         self._decision_stable_ms = 0
+        # 开局静默期内不累积任何血条归零证据。
+        self._reset_hp_evidence()
 
     def _apply_latches(
         self, raw: dict[str, bool], timestamp: float
@@ -332,6 +506,10 @@ class DeathDetector:
         score: float,
         stable_ms: int,
         timestamp: float,
+        hp_fill_ratio: float | None,
+        hp_evidence: str,
+        exit_authorized: bool,
+        evidence_at: float,
     ) -> DeathSignals:
         votes = {name: bool(effective.get(name, False)) for name in SIGNAL_NAMES}
         reported_score = float(max(0.0, score))
@@ -348,6 +526,10 @@ class DeathDetector:
             stable_ms=int(max(0, stable_ms)),
             timestamp=float(timestamp),
             votes=votes,
+            hp_fill_ratio=hp_fill_ratio,
+            hp_evidence=hp_evidence,
+            exit_authorized=bool(exit_authorized),
+            evidence_at=float(evidence_at),
         )
 
 

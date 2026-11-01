@@ -29,6 +29,7 @@ from src.common.coords import (
 )
 from src.common.types import DeathSignals, MapMatch, NormalizedRect, Observation, ShipPosition
 from src.config.models import (
+    BattleHudConfig,
     ClientProfile,
     DeathConfig,
     MapPack,
@@ -206,7 +207,14 @@ def test_ship_locator_resolves_marker_from_project_root(tmp_path: Path) -> None:
 def test_death_detector_signature() -> None:
     parameters = list(inspect.signature(DeathDetector.__init__).parameters)
     assert parameters[1:3] == ["cfg", "battle_started_at"]
-    assert list(inspect.signature(DeathDetector.update).parameters)[1:] == ["votes", "timestamp"]
+    assert "hud" in parameters  # ISS-002：battle_hud 提供连续帧确认/证据 TTL 配置
+    assert list(inspect.signature(DeathDetector.update).parameters)[1:] == [
+        "votes",
+        "timestamp",
+        "hp_fill_ratio",
+        "hp_evidence",
+        "frame_id",
+    ]
     assert list(inspect.signature(DeathDetector.reset).parameters)[1:] == []
     assert isinstance(DeathDetector.decided, property)
 
@@ -310,7 +318,13 @@ def _engine_like_observe(
         "marker_lost": bool(ship is not None and ship.source == "lost"),
         "spectator_ui": False,
     }
-    death = detector.update(votes, timestamp)  # type: ignore[attr-defined]
+    death = detector.update(  # type: ignore[attr-defined]
+        votes,
+        timestamp,
+        hp_fill_ratio=None,
+        hp_evidence="unavailable",
+        frame_id=1,
+    )
     return Observation(
         timestamp=timestamp,
         window_rect=(0, 0, 2560, 1600),
@@ -361,7 +375,8 @@ class _FakeShipLocator:
 
 
 class _FakeDeathDetector:
-    def update(self, votes: object, timestamp: float) -> DeathSignals:
+    def update(self, votes: object, timestamp: float, **kwargs: object) -> DeathSignals:
+        # 与真实 DeathDetector 的关键字参数契约一致（hp_fill_ratio/hp_evidence/frame_id）。
         return DeathSignals(
             hp_bar_absent=False,
             hp_zero=False,
@@ -371,6 +386,8 @@ class _FakeDeathDetector:
             score=0.0,
             stable_ms=0,
             timestamp=timestamp,
+            hp_fill_ratio=kwargs.get("hp_fill_ratio"),  # type: ignore[arg-type]
+            hp_evidence=str(kwargs.get("hp_evidence", "unavailable")),
         )
 
 
@@ -386,6 +403,8 @@ def test_engine_like_observe_with_fakes() -> None:
     assert observation.ship.source == "marker"
     assert observation.death is not None
     assert observation.death.score == 0.0
+    assert observation.death.hp_evidence == "unavailable"
+    assert observation.death.exit_authorized is False
     assert observation.frame_id == 1
     assert observation.frame_timestamp == 3.5
 
@@ -408,3 +427,57 @@ def test_death_decision_is_visible_via_signals_dead() -> None:
     assert signals.score == 0.75
     assert signals.dead is True
     assert detector.decision_raw_score == 0.35
+
+
+# ---------------------------------------------------------------------------
+# 5. ISS-002：退出授权契约（状态机只认 exit_authorized）
+# ---------------------------------------------------------------------------
+
+
+def test_exit_authorized_contract_with_battle_hud() -> None:
+    """连续 zero 帧 + TTL 内才授权；banner/hp_bar_absent/marker_lost 不能单独授权。"""
+    detector = DeathDetector(DeathConfig(), battle_started_at=0.0, hud=BattleHudConfig())
+    # 单帧 zero 证据：未达到 confirm_frames=2。
+    first = detector.update(
+        {"banner": True, "hp_bar_absent": True, "marker_lost": True},
+        5.0,
+        hp_fill_ratio=0.0,
+        hp_evidence="zero",
+        frame_id=1,
+    )
+    assert first.exit_authorized is False
+    assert first.evidence_at == 0.0
+    # 第二个新帧仍为 zero：授权成立，evidence_at 为该帧时间戳。
+    second = detector.update(
+        {},
+        5.5,
+        hp_fill_ratio=0.001,
+        hp_evidence="zero",
+        frame_id=2,
+    )
+    assert second.exit_authorized is True
+    assert second.evidence_at == 5.5
+    assert second.hp_evidence == "zero"
+    assert second.hp_fill_ratio == pytest.approx(0.001)
+    # 矛盾证据（存活帧）立即撤销授权。
+    alive = detector.update(
+        {"hp_bar_absent": True}, 6.0, hp_fill_ratio=0.8, hp_evidence="alive", frame_id=3
+    )
+    assert alive.exit_authorized is False
+    assert alive.hp_evidence == "alive"
+
+
+def test_exit_authorized_requires_fresh_frame_and_resets_evidence_at() -> None:
+    """同一帧被重复消费不刷新证据时间戳；超过 TTL 后授权失效。"""
+    detector = DeathDetector(
+        DeathConfig(),
+        battle_started_at=0.0,
+        hud=BattleHudConfig(hp_bar_evidence_ttl_s=1.0),
+    )
+    for frame_id in (1, 2):
+        detector.update({}, 5.0 + 0.1 * (frame_id - 1), hp_fill_ratio=0.0, hp_evidence="zero", frame_id=frame_id)
+    authorized = detector.update({}, 5.2, hp_fill_ratio=0.0, hp_evidence="zero", frame_id=2)
+    assert authorized.exit_authorized is True
+    # 复用同一帧（frame_id=2）反复调用：不刷新证据，TTL 到期后失效。
+    expired = detector.update({}, 6.5, hp_fill_ratio=0.0, hp_evidence="zero", frame_id=2)
+    assert expired.exit_authorized is False
