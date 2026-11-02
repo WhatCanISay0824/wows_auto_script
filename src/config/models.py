@@ -178,6 +178,7 @@ class ClientProfile:
     popup_features: tuple[str, ...] = ()
     profile_dir: Path | None = None
     notes: str = ""
+    calibration_required: bool = False
 
     def feature(self, feature_id: str) -> FeatureDef | None:
         return self.features.get(feature_id)

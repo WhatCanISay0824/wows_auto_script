@@ -1,0 +1,17 @@
+# 船只配置（详细设计 3.2 / 6.8）
+# 由控制台“首次船卡导入”生成；模板相对本目录（card.png）。
+# 信号旗校验由 profile.ship_check_sequence 完成；loadout_slots 允许为空。
+
+ship_id: ship_001
+display_name: iron_duke
+card_template: card.png
+card_search_region:
+- 0.0
+- 0.8
+- 1.0
+- 1.0
+loadout_slots: []
+max_scrolls: 20
+scroll_direction: down
+scroll_clicks: 2
+notes: 由 GUI 首次导入生成；未实机验证识别效果。

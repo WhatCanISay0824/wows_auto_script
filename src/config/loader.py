@@ -1678,6 +1678,7 @@ def load_profile(
         popup_features=_str_list(raw, "popup_features", (), collected, f"{label}: popup_features"),
         profile_dir=profile_dir,
         notes=_str_value(raw, "notes", "", collected, label),
+        calibration_required=_bool_value(raw, "calibration_required", False, collected, label),
     )
 
 

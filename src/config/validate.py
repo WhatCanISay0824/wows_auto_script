@@ -894,6 +894,13 @@ def validate_profile(
         )
     if not profile.display_name:
         _error(issues, "missing", _loc(location, "display_name"), "display_name 不能为空")
+    if profile.calibration_required:
+        _warn(
+            issues, "calibration_required", _loc(location, "calibration_required"),
+            "此客户端模板尚待实机标定：初始资源来自国服简体中文 2560×1600 界面。"
+            "请使用对应服务器截图核对窗口、界面、己方标记和船只模板；其他语言需重新标定。"
+            "选择此配置不会切换游戏服务器。",
+        )
     if not profile.language:
         _error(issues, "missing", _loc(location, "language"), "language 不能为空")
     width, height = profile.reference_resolution
