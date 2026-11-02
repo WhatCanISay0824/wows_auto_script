@@ -668,12 +668,13 @@ def test_exit_menu_timeout_saves_diagnostic(tmp_path: Path) -> None:
     assert h.machine.state is State.EXIT_MENU_OPEN
     h.perception.last_frame = SimpleNamespace(image=object())  # 让诊断截图有帧可存
     h.step()  # 首次发送 Esc。
-    h.clock.advance(9.0)
+    h.clock.advance(3.0)
     h.perception.death = _death_signals(h.clock.now())
     h.step()  # 超时前先触发一次 ESC 重试（并保存 retry 诊断）
     assert "exit_menu_retry" in h.screenshots.diagnostics
-    h.step()  # 超过 exit_menu_s -> ERROR_RECOVERY
-    assert h.machine.state is State.ERROR_RECOVERY
+    h.clock.advance(6.0)
+    h.step()  # 已确认本场死亡，超时后被动等待自然结算。
+    assert h.machine.state is State.DEAD_PENDING_EXIT
     assert "exit_menu_timeout" in h.screenshots.diagnostics
 
 

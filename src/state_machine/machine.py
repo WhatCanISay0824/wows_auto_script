@@ -122,6 +122,7 @@ class StateMachine:
         self._dead_wait_until = 0.0
         self._dead_wait_log_reason = ""
         self._dead_numeric_confirmed = False
+        self._dead_result_wait_until: float | None = None
         self._pending_exit_actions: list[Action] = []
         self._exit_menu_key_at: float | None = None
         self._exit_menu_key_frame: tuple[int, float] | None = None
@@ -357,7 +358,9 @@ class StateMachine:
             and self._result_visible(self._observation, now)
         ):
             return None  # 已确认结算由按钮等待期限处理。
-        if self._state is State.DEAD_PENDING_EXIT and self._dead_numeric_confirmed:
+        if self._state is State.DEAD_PENDING_EXIT and (
+            self._dead_numeric_confirmed or self._dead_result_wait_until is not None
+        ):
             return None  # 数字确认死亡后等新鲜退出证据或自然结算，不重启托管。
         timeouts = self.config.global_config.timeouts
         mapping: dict[State, tuple[float, str]] = {
@@ -663,7 +666,9 @@ class StateMachine:
     # ==================================================================
     def _enter_battle_active(self, now: float, reason: str) -> None:
         self._stop_subflows()
-        if self._dead_numeric_confirmed and self._battle_id is not None:
+        if (
+            self._dead_numeric_confirmed or self._dead_result_wait_until is not None
+        ) and self._battle_id is not None:
             self._transition(State.DEAD_PENDING_EXIT, "confirmed_zero_wait")
             return
         # ISS-006：同一场次内从暂停恢复时保留 _battle/_battle_id，不重建场次上下文
@@ -1091,6 +1096,15 @@ class StateMachine:
             self._battle_result = "finished"
             self._transition(State.BATTLE_FINISHED, "dead_wait_result")
             return []
+        if self._dead_result_wait_until is not None:
+            if self._port_visible(observation, now):
+                self._mark_returned_to_port()
+                self._transition(State.POST_EXIT_INTERFACE, "dead_wait_port")
+            elif now >= self._dead_result_wait_until:
+                self.request_pause("death_result_timeout", "死亡退出未成功，等待正常结算或回港超时")
+            else:
+                self._log_dead_wait_once("exit_menu_timeout_waiting_result")
+            return []
         if now < self._dead_wait_until:
             self._log_dead_wait_once("awaiting_wait_window")
             return []
@@ -1183,13 +1197,6 @@ class StateMachine:
             self._exit_menu_key_frame = (int(observation.frame_id), float(observation.frame_timestamp))
             return actions
         elapsed = now - self._entered_at
-        # 只有发送之后的新鲜零血帧才能补按；未知画面可能是未识别的确认框。
-        if not self._exit_retried and self._can_retry_exit_menu(observation, now):
-            self._exit_retried = True
-            self._save_diagnostic("exit_menu_retry", now)
-            key = self.deps.config.keymap.resolve(exit_cfg.menu_key)
-            self._log_action("exit_step", {"step": "retry_menu_key", "elapsed_s": round(elapsed, 2)})
-            return [Action.key_down(key, label="exit_menu_retry"), Action.key_up(key, label="exit_menu_retry")]
         timeout = float(self.config.global_config.timeouts.exit_menu_s)
         if elapsed > timeout:
             self._save_diagnostic("exit_menu_timeout", now)
@@ -1200,7 +1207,21 @@ class StateMachine:
                 "exit_authorized": self._exit_authorized(observation, now),
                 "escape_retried": self._exit_retried,
             })
-            self._transition(State.ERROR_RECOVERY, "exit_menu_timeout")
+            if self._has_authorized_exit_context():
+                # 战斗结束动画和延迟可能使 Esc 无效；停止退出输入，等待本场正常结算。
+                self._pending_exit_actions = []
+                self._dead_result_wait_until = now + float(self.config.global_config.timeouts.exit_s)
+                self._transition(State.DEAD_PENDING_EXIT, "exit_menu_wait_result")
+            else:
+                self._transition(State.ERROR_RECOVERY, "exit_menu_timeout")
+            return []
+        # 只有发送之后的新鲜零血帧才能补按；未知画面可能是未识别的确认框。
+        if not self._exit_retried and self._can_retry_exit_menu(observation, now):
+            self._exit_retried = True
+            self._save_diagnostic("exit_menu_retry", now)
+            key = self.deps.config.keymap.resolve(exit_cfg.menu_key)
+            self._log_action("exit_step", {"step": "retry_menu_key", "elapsed_s": round(elapsed, 2)})
+            return [Action.key_down(key, label="exit_menu_retry"), Action.key_up(key, label="exit_menu_retry")]
         return []
 
     def _can_retry_exit_menu(self, observation: Observation, now: float) -> bool:
@@ -1362,6 +1383,7 @@ class StateMachine:
         self._battle_id = None
         self._battle = None
         self._dead_numeric_confirmed = False
+        self._dead_result_wait_until = None
         self._notify_battle_context(None)
         # 下一局直接排队（继续战斗）时也要遵守会话时长/场次/轮换限制（2026-10-31）
         stop = self.deps.session.check_stop()
@@ -1670,6 +1692,7 @@ class StateMachine:
             self._exit_error = None
             self._result_continue_clicked = False
             self._dead_numeric_confirmed = False
+            self._dead_result_wait_until = None
             self._battle_id = self.deps.events.begin_battle(self._session_id, map_id)
             self.deps.screenshots.begin_battle(self._battle_id)
             self.deps.session.begin_battle()
@@ -1698,6 +1721,7 @@ class StateMachine:
         self._battle = None
         self._battle_result = ""
         self._dead_numeric_confirmed = False
+        self._dead_result_wait_until = None
         self._notify_battle_context(None)
 
     def _notify_battle_context(self, battle_id: int | None) -> None:
