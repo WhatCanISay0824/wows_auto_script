@@ -782,6 +782,20 @@ class SessionRunner:
             machine.set_rotation_limit(limit)
         else:
             machine.set_rotation_limit(None)
+        safety = runtime.app.global_config.safety
+        if limit is not None and limit > 0:
+            self._logger.info(
+                "启动场次限制：本次目标=%s，全局安全上限=%s，会话时长上限=%.1f 分钟",
+                limit,
+                safety.max_battles_per_session,
+                safety.max_session_minutes,
+            )
+        else:
+            self._logger.info(
+                "启动场次限制：本次目标未指定，全局安全上限=%s，会话时长上限=%.1f 分钟",
+                safety.max_battles_per_session,
+                safety.max_session_minutes,
+            )
         machine.start(runtime.clock.now())
         runtime.watchdog.start()
         _ensure_game_foreground(runtime)
@@ -1685,6 +1699,8 @@ class SessionRunner:
     def _session_view(self) -> SessionView:
         runtime = self.runtime
         session = runtime.session
+        count_today = getattr(session, "count_battles_today", None)
+        daily_used = count_today() if callable(count_today) else (self.plan.daily_used if self.plan else None)
         return SessionView(
             account_alias=runtime.app.account_alias,
             battles_completed=self.battles_completed,
@@ -1692,7 +1708,7 @@ class SessionRunner:
             battle_in_progress=_value(runtime.machine, "battle") is not None,
             elapsed_s=float(_value(session, "elapsed_s", 0.0) or 0.0),
             last_battle_duration_s=_value(session, "last_battle_duration_s"),
-            daily_used=(self.plan.daily_used if self.plan is not None else None),
+            daily_used=daily_used,
             rotation_index=None,
             rotation_aliases=(),
             next_alias=None,

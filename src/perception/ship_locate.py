@@ -48,6 +48,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from ..common.images import read_color_image
 from ..common.types import ShipPosition
 from ..config.models import ClientProfile, PerceptionConfig
 
@@ -341,7 +342,7 @@ class ShipLocator:
     def _load_template(path: Path) -> np.ndarray:
         if not path.is_file():
             raise FileNotFoundError(f"自身标记模板不存在: {path}")
-        image = cv2.imread(str(path), cv2.IMREAD_COLOR)
+        image = read_color_image(path)
         if image is None or image.size == 0:
             raise ValueError(f"自身标记模板无法读取: {path}")
         height, width = image.shape[:2]

@@ -52,6 +52,7 @@ battle_hud:
   hp_bar_alive_min_ratio: 0.10                  # 高于=存活；两者之间=无法判断（不授权）
   hp_bar_confirm_frames: 2                      # 连续 N 个新帧确认归零才授权提前退出
   hp_bar_evidence_ttl_s: 1.0                    # 归零证据有效期（秒）；超时/矛盾证据撤销授权
+  hp_zero_feature: hp_zero_value                # 可选数字零血模板；配置后空条不再单独授权
   spectator_features: []                        # 用户确认：死亡立刻退出，不需要观战界面
   death_banner_feature: death_banner            # 已提取（“您的战舰已被玩家摧毁”）
   result_feature: battle_results                # 已提取（结算页右侧固定分页栏）
@@ -133,6 +134,10 @@ features:
     template: features/hp_bar_present.png          # 左下“VII 列宁格勒”血条文字（静态）
     region: [0.0, 0.72, 0.17, 0.80]
     threshold: 0.82
+  hp_zero_value:
+    template: features/hp_zero_value.png           # 当前血量“0/”局部（红橙 0 + 中性亮度分隔符）
+    region: [0.075, 0.77, 0.17, 0.795]             # 数字专用 ROI，覆盖当前血量与分隔符
+    threshold: 0.92                                # 前景分类匹配；默认多尺度 0.95/1.0/1.05
   death_banner:
     template: features/death_banner.png            # “您的战舰已被玩家摧毁”（静态文字）
     region: [0.38, 0.82, 0.74, 0.93]
@@ -160,7 +165,7 @@ features:
     threshold: 0.78   # 2026-10-31 下调：菜单淡入期间匹配分数偏低，避免误判未打开而重复按 ESC
   exit_confirm_yes:
     template: features/exit_confirm_yes.png           # “离开战斗?” 确认框里的“是”按钮
-    region: [0.34, 0.45, 0.48, 0.53]
+    region: [0.34, 0.45, 0.48, 0.57]                 # 覆盖普通确认及“战斗提前结束”说明增高后的按钮
     threshold: 0.78   # 与退出菜单同步下调
   # ---- 实测港口标签页 / 装备页信号旗（210924 / 214644）----
   port_equip_tab:

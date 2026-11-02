@@ -105,7 +105,8 @@ def test_load_profile_real_cn360(project_root: Path) -> None:
     assert profile.client_id == "cn360"
     assert profile.display_name
     assert profile.reference_resolution == (2560, 1600)
-    assert len(profile.features) == 19  # 18 个界面模板 + 2026-10-31 新增 result_continue_battle_button
+    assert len(profile.features) == 20
+    assert profile.battle_hud.hp_zero_feature == "hp_zero_value"
     # 2026-10-30 实机截图已全部提取（含退出菜单/确认框/装备页/标签页）
     assert all(feature.template_path is not None for feature in profile.features.values())
     assert profile.battle_hud.spectator_features == ()

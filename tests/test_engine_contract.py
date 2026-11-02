@@ -214,6 +214,7 @@ def test_death_detector_signature() -> None:
         "hp_fill_ratio",
         "hp_evidence",
         "frame_id",
+        "hp_current",
     ]
     assert list(inspect.signature(DeathDetector.reset).parameters)[1:] == []
     assert isinstance(DeathDetector.decided, property)

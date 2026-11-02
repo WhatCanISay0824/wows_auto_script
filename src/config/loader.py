@@ -1576,6 +1576,7 @@ def load_profile(
         hp_bar_evidence_ttl_s=_float_value(
             battle_hud_raw, "hp_bar_evidence_ttl_s", 1.0, collected, hud_loc
         ),
+        hp_zero_feature=_opt_str(battle_hud_raw, "hp_zero_feature", None, collected, hud_loc),
         spectator_features=_str_list(battle_hud_raw, "spectator_features", (), collected, hud_loc),
         death_banner_feature=_str_value(
             battle_hud_raw, "death_banner_feature", "death_banner", collected, hud_loc

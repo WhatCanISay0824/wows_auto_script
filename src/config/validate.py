@@ -1082,6 +1082,7 @@ def validate_profile(
                 f"观战特征不存在: {feature_id}",
             )
     for name, value in (
+        ("hp_zero_feature", hud.hp_zero_feature),
         ("death_banner_feature", hud.death_banner_feature),
         ("result_feature", hud.result_feature),
         ("result_continue_feature", hud.result_continue_feature),

@@ -84,6 +84,105 @@ _HP_FILL_COLUMN_MIN_PX = 3
 _HP_BAR_MIN_REGION_WIDTH = 32
 _HP_BAR_MIN_REGION_HEIGHT = 8
 
+# ---------------------------------------------------------------------------
+# 数字零血：仅针对 hp_zero_feature 的前景分类匹配（不改通用 TemplateMatcher）
+# ---------------------------------------------------------------------------
+# 当前血量数字是红/橙色；斜杠是中性亮色。把模板与配置数字 ROI 都归成三类：
+# 红橙=255、中性亮色(slash)=128、其他背景=0，再做模板匹配。
+_HP_GLYPH_HUE_MAX = 28
+_HP_GLYPH_HUE_RED_MIN = 165
+_HP_GLYPH_SAT_MIN = 130
+_HP_GLYPH_VALUE_MIN = 140
+_HP_SLASH_SAT_MAX = 85
+_HP_SLASH_VALUE_MIN = 145
+#: 连通域最小面积（绝对像素）及相对模板零字形的最小比例，用于滤掉抗锯齿噪声。
+_HP_GLYPH_MIN_COMPONENT_AREA = 4
+_HP_GLYPH_MIN_AREA_RATIO = 0.15
+#: 连通域面积相对模板零字形的合理范围；多个数字粘连会显著超出。
+_HP_GLYPH_AREA_RATIO_MIN = 0.35
+_HP_GLYPH_AREA_RATIO_MAX = 3.0
+
+
+def hp_foreground_classes(image: np.ndarray) -> np.ndarray:
+    """把 BGR 图像分成背景 0 / 分隔符 128 / 红橙数字 255 三类。"""
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    hue = hsv[:, :, 0]
+    saturation = hsv[:, :, 1]
+    value = hsv[:, :, 2]
+    classes = np.zeros(hue.shape, dtype=np.uint8)
+    neutral_bright = (saturation < _HP_SLASH_SAT_MAX) & (value > _HP_SLASH_VALUE_MIN)
+    red_orange = (
+        ((hue <= _HP_GLYPH_HUE_MAX) | (hue >= _HP_GLYPH_HUE_RED_MIN))
+        & (saturation >= _HP_GLYPH_SAT_MIN)
+        & (value >= _HP_GLYPH_VALUE_MIN)
+    )
+    classes[neutral_bright] = 128
+    classes[red_orange] = 255
+    return classes
+
+
+def match_hp_zero_foreground(
+    image: np.ndarray,
+    template_classes: np.ndarray,
+    region: Rect,
+    scales: Sequence[float],
+    threshold: float,
+) -> MatchResult:
+    """在数字 ROI 内按前景分类做多尺度匹配（仅供数字零血 helper 使用）。"""
+    height, width = image.shape[:2]
+    x1 = max(0, region.x)
+    y1 = max(0, region.y)
+    x2 = min(width, region.right)
+    y2 = min(height, region.bottom)
+    if x2 <= x1 or y2 <= y1 or template_classes.size == 0:
+        return MatchResult(feature_id="hp_zero_value", found=False, score=0.0)
+    frame_classes = hp_foreground_classes(image[y1:y2, x1:x2])
+    template_h, template_w = template_classes.shape[:2]
+    best_score = -1.0
+    best_scale = 1.0
+    best_location: tuple[int, int] | None = None
+    best_size = (0, 0)
+    for scale in scales:
+        if scale <= 0:
+            continue
+        target_w = max(1, int(round(template_w * float(scale))))
+        target_h = max(1, int(round(template_h * float(scale))))
+        if target_w > frame_classes.shape[1] or target_h > frame_classes.shape[0]:
+            continue
+        resized = cv2.resize(
+            template_classes, (target_w, target_h), interpolation=cv2.INTER_NEAREST
+        )
+        scores = cv2.matchTemplate(frame_classes, resized, cv2.TM_CCOEFF_NORMED)
+        _, max_value, _, max_location = cv2.minMaxLoc(scores)
+        if not np.isfinite(max_value):
+            continue
+        if float(max_value) > best_score:
+            best_score = float(max_value)
+            best_scale = float(scale)
+            best_location = (int(max_location[0]), int(max_location[1]))
+            best_size = (target_w, target_h)
+    if best_location is None:
+        return MatchResult(feature_id="hp_zero_value", found=False, score=0.0)
+    found = best_score >= float(threshold)
+    if not found:
+        return MatchResult(
+            feature_id="hp_zero_value",
+            found=False,
+            score=max(0.0, min(1.0, best_score)),
+            scale=best_scale,
+        )
+    x = x1 + best_location[0]
+    y = y1 + best_location[1]
+    template_width, template_height = best_size
+    return MatchResult(
+        feature_id="hp_zero_value",
+        found=True,
+        score=max(0.0, min(1.0, best_score)),
+        center=(x + template_width // 2, y + template_height // 2),
+        rect=(x, y, template_width, template_height),
+        scale=best_scale,
+    )
+
 
 def _collect_sequence_features(profile: ClientProfile) -> tuple[str, ...]:
     """收集步骤序列 / 弹窗 / 退出配置引用的特征，供每帧 Observation 一并匹配。
@@ -182,6 +281,18 @@ class PerceptionEngine:
         self._map_identify_count = 0
         self._minimap_expected_scale = config.global_config.map.expected_minimap_scale
         self._hp_bar_check_enabled = bool(self.profile.features.get("hp_bar_present"))
+        # 数字零模板前景分类缓存：path -> (classes, 零连通域 bbox, 面积)。
+        self._hp_zero_template_cache: dict[
+            str,
+            tuple[
+                np.ndarray,
+                tuple[int, int, int, int],
+                int,
+                tuple[int, int, int, int],
+                int,
+            ],
+        ] = {}
+        self._last_hp_log: tuple[str, int | None] | None = None
         # 以下显示/解析类可选：main 启动时按当前船只调用 configure_ship_hp_bar() 覆盖
         self._extras_configured = False
 
@@ -229,6 +340,7 @@ class PerceptionEngine:
             hud=self.profile.battle_hud,
         )
         self._last_death = None
+        self._last_hp_log = None
         self._ship_locator.reset()
         self._calibration = None
         self._last_map_match = None
@@ -238,6 +350,7 @@ class PerceptionEngine:
     def end_battle(self) -> None:
         self._death_detector = None
         self._last_death = None
+        self._last_hp_log = None
         self._battle_started_at = None
         self._calibration = None
         self._last_map_match = None
@@ -620,6 +733,144 @@ class PerceptionEngine:
         mask = cv2.inRange(hsv, lower, upper)
         return float(np.count_nonzero(mask)) / float(mask.size)
 
+    def _hp_zero_template_foreground(
+        self, feature
+    ) -> tuple[
+        np.ndarray,
+        tuple[int, int, int, int],
+        int,
+        tuple[int, int, int, int],
+        int,
+    ] | None:
+        """读取并缓存模板前景分类、零字形与分隔符连通域。"""
+        path = getattr(feature, "template_path", None)
+        if path is None:
+            return None
+        try:
+            if not path.is_file():
+                return None
+            key = str(path.resolve())
+        except OSError:
+            return None
+        cached = self._hp_zero_template_cache.get(key)
+        if cached is not None:
+            return cached
+        try:
+            raw = np.fromfile(str(path), dtype=np.uint8)
+            template = cv2.imdecode(raw, cv2.IMREAD_COLOR)
+        except OSError:
+            return None
+        if template is None or template.size == 0:
+            return None
+        classes = hp_foreground_classes(template)
+        red = (classes == 255).astype(np.uint8)
+        count, _labels, stats, _centroids = cv2.connectedComponentsWithStats(red, connectivity=8)
+        if count <= 1:
+            return None
+        best = max(range(1, count), key=lambda index: int(stats[index, 4]))
+        bbox = tuple(int(value) for value in stats[best, :4])
+        area = int(stats[best, 4])
+        if area <= 0:
+            return None
+        separator = (classes == 128).astype(np.uint8)
+        sep_count, _sep_labels, sep_stats, _sep_centroids = cv2.connectedComponentsWithStats(
+            separator, connectivity=8
+        )
+        if sep_count <= 1:
+            return None
+        sep_best = max(range(1, sep_count), key=lambda index: int(sep_stats[index, 4]))
+        separator_bbox = tuple(int(value) for value in sep_stats[sep_best, :4])
+        separator_area = int(sep_stats[sep_best, 4])
+        if separator_area <= 0:
+            return None
+        data = (classes, bbox, area, separator_bbox, separator_area)  # type: ignore[assignment]
+        self._hp_zero_template_cache[key] = data
+        return data
+
+    def _hp_numeric_evidence(
+        self,
+        frame: Frame | None,
+        hud: BattleHudConfig,
+        hp_bar_found: bool,
+    ) -> tuple[int | None, bool]:
+        """返回数字判读的 (hp_current, 是否确认零血)。
+
+        启用数字特征后必须同时满足：己方血条身份命中、前景分类后的 ``0/`` 模板
+        命中、数字 ROI 内红橙连通域只有模板对应的零字形（无左侧其他有效字形）。
+        """
+        feature_id = hud.hp_zero_feature
+        if not feature_id or frame is None or not hp_bar_found:
+            return None, False
+        feature = self.profile.feature(feature_id)
+        if feature is None:
+            return None, False
+        template_data = self._hp_zero_template_foreground(feature)
+        if template_data is None:
+            return None, False
+        template_classes, zero_bbox, zero_area, separator_bbox, separator_area = template_data
+        region = feature.region.to_pixels(frame.window_rect.w, frame.window_rect.h)
+        matched = match_hp_zero_foreground(
+            frame.image,
+            template_classes,
+            region,
+            feature.scales,
+            feature.threshold,
+        )
+        if not matched.found or matched.rect is None:
+            return None, False
+        crop = frame.crop(region)
+        if crop is None or crop.size == 0:
+            return None, False
+        classes = hp_foreground_classes(crop)
+        red_mask = (classes == 255).astype(np.uint8)
+        count, _labels, stats, _centroids = cv2.connectedComponentsWithStats(
+            red_mask, connectivity=8
+        )
+        scale = float(matched.rect[2]) / float(max(1, template_classes.shape[1]))
+        expected_area = max(1, int(round(zero_area * scale * scale)))
+        min_area = max(
+            _HP_GLYPH_MIN_COMPONENT_AREA,
+            int(round(expected_area * _HP_GLYPH_MIN_AREA_RATIO)),
+        )
+        components = [
+            tuple(int(value) for value in stats[index, :4]) + (int(stats[index, 4]),)
+            for index in range(1, count)
+            if int(stats[index, 4]) >= min_area
+        ]
+        if len(components) != 1:
+            # 左侧还有其他红橙字形（10/100/...）或多个零：整体拒绝。
+            return None, False
+        comp_x, comp_y, comp_w, comp_h, comp_area = components[0]
+        expected_x = matched.rect[0] - region.x + int(round(zero_bbox[0] * scale))
+        expected_y = matched.rect[1] - region.y + int(round(zero_bbox[1] * scale))
+        expected_w = max(1, int(round(zero_bbox[2] * scale)))
+        expected_h = max(1, int(round(zero_bbox[3] * scale)))
+        overlap_w = max(
+            0, min(comp_x + comp_w, expected_x + expected_w) - max(comp_x, expected_x)
+        )
+        overlap_h = max(
+            0, min(comp_y + comp_h, expected_y + expected_h) - max(comp_y, expected_y)
+        )
+        if overlap_w * overlap_h / float(max(1, comp_area)) < 0.5:
+            return None, False
+        area_ratio = comp_area / float(expected_area)
+        if not _HP_GLYPH_AREA_RATIO_MIN <= area_ratio <= _HP_GLYPH_AREA_RATIO_MAX:
+            return None, False
+        sep_x = matched.rect[0] - region.x + int(round(separator_bbox[0] * scale))
+        sep_y = matched.rect[1] - region.y + int(round(separator_bbox[1] * scale))
+        sep_w = max(1, int(round(separator_bbox[2] * scale)))
+        sep_h = max(1, int(round(separator_bbox[3] * scale)))
+        separator_crop = classes[
+            max(0, sep_y) : max(0, sep_y) + sep_h,
+            max(0, sep_x) : max(0, sep_x) + sep_w,
+        ]
+        actual_separator = int(np.count_nonzero(separator_crop == 128))
+        expected_separator = max(1, int(round(separator_area * scale * scale)))
+        if actual_separator < max(2, int(round(expected_separator * 0.35))):
+            # 分隔符不完整（0 后面不是斜杠）时不确认零血。
+            return None, False
+        return 0, True
+
     def _hp_evidence(
         self,
         frame: Frame | None,
@@ -673,9 +924,24 @@ class PerceptionEngine:
             ids = self._battle_feature_ids(set())
             features = self._feature_matcher.match_many(ids, frame) if frame is not None else {}
         hud = self.profile.battle_hud
-        hp_fill_ratio, hp_evidence, hp_bar_found = self._hp_evidence(frame, features, hud)
+        hp_fill_ratio, bar_evidence, hp_bar_found = self._hp_evidence(frame, features, hud)
         hp_bar_feature = bool(self._hp_bar_check_enabled and "hp_bar_present" in self.profile.features)
         hp_bar_absent = bool(hp_bar_feature and not hp_bar_found)
+        hp_current, numeric_zero = self._hp_numeric_evidence(frame, hud, hp_bar_found)
+        if hud.hp_zero_feature is not None:
+            # 启用数字判零后空条不再单独授权；非零只沿用条形 alive/unknown。
+            if numeric_zero:
+                hp_evidence = "zero"
+            elif hp_bar_found and hp_fill_ratio is not None and hp_fill_ratio >= float(
+                hud.hp_bar_alive_min_ratio
+            ):
+                hp_evidence = "alive"
+            elif hp_fill_ratio is None:
+                hp_evidence = "unavailable"
+            else:
+                hp_evidence = "unknown"
+        else:
+            hp_evidence = bar_evidence
         banner = bool(features.get(hud.death_banner_feature) and features[hud.death_banner_feature].found)
         spectator = any(
             bool(features.get(feature_id) and features[feature_id].found) for feature_id in hud.spectator_features
@@ -683,11 +949,23 @@ class PerceptionEngine:
         if ship is None:
             ship = self._last_ship
         marker_lost = ship is None or ship.source == "lost"
+        hp_log_key = (hp_evidence, hp_current)
+        if hp_log_key != self._last_hp_log:
+            self._logger.info(
+                "血条证据变更: evidence=%s hp_current=%s fill=%s hp_bar_present=%s source=%s",
+                hp_evidence,
+                hp_current,
+                "无" if hp_fill_ratio is None else f"{hp_fill_ratio:.4f}",
+                hp_bar_found,
+                "numeric" if hud.hp_zero_feature is not None else "bar",
+            )
+            self._last_hp_log = hp_log_key
         if frame is not None and self._logger.isEnabledFor(logging.DEBUG):
             self._logger.debug(
-                "血条证据: fill=%s evidence=%s hp_bar_present=%s green_aux=%s",
+                "血条证据: fill=%s evidence=%s hp_current=%s hp_bar_present=%s green_aux=%s",
                 "无" if hp_fill_ratio is None else f"{hp_fill_ratio:.4f}",
                 hp_evidence,
+                hp_current,
                 hp_bar_found,
                 self._hp_green_ratio(frame),
             )
@@ -704,6 +982,7 @@ class PerceptionEngine:
             hp_fill_ratio=hp_fill_ratio,
             hp_evidence=hp_evidence,
             frame_id=frame.frame_id if frame is not None else None,
+            hp_current=hp_current,
         )
         self._last_death = signals
         return signals

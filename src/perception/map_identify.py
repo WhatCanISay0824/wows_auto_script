@@ -86,6 +86,7 @@ from ..common.coords import (
     mirror_x_matrix,
     nearest_axis_rotation,
 )
+from ..common.images import read_color_image
 from ..common.types import MapMatch
 from ..config.models import MapPack, PerceptionConfig
 
@@ -212,7 +213,7 @@ def _ncc(warped: np.ndarray, target: np.ndarray, valid: np.ndarray) -> float:
 def _read_background(path: Path) -> np.ndarray | None:
     if not path.is_file():
         return None
-    image = cv2.imread(str(path), cv2.IMREAD_COLOR)
+    image = read_color_image(path)
     if image is None or image.size == 0:
         return None
     return image

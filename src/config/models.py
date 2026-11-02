@@ -111,6 +111,8 @@ class BattleHudConfig:
     # 退出授权需要连续 N 帧确认归零，且最近证据在 TTL 内（超时/矛盾证据立即撤销）。
     hp_bar_confirm_frames: int = 2
     hp_bar_evidence_ttl_s: float = 1.0
+    #: 可选数字零血特征（例如 ``hp_zero_value``）；配置后空条不再单独授权 zero。
+    hp_zero_feature: str | None = None
     spectator_features: tuple[str, ...] = ()
     death_banner_feature: str = "death_banner"
     result_feature: str = "battle_results"

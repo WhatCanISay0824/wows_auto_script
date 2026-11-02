@@ -81,6 +81,42 @@ def test_battle_timing_and_counts() -> None:
     assert not controller.battle_in_progress
 
 
+def test_abort_battle_is_idempotent_and_does_not_count_completion() -> None:
+    events: list[tuple[str, dict]] = []
+    controller, clock, _ = make_controller(
+        on_event=lambda event, detail: events.append((event, detail))
+    )
+    controller.start()
+    assert controller.abort_battle("not_started") is None
+    controller.begin_battle()
+    clock.advance(12.5)
+    stop = controller.stop(StopReason.MANUAL, "用户停止")
+
+    duration = controller.abort_battle("pause_return_port")
+
+    assert duration == pytest.approx(12.5)
+    assert not controller.battle_in_progress
+    assert controller.battles_completed == 0
+    assert controller.last_battle_duration_s == pytest.approx(12.5)
+    assert controller.stop_request is stop
+    assert controller.stop_request.reason == StopReason.MANUAL
+    assert controller.abort_battle("again") is None
+    aborted = [detail for event, detail in events if event == "battle_aborted"]
+    assert aborted == [
+        {
+            "duration_s": 12.5,
+            "battles_completed": 0,
+            "reason": "pause_return_port",
+        }
+    ]
+
+    controller.begin_battle()
+    assert controller.battle_in_progress
+    clock.advance(2.0)
+    assert controller.end_battle("victory") == pytest.approx(2.0)
+    assert controller.battles_completed == 1
+
+
 def test_session_battles_cap() -> None:
     safety = SafetyConfig(max_battles_per_session=2)
     controller, _, _ = make_controller(safety=safety)

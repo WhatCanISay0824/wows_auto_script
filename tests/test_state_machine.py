@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -27,6 +28,8 @@ from src.config.models import (
     GlobalConfig,
     KeyMap,
     MapPack,
+    SafetyConfig,
+    SessionConfig,
     ShipProfile,
     SpawnPoint,
     StepDef,
@@ -35,8 +38,9 @@ from src.config.models import (
 from src.execution.safety import StopController
 from src.state_machine.accounts import AccountRotator
 from src.state_machine.machine import MachineDeps, StateMachine
+from src.state_machine.session import SessionController
 from src.state_machine.ship_check import ShipCheckStatus
-from src.state_machine.steps import StepStatus
+from src.state_machine.steps import StepSequenceExecutor, StepStatus
 
 # ---------------------------------------------------------------------------
 # 假依赖
@@ -215,6 +219,8 @@ class FakeSession:
         self.successes = 0
         self.battle_starts = 0
         self.battle_ends = 0
+        self.battle_aborts: list[str] = []
+        self.battle_active = False
         self._stop: StopRequest | None = None
 
     def start(self):
@@ -229,9 +235,18 @@ class FakeSession:
 
     def begin_battle(self) -> None:
         self.battle_starts += 1
+        self.battle_active = True
 
     def end_battle(self, result="") -> float:
         self.battle_ends += 1
+        self.battle_active = False
+        return 0.0
+
+    def abort_battle(self, reason: str = "") -> float | None:
+        if not self.battle_active:
+            return None
+        self.battle_active = False
+        self.battle_aborts.append(reason)
         return 0.0
 
     def check_stop(self):
@@ -250,6 +265,10 @@ class FakeSession:
     @property
     def battles_completed(self) -> int:
         return self.battle_ends
+
+    @property
+    def battle_in_progress(self) -> bool:
+        return self.battle_active
 
 
 class FakeSteps:
@@ -523,6 +542,44 @@ def drive_to_battle_active(h: Harness) -> None:
     assert h.machine.state is State.BATTLE_ACTIVE
 
 
+def _frame_observation(
+    now: float,
+    *,
+    frame_id: int,
+    frame_timestamp: float,
+    features: dict[str, MatchResult] | None = None,
+) -> Observation:
+    return Observation(
+        timestamp=now,
+        window_rect=(0, 0, 2560, 1600),
+        features=dict(features or {}),
+        frame_id=frame_id,
+        frame_timestamp=frame_timestamp,
+    )
+
+
+def _continue_from_active_battle(h: Harness) -> None:
+    """战斗内结算并点“继续战斗”，推进到下一场的 BATTLE_ACTIVE。"""
+    h.perception.features = {
+        "battle_results": _match("battle_results"),
+        "result_continue_battle_button": _match("result_continue_battle_button"),
+    }
+    h.step()
+    assert h.machine.state is State.BATTLE_FINISHED
+    h.clock.advance(0.2)
+    actions = h.step()
+    assert h.machine.state is State.EXITING
+    assert any(action.label == "result_continue" for action in actions)
+    h.perception.features = {"queue_indicator": _match("queue_indicator")}
+    h.step()
+    assert h.machine.state is State.START_COOP
+    h.step()
+    assert h.machine.state is State.QUEUEING
+    h.perception.features = {"battle_hud_indicator": _match("battle_hud_indicator")}
+    h.step()
+    assert h.machine.state is State.BATTLE_ACTIVE
+
+
 # ---------------------------------------------------------------------------
 # 测试
 # ---------------------------------------------------------------------------
@@ -610,12 +667,121 @@ def test_exit_menu_timeout_saves_diagnostic(tmp_path: Path) -> None:
     h.step()
     assert h.machine.state is State.EXIT_MENU_OPEN
     h.perception.last_frame = SimpleNamespace(image=object())  # 让诊断截图有帧可存
+    h.step()  # 首次发送 Esc。
     h.clock.advance(9.0)
+    h.perception.death = _death_signals(h.clock.now())
     h.step()  # 超时前先触发一次 ESC 重试（并保存 retry 诊断）
     assert "exit_menu_retry" in h.screenshots.diagnostics
     h.step()  # 超过 exit_menu_s -> ERROR_RECOVERY
     assert h.machine.state is State.ERROR_RECOVERY
     assert "exit_menu_timeout" in h.screenshots.diagnostics
+
+
+@pytest.mark.parametrize("visible", ["confirm", "menu", "direct"])
+def test_visible_exit_interface_discards_pending_escape(tmp_path: Path, visible: str) -> None:
+    h = Harness(tmp_path)
+    drive_to_battle_active(h)
+    h.perception.death = _death_signals(h.clock.now())
+    h.step()
+    h.clock.advance(2.5)
+    h.perception.death = _death_signals(h.clock.now())
+    h.step()
+    assert h.machine.state is State.EXIT_MENU_OPEN
+    if visible == "confirm":
+        h.perception.features["exit_confirm"] = _match("exit_confirm")
+    elif visible == "menu":
+        h.perception.features["exit_menu_panel"] = _match("exit_menu_panel")
+        h.perception.features["return_port"] = _match("return_port")
+    else:
+        h.machine.profile = replace(h.machine.profile, exit=replace(
+            h.machine.profile.exit, direct_exit_feature="direct_exit"
+        ))
+        h.perception.features["direct_exit"] = _match("direct_exit")
+
+    actions = h.step()
+
+    assert not any(action.key == "escape" for action in actions)
+    assert h.machine._pending_exit_actions == []
+    assert h.machine.state is (State.EXITING if visible == "direct" else State.EXIT_CONFIRMING)
+
+
+@pytest.mark.parametrize(
+    "evidence", ["missing", "unknown", "expired", "same_frame", "before_key", "stale_frame"]
+)
+def test_exit_menu_retry_requires_fresh_zero_after_first_escape(tmp_path: Path, evidence: str) -> None:
+    h = Harness(tmp_path)
+    drive_to_battle_active(h)
+    h.perception.features.clear()
+    h.perception.death = _death_signals(h.clock.now())
+    h.step()
+    h.clock.advance(2.5)
+    h.perception.death = _death_signals(h.clock.now())
+    h.step()
+    first = h.obs()
+    actions = h.machine.step(first, h.clock.now())
+    assert any(action.label == "exit_menu" for action in actions)
+    h.clock.advance(3.0)
+    now = h.clock.now()
+    death = _death_signals(now)
+    if evidence == "missing":
+        death = None
+    elif evidence == "unknown":
+        death = _death_signals(now, authorized=False)
+    elif evidence == "expired":
+        death = _death_signals(first.frame_timestamp)
+    observation = replace(h.obs(), death=death, frame_id=2)
+    if evidence == "same_frame":
+        observation = replace(observation, frame_id=first.frame_id, frame_timestamp=first.frame_timestamp)
+    elif evidence == "before_key":
+        observation = replace(observation, frame_timestamp=first.frame_timestamp - 0.5)
+    elif evidence == "stale_frame":
+        observation = replace(observation, frame_timestamp=now - 2.0)
+
+    actions = h.machine.step(observation, now)
+
+    assert not any(action.key == "escape" for action in actions)
+    assert h.machine.state is State.EXIT_MENU_OPEN
+    assert not h.machine._exit_retried
+
+
+def test_exit_menu_retry_still_works_for_new_zero_frame(tmp_path: Path) -> None:
+    h = Harness(tmp_path)
+    drive_to_battle_active(h)
+    h.perception.death = _death_signals(h.clock.now())
+    h.step()
+    h.clock.advance(2.5)
+    h.perception.death = _death_signals(h.clock.now())
+    h.step()
+    h.step()  # 首次 Esc。
+    h.clock.advance(3.0)
+    h.perception.death = _death_signals(h.clock.now())
+
+    actions = h.step()
+
+    assert any(action.label == "exit_menu_retry" for action in actions)
+    assert h.machine._exit_retried
+    assert h.step() == []
+
+
+def test_exit_menu_retry_waits_from_actual_first_escape(tmp_path: Path) -> None:
+    h = Harness(tmp_path)
+    drive_to_battle_active(h)
+    h.perception.death = _death_signals(h.clock.now())
+    h.step()
+    h.clock.advance(2.5)
+    h.perception.death = _death_signals(h.clock.now())
+    h.step()
+    h.clock.advance(3.0)
+    h.perception.death = _death_signals(h.clock.now())
+    assert any(action.label == "exit_menu" for action in h.step())
+    h.clock.advance(0.6)
+    h.perception.death = _death_signals(h.clock.now())
+
+    actions = h.step()
+
+    assert actions == []
+    assert not h.machine._exit_retried
+    assert h.machine.state is State.EXIT_MENU_OPEN
 
 
 def test_dead_exit_flow_to_port(tmp_path: Path) -> None:
@@ -744,6 +910,139 @@ def test_result_skips_continue_when_session_stopping(tmp_path: Path) -> None:
     assert "result_return_port" in labels
 
 
+def test_result_returns_to_port_at_global_session_cap(tmp_path: Path) -> None:
+    h = Harness(tmp_path)
+    safety = replace(h.app.global_config.safety, max_battles_per_session=1)
+    h.app = replace(h.app, global_config=replace(h.app.global_config, safety=safety))
+    h.machine.config = h.app
+    h.session = SessionController(h.app.global_config.session, safety, h.clock)
+    h.machine.deps.session = h.session
+    drive_to_battle_active(h)
+    h.perception.features = {
+        "battle_results": _match("battle_results"),
+        "result_continue_battle_button": _match("result_continue_battle_button"),
+        "result_return_port_button": _match("result_return_port_button"),
+    }
+    h.step()
+
+    actions = h.step()
+
+    assert any(action.label == "result_return_port" for action in actions)
+    assert not any(action.label == "result_continue" for action in actions)
+    h.perception.features = {"port_indicator": _match("port_indicator")}
+    h.step()
+    h.step()
+    assert h.machine.state is State.STOPPING
+    assert h.machine.battles_completed == h.session.battles_completed == 1
+
+
+@pytest.mark.parametrize("phase", ["starting", "start_full"])
+@pytest.mark.parametrize("visible, target", [
+    ("queue_indicator", State.QUEUEING),
+    ("loading_indicator", State.LOADING),
+    ("battle_hud_indicator", State.BATTLE_ACTIVE),
+])
+def test_port_start_adopts_actual_game_progress(tmp_path: Path, phase: str, visible: str, target: State) -> None:
+    h = Harness(tmp_path)
+    h.machine.start()
+    h.perception.detected = State.PORT
+    for _ in range(4):
+        h.step()
+    assert h.machine._port_phase == "starting"
+    steps = StepSequenceExecutor(h.app.keymap)
+    steps.start([StepDef(action="wait_feature", feature="queue_indicator", timeout_ms=20000)])
+    h.machine.deps.steps = steps
+    h.machine._port_phase = phase
+    h.perception.features = {visible: _match(visible)}
+    next_id = h.events.battle_id + 1
+
+    actions = h.step()
+
+    assert h.machine.state is target
+    assert h.machine.battle_id == next_id
+    assert h.session.battle_starts == 1
+    assert steps.status is StepStatus.DONE
+    assert actions == []
+    h.step()
+    assert h.events.battle_id == next_id
+    assert h.session.battle_starts == 1
+
+
+def test_port_start_unknown_frame_keeps_waiting(tmp_path: Path) -> None:
+    h = Harness(tmp_path)
+    h.machine.start()
+    h.perception.detected = State.PORT
+    for _ in range(4):
+        h.step()
+    steps = StepSequenceExecutor(h.app.keymap)
+    steps.start([StepDef(action="wait_feature", feature="queue_indicator", timeout_ms=20000)])
+    h.machine.deps.steps = steps
+
+    assert h.step() == []
+    assert h.machine.state is State.PORT
+    assert h.machine.battle_id is None
+    assert steps.status is StepStatus.RUNNING
+
+
+def test_successful_resume_clears_old_pause_reason(tmp_path: Path) -> None:
+    h = Harness(tmp_path)
+    drive_to_battle_active(h)
+    h.machine.request_pause("manual")
+    h.controller.resume()
+    h.perception.detected = State.BATTLE_ACTIVE
+    h.machine.request_resume()
+
+    h.step()
+
+    assert h.machine.state is State.BATTLE_ACTIVE
+    assert h.machine.pause_reason == ""
+
+
+@pytest.mark.parametrize("detected", [State.EXIT_MENU_OPEN, State.EXIT_CONFIRMING])
+def test_gui_return_preserves_visible_exit_interface(tmp_path: Path, detected: State) -> None:
+    h = Harness(tmp_path)
+    drive_to_battle_active(h)
+    h.perception.death = _death_signals(h.clock.now())
+    h.step()
+    h.clock.advance(2.5)
+    h.perception.death = _death_signals(h.clock.now())
+    h.step()
+    assert h.machine.state is State.EXIT_MENU_OPEN
+    battle_id = h.machine.battle_id
+    h.machine.suspend_for_gui()
+    h.perception.detected = detected
+    h.perception.features = {"exit_confirm": _match("exit_confirm")}
+
+    h.machine.continue_after_gui(h.obs(), h.clock.now())
+
+    assert h.machine.state is detected
+    assert h.machine.battle_id == battle_id
+    assert not h.controller.paused
+    assert h.executor.gate_open
+    actions = h.step()
+    assert not any(action.key == "escape" for action in actions)
+
+
+@pytest.mark.parametrize("source", ["gui", "pause"])
+def test_return_to_exit_dialog_does_not_authorize_living_ship_exit(tmp_path: Path, source: str) -> None:
+    h = Harness(tmp_path)
+    drive_to_battle_active(h)
+    h.perception.detected = State.EXIT_CONFIRMING
+    h.perception.features = {"exit_confirm": _match("exit_confirm")}
+    if source == "gui":
+        h.machine.suspend_for_gui()
+        h.machine.continue_after_gui(h.obs(), h.clock.now())
+    else:
+        h.machine.request_pause("manual")
+        h.controller.resume()
+        h.machine.request_resume()
+        h.step()
+
+    assert h.machine.state is State.PAUSED
+    assert h.step() == []
+    assert h.machine.battle_id is not None
+
+
 def test_result_returns_to_port_without_continue_button(tmp_path: Path) -> None:
     """结算页没有“继续战斗！”时回退到“回到港口”。"""
     h = Harness(tmp_path)
@@ -768,6 +1067,95 @@ def test_result_returns_to_port_without_continue_button(tmp_path: Path) -> None:
     assert h.machine.state is State.PORT
     assert h.events.battles and h.events.battles[-1][0] == "finished"
     assert h.machine.battles_completed == 1
+
+
+def test_result_missing_buttons_waits_60s_without_consuming_recovery(tmp_path: Path) -> None:
+    """复现旧 20 秒循环：按钮缺席时 20/40/59 秒仍留在结算，不进入异常恢复。"""
+    h = Harness(tmp_path)
+    drive_to_battle_active(h)
+    h.perception.features = {"battle_results": _match("battle_results")}
+    h.step()
+    assert h.machine.state is State.BATTLE_FINISHED
+    entered_at = h.clock.now()
+
+    for elapsed in (20.1, 40.1, 59.0):
+        h.clock.advance(elapsed - (h.clock.now() - entered_at))
+        actions = h.step()
+        assert h.machine.state is State.BATTLE_FINISHED
+        assert all(action.label == "battle_result" for action in actions)
+        assert len(h.machine._recovery_times) == 0  # noqa: SLF001
+        assert not any(item[2] is State.ERROR_RECOVERY for item in h.machine.transitions)
+
+
+def test_result_missing_buttons_pauses_once_at_60s_with_scores(tmp_path: Path) -> None:
+    h = Harness(tmp_path)
+    h.perception.last_frame = SimpleNamespace(image=object())
+    drive_to_battle_active(h)
+    h.perception.features = {"battle_results": _match("battle_results")}
+    h.step()
+    assert h.machine.state is State.BATTLE_FINISHED
+
+    h.clock.advance(60.1)
+    actions = h.step()
+
+    assert actions == []
+    assert h.machine.state is State.PAUSED
+    assert h.machine.pause_reason == "result_buttons_missing"
+    assert h.controller.pause_request is not None
+    assert "60" in h.controller.pause_request.detail
+    assert h.screenshots.diagnostics.count("result_buttons_missing") == 1
+    missing_logs = [
+        detail
+        for action_type, detail in h.events.actions
+        if action_type == "result_step" and detail.get("step") == "buttons_missing"
+    ]
+    assert len(missing_logs) == 1
+    assert "continue_score" in missing_logs[0]
+    assert "return_score" in missing_logs[0]
+    assert h.machine.battle_id is not None
+    assert h.machine.battles_completed == 0
+
+
+def test_result_continue_button_at_50s_still_continues(tmp_path: Path) -> None:
+    h = Harness(tmp_path)
+    drive_to_battle_active(h)
+    h.perception.features = {"battle_results": _match("battle_results")}
+    h.step()
+    h.clock.advance(50.0)
+    assert all(action.label == "battle_result" for action in h.step())
+    assert h.machine.state is State.BATTLE_FINISHED
+
+    h.perception.features["result_continue_battle_button"] = _match(
+        "result_continue_battle_button"
+    )
+    actions = h.step()
+
+    assert h.machine.state is State.EXITING
+    assert any(action.label == "result_continue" for action in actions)
+
+
+@pytest.mark.parametrize(
+    ("request_action", "expected"),
+    [
+        (lambda h: h.machine.request_pause("manual"), State.PAUSED),
+        (lambda h: h.machine.request_stop("emergency_stop", "F12"), State.STOPPING),
+    ],
+)
+def test_manual_pause_and_stop_take_priority_over_result_wait(
+    tmp_path: Path, request_action, expected: State
+) -> None:
+    h = Harness(tmp_path)
+    drive_to_battle_active(h)
+    h.perception.features = {"battle_results": _match("battle_results")}
+    h.step()
+    h.clock.advance(30.0)
+    battle_id = h.machine.battle_id
+
+    request_action(h)
+
+    assert h.machine.state is expected
+    assert h.machine.battle_id == (battle_id if expected is State.PAUSED else None)
+    assert h.machine.battles_completed == 0
 
 
 def test_banner_or_missing_hp_bar_does_not_authorize_exit(tmp_path: Path) -> None:
@@ -832,6 +1220,33 @@ def test_dead_wait_alive_evidence_returns_to_battle(tmp_path: Path) -> None:
     assert h.machine.state is State.BATTLE_ACTIVE
 
 
+@pytest.mark.parametrize("pause_resume", [False, True])
+def test_confirmed_numeric_zero_never_restarts_battle_flows(
+    tmp_path: Path, pause_resume: bool
+) -> None:
+    h = Harness(tmp_path)
+    drive_to_battle_active(h)
+    h.perception.features = {}
+    h.perception.death = replace(_death_signals(h.clock.now()), hp_current=0)
+    h.step()
+    assert h.machine.state is State.DEAD_PENDING_EXIT
+    nav_starts, behavior_starts = h.autopilot.started, h.behavior.started
+    h.clock.advance(20.0)
+    h.perception.death = _death_signals(h.clock.now(), authorized=False, hp_evidence="unknown")
+    if pause_resume:
+        h.machine.request_pause("manual")
+        h.perception.detected = State.BATTLE_ACTIVE
+        h.controller.resume()
+        h.machine.request_resume()
+    assert h.step() == []
+    assert h.machine.state is State.DEAD_PENDING_EXIT
+    assert (h.autopilot.started, h.behavior.started) == (nav_starts, behavior_starts)
+    h.clock.advance(3.0)
+    h.perception.death = replace(_death_signals(h.clock.now()), hp_current=0)
+    h.step()
+    assert h.machine.state is State.EXIT_MENU_OPEN
+
+
 def test_result_during_dead_wait_takes_priority(tmp_path: Path) -> None:
     h = Harness(tmp_path)
     drive_to_battle_active(h)
@@ -842,6 +1257,100 @@ def test_result_during_dead_wait_takes_priority(tmp_path: Path) -> None:
     h.step()
     assert h.machine.state is State.BATTLE_FINISHED
     assert "exit_requested" not in h.events.battle_marks
+
+
+def test_exit_menu_result_clears_pending_escape(tmp_path: Path) -> None:
+    """退出菜单待发送 ESC 时出现结算，必须直接分流且不发送缓存动作。"""
+    h = Harness(tmp_path)
+    drive_to_battle_active(h)
+    h.perception.death = _death_signals(h.clock.now())
+    h.step()
+    h.clock.advance(2.5)
+    h.perception.death = _death_signals(h.clock.now())
+    h.step()
+    assert h.machine.state is State.EXIT_MENU_OPEN
+    assert h.machine._pending_exit_actions  # noqa: SLF001 - 验证缓存动作被结算清除
+
+    h.perception.features = {"battle_results": _match("battle_results")}
+    actions = h.step()
+
+    assert h.machine.state is State.BATTLE_FINISHED
+    assert actions == []
+    assert h.machine._pending_exit_actions == []  # noqa: SLF001
+
+
+def test_exit_confirming_result_takes_priority_over_menu_fallback(tmp_path: Path) -> None:
+    h = Harness(tmp_path)
+    drive_to_battle_active(h)
+    h.perception.death = _death_signals(h.clock.now())
+    h.step()
+    h.clock.advance(2.5)
+    h.perception.death = _death_signals(h.clock.now())
+    h.step()
+    h.perception.features = {
+        "exit_menu_panel": _match("exit_menu_panel"),
+        "return_port": _match("return_port"),
+    }
+    h.step()
+    assert h.machine.state is State.EXIT_CONFIRMING
+
+    h.perception.features["battle_results"] = _match("battle_results")
+    actions = h.step()
+
+    assert h.machine.state is State.BATTLE_FINISHED
+    assert not any(action.label.startswith("exit_return_port") for action in actions)
+
+
+def test_exiting_result_takes_priority_over_exit_timeout(tmp_path: Path) -> None:
+    """复现实机：退出等待超过 exit_s 时同一帧已是结算页，应转结算而非暂停。"""
+    h = Harness(tmp_path)
+    drive_to_battle_active(h)
+    h.perception.death = _death_signals(h.clock.now())
+    h.step()
+    h.clock.advance(2.5)
+    h.perception.death = _death_signals(h.clock.now())
+    h.step()
+    h.perception.features = {"exit_confirm": _match("exit_confirm")}
+    h.step()
+    h.step()
+    assert h.machine.state is State.EXITING
+
+    h.perception.features = {"battle_results": _match("battle_results")}
+    h.clock.advance(181.0)
+    actions = h.step()
+
+    assert h.machine.state is State.BATTLE_FINISHED
+    assert actions == []
+    assert h.machine.battle_id is not None
+
+
+@pytest.mark.parametrize(
+    ("limit", "result_feature", "clicked_label"),
+    [
+        (10, "result_continue_battle_button", "result_continue"),
+        (1, "result_return_port_button", "result_return_port"),
+    ],
+)
+def test_result_screen_left_after_click_does_not_repeat_button(
+    tmp_path: Path, limit: int, result_feature: str, clicked_label: str
+) -> None:
+    h = Harness(tmp_path)
+    h.machine.set_rotation_limit(limit)
+    drive_to_battle_active(h)
+    h.perception.features = {
+        "battle_results": _match("battle_results"),
+        result_feature: _match(result_feature),
+    }
+    h.step()
+    h.clock.advance(0.2)
+    actions = h.step()
+    assert h.machine.state is State.EXITING
+    assert any(action.label == clicked_label for action in actions)
+
+    repeated = h.step()
+
+    assert h.machine.state is State.EXITING
+    assert not any(action.label == clicked_label for action in repeated)
 
 
 def test_battle_error_recovery_does_not_send_escape(tmp_path: Path) -> None:
@@ -856,6 +1365,229 @@ def test_battle_error_recovery_does_not_send_escape(tmp_path: Path) -> None:
     assert h.machine.state is State.PAUSED
     assert h.machine.pause_reason == "battle_unknown_interface"
     assert not any(action.label == "recovery_escape" for action in h.executor.submitted)
+
+
+@pytest.mark.parametrize(
+    ("with_context", "with_result", "expected"),
+    [
+        (True, True, State.BATTLE_FINISHED),
+        (True, False, State.PAUSED),
+        (False, True, State.PAUSED),
+    ],
+)
+def test_error_recovery_result_requires_current_context_and_evidence(
+    tmp_path: Path, with_context: bool, with_result: bool, expected: State
+) -> None:
+    h = Harness(tmp_path)
+    if with_context:
+        drive_to_battle_active(h)
+    else:
+        h.machine.start()
+        h.perception.detected = State.PORT
+        h.step()
+        assert h.machine.battle_id is None
+    h.perception.detected = State.BATTLE_FINISHED
+    if with_result:
+        h.perception.features = {"battle_results": _match("battle_results")}
+    h.machine._transition(State.ERROR_RECOVERY, "test_result_recovery")  # noqa: SLF001
+
+    h.step()
+
+    assert h.machine.state is expected
+    if expected is State.PAUSED:
+        assert h.machine.pause_reason == "recovery_mid_battle"
+
+
+def test_third_battle_death_result_continues_to_fourth(tmp_path: Path) -> None:
+    h = Harness(tmp_path)
+    h.machine.set_rotation_limit(10)
+    drive_to_battle_active(h)
+    _continue_from_active_battle(h)
+    assert h.machine.battles_completed == 1
+    _continue_from_active_battle(h)
+    assert h.machine.battles_completed == 2
+    third_battle_id = h.machine.battle_id
+
+    h.perception.features = {}
+    h.perception.death = _death_signals(h.clock.now())
+    h.step()
+    assert h.machine.state is State.DEAD_PENDING_EXIT
+    h.clock.advance(2.5)
+    h.perception.death = _death_signals(h.clock.now())
+    h.step()
+    assert h.machine.state is State.EXIT_MENU_OPEN
+    h.perception.features = {
+        "battle_results": _match("battle_results"),
+        "result_continue_battle_button": _match("result_continue_battle_button"),
+    }
+    h.step()
+    assert h.machine.state is State.BATTLE_FINISHED
+    h.clock.advance(0.2)
+    actions = h.step()
+    assert h.machine.state is State.EXITING
+    assert any(action.label == "result_continue" for action in actions)
+    h.perception.features = {"queue_indicator": _match("queue_indicator")}
+    h.step()
+    assert h.machine.battles_completed == 3
+    assert h.machine.state is State.START_COOP
+    h.step()
+    assert h.machine.state is State.QUEUEING
+    assert h.machine.battle_id is not None
+    assert h.machine.battle_id != third_battle_id
+    h.perception.features = {"battle_hud_indicator": _match("battle_hud_indicator")}
+    h.step()
+    assert h.machine.state is State.BATTLE_ACTIVE
+    assert h.machine.battles_completed == 3
+    assert h.session.battle_starts == 4
+
+
+def test_ten_battle_target_returns_port_and_stops(tmp_path: Path) -> None:
+    h = Harness(tmp_path)
+    h.machine.set_rotation_limit(10)
+    drive_to_battle_active(h)
+    for completed in range(1, 10):
+        _continue_from_active_battle(h)
+        assert h.machine.battles_completed == completed
+    assert h.machine.state is State.BATTLE_ACTIVE
+
+    h.perception.features = {
+        "battle_results": _match("battle_results"),
+        "result_continue_battle_button": _match("result_continue_battle_button"),
+        "result_return_port_button": _match("result_return_port_button"),
+    }
+    h.step()
+    assert h.machine.state is State.BATTLE_FINISHED
+    h.clock.advance(0.2)
+    actions = h.step()
+    assert h.machine.state is State.EXITING
+    assert any(action.label == "result_return_port" for action in actions)
+    assert not any(action.label == "result_continue" for action in actions)
+    h.perception.features = {"port_indicator": _match("port_indicator")}
+    h.step()
+    assert h.machine.state is State.POST_EXIT_INTERFACE
+    h.step()
+
+    assert h.machine.state is State.STOPPING
+    assert h.machine.battles_completed == 10
+    assert h.machine.stop_request is not None
+    assert str(h.machine.stop_request.reason) == "account_rotation"
+
+
+def test_exit_menu_fallback_waits_for_interval_and_new_frame(tmp_path: Path) -> None:
+    h = Harness(tmp_path)
+    drive_to_battle_active(h)
+    h.perception.death = _death_signals(h.clock.now())
+    h.step()
+    h.clock.advance(2.5)
+    h.perception.death = _death_signals(h.clock.now())
+    h.step()
+    assert h.machine.state is State.EXIT_MENU_OPEN
+    t0 = h.clock.now()
+    h.perception.features = {
+        "exit_menu_panel": _match("exit_menu_panel"),
+        "return_port": _match("return_port"),
+    }
+
+    first = h.machine.step(
+        _frame_observation(t0, frame_id=10, frame_timestamp=100.0), t0
+    )
+    assert h.machine.state is State.EXIT_CONFIRMING
+    assert any(action.label == "exit_return_port" for action in first)
+
+    h.clock.advance(0.2)
+    early_new_frame = h.machine.step(
+        _frame_observation(t0 + 0.2, frame_id=11, frame_timestamp=100.2),
+        t0 + 0.2,
+    )
+    assert early_new_frame == []
+    assert h.machine.state is State.EXIT_CONFIRMING
+
+    h.clock.advance(0.4)
+    same_frame = h.machine.step(
+        _frame_observation(t0 + 0.6, frame_id=11, frame_timestamp=100.2),
+        t0 + 0.6,
+    )
+    assert same_frame == []
+    assert h.machine.state is State.EXIT_CONFIRMING
+
+    h.clock.advance(0.1)
+    retry = h.machine.step(
+        _frame_observation(t0 + 0.7, frame_id=12, frame_timestamp=100.7),
+        t0 + 0.7,
+    )
+    assert any(action.label == "exit_return_port_fallback" for action in retry)
+
+    h.clock.advance(0.6)
+    same_retry_frame = h.machine.step(
+        _frame_observation(t0 + 1.3, frame_id=12, frame_timestamp=100.7),
+        t0 + 1.3,
+    )
+    assert same_retry_frame == []
+
+
+def test_exit_menu_fallback_still_times_out_with_new_frames(tmp_path: Path) -> None:
+    h = Harness(tmp_path)
+    drive_to_battle_active(h)
+    h.perception.death = _death_signals(h.clock.now())
+    h.step()
+    h.clock.advance(2.5)
+    h.perception.death = _death_signals(h.clock.now())
+    h.step()
+    assert h.machine.state is State.EXIT_MENU_OPEN
+    t0 = h.clock.now()
+    h.perception.features = {
+        "exit_menu_panel": _match("exit_menu_panel"),
+        "return_port": _match("return_port"),
+    }
+    h.machine.step(_frame_observation(t0, frame_id=30, frame_timestamp=300.0), t0)
+    assert h.machine.state is State.EXIT_CONFIRMING
+
+    for offset in range(1, 10):
+        h.clock.advance(0.6)
+        now = t0 + offset * 0.6
+        frame_timestamp = 300.0 + offset * 0.6
+        actions = h.machine.step(
+            _frame_observation(
+                now, frame_id=30 + offset, frame_timestamp=frame_timestamp
+            ),
+            now,
+        )
+        if now - t0 > 5.0:
+            assert h.machine.state is State.EXITING
+            assert not any(action.label == "exit_return_port_fallback" for action in actions)
+            break
+        assert h.machine.state is State.EXIT_CONFIRMING
+        assert any(action.label == "exit_return_port_fallback" for action in actions)
+    else:
+        pytest.fail("持续菜单补点未在确认等待超时后进入 EXITING")
+
+
+def test_exit_confirm_has_priority_over_menu_fallback(tmp_path: Path) -> None:
+    h = Harness(tmp_path)
+    drive_to_battle_active(h)
+    h.perception.death = _death_signals(h.clock.now())
+    h.step()
+    h.clock.advance(2.5)
+    h.perception.death = _death_signals(h.clock.now())
+    h.step()
+    t0 = h.clock.now()
+    h.perception.features = {
+        "exit_menu_panel": _match("exit_menu_panel"),
+        "return_port": _match("return_port"),
+    }
+    h.machine.step(_frame_observation(t0, frame_id=20, frame_timestamp=200.0), t0)
+    assert h.machine.state is State.EXIT_CONFIRMING
+
+    h.perception.features["exit_confirm"] = _match("exit_confirm")
+    h.clock.advance(0.6)
+    actions = h.machine.step(
+        _frame_observation(t0 + 0.6, frame_id=21, frame_timestamp=200.6),
+        t0 + 0.6,
+    )
+
+    assert h.machine.state is State.EXITING
+    assert any(action.label == "exit_confirm" for action in actions)
+    assert not any(action.label == "exit_return_port_fallback" for action in actions)
 
 
 def test_pause_and_resume(tmp_path: Path) -> None:
@@ -933,6 +1665,66 @@ def test_resume_to_port_aborts_unfinished_battle(tmp_path: Path) -> None:
     assert h.machine.battle_id is None
     assert h.events.battles and h.events.battles[-1][0] == "aborted"
     assert h.battle_contexts[-1] is None
+
+
+def test_resume_to_port_abort_clears_session_timer_even_if_db_write_fails(tmp_path: Path) -> None:
+    h = Harness(tmp_path)
+    drive_to_battle_active(h)
+    assert h.session.battle_in_progress
+
+    def fail_end_battle(*args, **kwargs) -> None:
+        raise RuntimeError("db down")
+
+    h.events.end_battle = fail_end_battle  # type: ignore[method-assign]
+    h.machine.request_pause("manual")
+    h.perception.detected = State.PORT
+    h.controller.resume()
+    h.machine.request_resume()
+    h.step()
+
+    assert h.machine.state is State.PORT
+    assert not h.session.battle_in_progress
+    assert len(h.session.battle_aborts) == 1
+    assert h.session.battles_completed == 0
+
+
+def test_real_session_port_interrupt_allows_next_battle_without_extra_completion(tmp_path: Path) -> None:
+    h = Harness(tmp_path)
+    real_session = SessionController(SessionConfig(), SafetyConfig(), h.clock)
+    h.session = real_session  # type: ignore[assignment]
+    h.machine.deps.session = real_session
+    drive_to_battle_active(h)
+    old_battle_id = h.machine.battle_id
+    assert old_battle_id is not None
+    assert real_session.battle_in_progress
+
+    h.clock.advance(12.0)
+    h.machine.request_pause("manual")
+    h.perception.detected = State.PORT
+    h.perception.features = {"port_indicator": _match("port_indicator")}
+    h.controller.resume()
+    h.machine.request_resume()
+    h.step()
+
+    assert h.machine.state is State.PORT
+    assert h.machine.battle_id is None
+    assert not real_session.battle_in_progress
+    assert real_session.battles_completed == 0
+
+    h.step()  # PORT idle -> verify
+    h.step()  # verify -> start
+    h.step()  # start -> starting
+    h.step()  # start sequence done -> START_COOP
+    assert h.machine.state is State.START_COOP
+    h.perception.features = {"queue_indicator": _match("queue_indicator")}
+    h.step()
+
+    assert h.machine.state is State.QUEUEING
+    assert h.machine.battle_id is not None
+    assert h.machine.battle_id != old_battle_id
+    assert real_session.battle_in_progress
+    assert real_session.battles_completed == 0
+    assert h.events.battles and h.events.battles[-1][0] == "aborted"
 
 
 def test_stop_while_in_battle_aborts_record(tmp_path: Path) -> None:
