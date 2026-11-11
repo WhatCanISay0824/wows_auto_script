@@ -509,12 +509,25 @@ class ShipLocator:
     ) -> _Detection | None:
         predicted = self._predict(timestamp)
         if self._hsv_lower is not None and self._hsv_upper is not None:
-            mask = self._color_mask_bgr(image_bgr)
-        else:
-            # 未配置颜色范围时退化为「亮度阈值 + 上一帧附近搜索」（评审 P0-6 降级路径）。
-            mask = self._brightness_mask(gray)
+            raw_mask = self._raw_color_mask_bgr(image_bgr)
+            mask = self._clean_mask(raw_mask)
+            best = self._detect_from_mask(mask, predicted)
+            if best is not None or np.array_equal(mask, raw_mask):
+                return best
+            # 去噪掩码找不到合格标记时，保留同 HSV 约束回退到原始颜色掩码。
+            return self._detect_from_mask(raw_mask, predicted)
+        mask = self._brightness_mask(gray)
+        return self._detect_from_mask(mask, predicted, gate_by_prediction=True)
+
+    def _detect_from_mask(
+        self,
+        mask: np.ndarray,
+        predicted: tuple[float, float] | None,
+        *,
+        gate_by_prediction: bool = False,
+    ) -> _Detection | None:
         candidates = self._color_candidates(mask, predicted)
-        if self._hsv_lower is None and predicted is not None:
+        if gate_by_prediction and predicted is not None:
             gate = max(self._search_radius * 2.0, 32.0)
             candidates = [
                 (center_x, center_y)
@@ -529,11 +542,17 @@ class ShipLocator:
             best = self._pick_better(best, detection, predicted)
         return best
 
-    def _color_mask_bgr(self, image_bgr: np.ndarray) -> np.ndarray:
+    def _raw_color_mask_bgr(self, image_bgr: np.ndarray) -> np.ndarray:
         hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
-        mask = cv2.inRange(hsv, self._hsv_lower, self._hsv_upper)  # type: ignore[arg-type]
+        return cv2.inRange(hsv, self._hsv_lower, self._hsv_upper)  # type: ignore[arg-type]
+
+    @staticmethod
+    def _clean_mask(mask: np.ndarray) -> np.ndarray:
         kernel = np.ones((MORPH_KERNEL_SIZE, MORPH_KERNEL_SIZE), dtype=np.uint8)
         return cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+
+    def _color_mask_bgr(self, image_bgr: np.ndarray) -> np.ndarray:
+        return self._clean_mask(self._raw_color_mask_bgr(image_bgr))
 
     def _brightness_mask(self, gray: np.ndarray) -> np.ndarray:
         """未配置 HSV 时的候选掩码：按模板亮度中值分割（自身标记通常是最亮元素）。"""

@@ -7,10 +7,236 @@ from dataclasses import replace
 import pytest
 from src.behavior.random_profile import RandomProfile
 from src.behavior.scheduler import BehaviorContext, BehaviorScheduler
-from src.common.types import ActionKind, NormalizedRect, Observation, Rect, ShipPosition
+from src.common.types import (
+    ActionKind,
+    CombatObservation,
+    EnemyContact,
+    NormalizedRect,
+    Observation,
+    Rect,
+    ShipPosition,
+)
 from src.config.models import BehaviorConfig, ConsumableSlot, KeyMap
 
 FAR = 1000.0  # 用于把不需要的计时器推到很远的间隔（截断正态在 [1000,1000] 上恒为 1000）
+
+
+def test_targeted_mode_replaces_random_camera_fire_and_watchdog() -> None:
+    cfg = make_config(targeted_combat=True, camera_interval_s=(1, 1), attack_interval_s=(1, 1),
+                      activity_watchdog_s=(1, 1), battle_start_quiet_s=0)
+    scheduler, events = collect_scheduler(cfg, make_profile(consumable_ratio=1))
+    for now in (2., 4., 6.):
+        assert scheduler.tick(make_observation(now), now) == []
+    frame = CombatObservation(10, 1, (100, 100), 90, (EnemyContact((200, 100)),))
+    obs = replace(make_observation(10), combat=frame)
+    actions = scheduler.tick(obs, 10)
+    assert [a.kind for a in actions] == [ActionKind.KEY_TAP]
+    assert actions[0].key == 'mouse_left'
+    assert all(n not in event_names(events) for n in ('watchdog', 'camera_move', 'fire_burst', 'consumable'))
+
+
+@pytest.mark.parametrize('reason', ['foreground', 'modal', 'stale', 'stopped', 'quiet', 'not_battle'])
+def test_targeted_mode_keeps_all_input_guards(reason: str) -> None:
+    scheduler, _ = collect_scheduler(make_config(targeted_combat=True), make_profile())
+    obs = replace(make_observation(20), combat=CombatObservation(20, 1, (100, 100), 90, (EnemyContact((200, 100)),)))
+    context = make_context()
+    now = 20.
+    if reason == 'foreground':
+        context = replace(context, foreground=False)
+    elif reason == 'modal':
+        context = replace(context, modal_visible=True)
+    elif reason == 'stale':
+        now = 25
+    elif reason == 'stopped':
+        scheduler.stop()
+    elif reason == 'quiet':
+        now = 5
+        obs = replace(obs, frame_timestamp=5, combat=replace(obs.combat, timestamp=5))
+    else:
+        context = replace(context, in_battle=False)
+    assert scheduler.tick(obs, now, context) == []
+
+
+def test_targeted_fire_counts_press_and_release_in_quota() -> None:
+    scheduler, _ = collect_scheduler(make_config(targeted_combat=True, actions_per_minute_max=2), make_profile())
+    def obs(now):
+        return replace(make_observation(now), combat=CombatObservation(now, int(now), (100, 100), 90,
+                       (EnemyContact((200, 100)),)))
+    assert len(scheduler.tick(obs(20), 20)) == 1
+    assert scheduler.tick(obs(30), 30) == []
+    assert len(scheduler.tick(obs(81), 81)) == 1
+
+
+def combat_observation(
+    now: float,
+    *,
+    enemies: tuple[EnemyContact, ...] = (),
+    candidates: int = 0,
+    camera: float | None = None,
+) -> Observation:
+    return replace(
+        make_observation(now),
+        combat=CombatObservation(now, int(round(now * 10)), (100.0, 100.0), camera, enemies, candidates),
+    )
+
+
+def idle_config(**overrides) -> BehaviorConfig:
+    values = {
+        "targeted_combat": True,
+        "battle_start_quiet_s": 0.0,
+        "idle_camera_interval_s": (2.0, 2.0),
+        "idle_camera_move_px": (40, 40),
+        "idle_camera_duration_s": (0.6, 0.6),
+        "idle_camera_actions_per_minute_max": 180,
+    }
+    values.update(overrides)
+    return make_config(**values)
+
+
+def test_idle_camera_moves_during_initial_quiet_without_enemy() -> None:
+    scheduler, events = collect_scheduler(
+        idle_config(battle_start_quiet_s=10.0), make_profile(seed=2026)
+    )
+    scheduler.notify_activity(1.0)
+    actions = []
+    action_times = []
+    for index in range(0, 90):
+        now = index / 10.0
+        produced = scheduler.tick(combat_observation(now), now)
+        actions.extend(produced)
+        if produced:
+            action_times.append(now)
+
+    assert action_times
+    assert action_times[0] <= 5.0
+    assert all(action.kind is ActionKind.MOVE_REL for action in actions)
+    assert all(action.label == "idle_camera" and action.dy == 0 for action in actions)
+    assert not any(action.label == "combat_fire" for action in actions)
+    bursts = 1 + sum(
+        later - earlier > 1.0
+        for earlier, later in zip(action_times, action_times[1:], strict=False)
+    )
+    movement_events = [detail for event, detail in events if event == "idle_camera_move"]
+    assert len(movement_events) == bursts
+    assert all("amplitude_px" in detail and "duration_s" in detail for detail in movement_events)
+
+
+def test_idle_camera_cancels_on_candidate_and_does_not_resume_old_remainder() -> None:
+    scheduler, _ = collect_scheduler(idle_config(), make_profile(seed=3))
+    actions = []
+    for index in range(0, 23):
+        now = index / 10.0
+        actions = scheduler.tick(combat_observation(now), now)
+    assert actions and actions[0].label == "idle_camera"
+
+    assert scheduler.tick(combat_observation(2.3, candidates=1), 2.3) == []
+    assert scheduler.tick(combat_observation(2.4), 2.4) == []
+    resumed = []
+    for index in range(25, 60):
+        now = index / 10.0
+        produced = scheduler.tick(combat_observation(now), now)
+        if produced:
+            resumed = produced
+            break
+    assert resumed
+    assert resumed[0].label == "idle_camera"
+
+
+def test_confirmed_enemy_uses_existing_combat_action_after_idle() -> None:
+    scheduler, _ = collect_scheduler(idle_config(), make_profile(seed=4))
+    for index in range(0, 23):
+        now = index / 10.0
+        scheduler.tick(combat_observation(now), now)
+
+    enemy = EnemyContact((200.0, 100.0))
+    actions = scheduler.tick(combat_observation(2.3, enemies=(enemy,), camera=90.0), 2.3)
+    assert [action.kind for action in actions] == [ActionKind.KEY_TAP]
+    assert actions[0].label == "combat_fire"
+
+
+def test_idle_quota_is_separate_from_combat_quota() -> None:
+    scheduler, events = collect_scheduler(
+        idle_config(idle_camera_actions_per_minute_max=1), make_profile(seed=5)
+    )
+    actions = []
+    for index in range(0, 23):
+        now = index / 10.0
+        actions.extend(scheduler.tick(combat_observation(now), now))
+    assert actions and actions[0].label == "idle_camera"
+    assert scheduler.tick(combat_observation(2.4), 2.4) == []
+    assert any(event == "idle_camera_rate_limited" for event, _ in events)
+
+    enemy = EnemyContact((200.0, 100.0))
+    actions = scheduler.tick(combat_observation(2.5, enemies=(enemy,), camera=90.0), 2.5)
+    assert [action.kind for action in actions] == [ActionKind.KEY_TAP]
+    assert actions[0].label == "combat_fire"
+
+
+def test_idle_still_moves_after_combat_quota_is_exhausted() -> None:
+    scheduler, _ = collect_scheduler(
+        idle_config(actions_per_minute_max=2), make_profile(seed=6)
+    )
+    enemy = EnemyContact((200.0, 100.0))
+    actions = scheduler.tick(combat_observation(0.0, enemies=(enemy,), camera=90.0), 0.0)
+    assert [action.kind for action in actions] == [ActionKind.KEY_TAP]
+
+    idle_actions = []
+    for index in range(1, 40):
+        now = index / 10.0
+        produced = scheduler.tick(combat_observation(now), now)
+        if produced:
+            idle_actions.extend(produced)
+            break
+    assert idle_actions
+    assert idle_actions[0].label == "idle_camera"
+
+
+@pytest.mark.parametrize(
+    "blocker",
+    ["foreground", "modal", "stale", "future", "window_missing", "capture_error", "not_battle", "stop", "resume", "start"],
+)
+def test_idle_motion_is_cleared_by_lifecycle_and_input_gates(blocker: str) -> None:
+    scheduler, _ = collect_scheduler(idle_config(), make_profile(seed=7))
+    actions = []
+    for index in range(0, 23):
+        now = index / 10.0
+        actions = scheduler.tick(combat_observation(now), now)
+    assert actions and actions[0].label == "idle_camera"
+
+    if blocker == "foreground":
+        assert scheduler.tick(combat_observation(2.3), 2.3, make_context(foreground=False)) == []
+    elif blocker == "modal":
+        assert scheduler.tick(combat_observation(2.3), 2.3, make_context(modal_visible=True)) == []
+    elif blocker == "stale":
+        assert scheduler.tick(make_observation(2.3, frame_timestamp=1.0), 2.3) == []
+    elif blocker == "future":
+        assert scheduler.tick(make_observation(2.3, frame_timestamp=2.4), 2.3) == []
+    elif blocker == "window_missing":
+        assert scheduler.tick(replace(combat_observation(2.3), window_missing=True), 2.3) == []
+    elif blocker == "capture_error":
+        assert scheduler.tick(replace(combat_observation(2.3), capture_error="boom"), 2.3) == []
+    elif blocker == "not_battle":
+        assert scheduler.tick(combat_observation(2.3), 2.3, make_context(in_battle=False)) == []
+    elif blocker == "stop":
+        scheduler.stop()
+        assert scheduler.tick(combat_observation(2.3), 2.3) == []
+        scheduler.resume(2.4)
+    elif blocker == "resume":
+        scheduler.resume(2.3)
+    else:
+        scheduler.start(make_profile(seed=8), 2.3)
+
+    assert scheduler.tick(combat_observation(2.4), 2.4) == []
+    resumed = []
+    for index in range(25, 80):
+        now = index / 10.0
+        produced = scheduler.tick(combat_observation(now), now)
+        if produced:
+            resumed = produced
+            break
+    assert resumed
+    assert resumed[0].label == "idle_camera"
+    assert resumed[0].kind is ActionKind.MOVE_REL
 
 
 def make_keymap() -> KeyMap:

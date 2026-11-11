@@ -13,7 +13,7 @@
 - 识别不到自身标记时最多等待 10 秒，之后回退到 ``(0.5, 0.5)`` 并记录 warning。
 - 自动目标在 M 开图前用当前小地图筛选安全水面（避开岛屿/海岸）；图像不可用、无效或
   没有安全候选时本周期不按 M、不点击，10 秒后重试；用户显式目标保持原坐标，不做水面偏移。
-- 自动选中的目标在本次 M 开图/点击/关图期间冻结；未确认移动的目标加入最多 16 个失败
+- 自动选中的目标在本次 M 开图/点击/关图期间冻结；可靠观测未确认移动的目标加入最多 16 个失败
   邻域，后续周期避开其 0.06 归一化邻域；成功移动、start/reset 或用户替换时清理。
 
 坐标换算（实现补充 10.1）：
@@ -137,6 +137,9 @@ class _VerifyState:
     speed_mps: float = 0.0
     confirmed: bool = False
     confirmed_by: str = ""
+    first_sample_at: float | None = None
+    last_sample_at: float | None = None
+    position_samples: int = 0
 
 
 class AutoPilotNavigator:
@@ -386,9 +389,10 @@ class AutoPilotNavigator:
                 and observation.frame_timestamp > self._battle_view_after):
             self._battle_view_after = None
         self._remember_own_position(observation)
-        if (self._phase in (_Phase.RECLICK, _Phase.WAIT_MARKER)
-                and observation.ship is not None and observation.ship.source != "lost"):
-            self._movement_reference = tuple(observation.ship.minimap_px)
+        if self._phase in (_Phase.RECLICK, _Phase.WAIT_MARKER):
+            self._movement_reference = (
+                tuple(observation.ship.minimap_px) if self._reliable_position(observation, now) else None
+            )
 
         phase = self._phase
         if phase is _Phase.WAIT_MARKER:
@@ -413,7 +417,7 @@ class AutoPilotNavigator:
                 return []
             return self._close_map(observation, now)
         if phase is _Phase.VERIFY:
-            self._update_verify(observation)
+            self._update_verify(observation, now)
             verify = self._verify
             if verify is not None and verify.confirmed:
                 self._confirm(now)
@@ -543,11 +547,39 @@ class AutoPilotNavigator:
     # ------------------------------------------------------------------
     # 验证
     # ------------------------------------------------------------------
-    def _update_verify(self, observation: Observation) -> None:
+    @staticmethod
+    def _marker_position_available(observation: Observation) -> bool:
+        ship = observation.ship
+        return bool(
+            ship is not None and ship.source == "marker" and ship.confidence >= 0.6
+            and all(math.isfinite(value) for value in (*ship.minimap_px, ship.speed_mps))
+        )
+
+    def _reliable_position(self, observation: Observation, now: float) -> bool:
+        timestamp = observation.frame_timestamp
+        return bool(
+            not observation.window_missing and not observation.capture_error
+            and timestamp is not None and math.isfinite(timestamp)
+            and 0 <= now - timestamp <= _OBS_MISSING_GRACE_S
+            and self._marker_position_available(observation)
+        )
+
+    def _update_verify(self, observation: Observation, now: float) -> None:
         verify = self._verify
         if verify is None:
             return
-        if observation.frame_timestamp is None or observation.frame_timestamp <= verify.started_at:
+        sample_at = observation.frame_timestamp
+        if (not self._reliable_position(observation, now)
+                or sample_at <= verify.started_at):
+            # 无效或旧画面中断静止证据，不能用预测位置填补观测缺口。
+            verify.ref_px = None
+            verify.first_sample_at = None
+            verify.last_sample_at = None
+            verify.position_samples = 0
+            verify.displacement_px = 0.0
+            verify.speed_mps = 0.0
+            return
+        if verify.last_sample_at is not None and sample_at <= verify.last_sample_at:
             return
         self._battle_view_after = None
         # HUD 提示只能证明识别到激活文字，不能证明舰船已经移动。
@@ -555,14 +587,21 @@ class AutoPilotNavigator:
         if verify_feature and observation.found(verify_feature):
             self.activation_detected = True
         ship = observation.ship
-        if ship is None or ship.source == "lost":
-            return
+        assert ship is not None
         current = (float(ship.minimap_px[0]), float(ship.minimap_px[1]))
+        if verify.last_sample_at is not None and sample_at - verify.last_sample_at > _OBS_MISSING_GRACE_S:
+            verify.ref_px = None
+            verify.first_sample_at = None
+            verify.position_samples = 0
+            verify.displacement_px = 0.0
+        if verify.first_sample_at is None:
+            verify.first_sample_at = sample_at
+        verify.last_sample_at = sample_at
+        verify.position_samples += 1
         verify.speed_mps = abs(float(ship.speed_mps))
         if verify.ref_px is None:
             # 关图时自身标记不可用：用验证窗口内首个可用样本作为参考
             verify.ref_px = current
-            return
         displacement = math.dist(current, verify.ref_px)
         verify.displacement_px = max(verify.displacement_px, displacement)
         if (
@@ -604,9 +643,26 @@ class AutoPilotNavigator:
         )
 
     def _verify_failed(self, now: float) -> None:
+        verify = self._verify
+        sufficient = (
+            verify is not None and verify.position_samples >= 2
+            and verify.first_sample_at is not None and verify.last_sample_at is not None
+            and verify.first_sample_at - verify.started_at <= _OBS_MISSING_GRACE_S
+            and now - verify.last_sample_at <= _OBS_MISSING_GRACE_S
+        )
+        if not sufficient:
+            self._emit(
+                "autopilot_verify_waiting", now, reason="position_evidence_insufficient",
+                position_samples=verify.position_samples if verify else 0,
+                observed_span_s=round(verify.last_sample_at - verify.first_sample_at, 3)
+                if verify and verify.first_sample_at is not None and verify.last_sample_at is not None else 0.0,
+            )
+            self._logger.warning("autopilot 定位证据不足，保留目标并继续等待，不排除目标或重新开图")
+            self._verify = _VerifyState(started_at=now)
+            self._phase_deadline = now + max(0.0, float(self.config.full_map_verify_s))
+            return
         self.verify_failed = True
         self.move_confirmed = False
-        verify = self._verify
         self._attempt += 1
         attempt = self._attempt
         self._map_sequence = False
@@ -629,7 +685,7 @@ class AutoPilotNavigator:
                 excluded=len(self._failed_targets),
             )
             self._logger.warning(
-                "autopilot 自动目标未产生移动，加入失败邻域（目标 %s，累计 %d 个）",
+                "autopilot 有效观测未确认移动，加入失败邻域（目标 %s，累计 %d 个）",
                 [round(failed_target[0], 4), round(failed_target[1], 4)],
                 len(self._failed_targets),
             )
@@ -640,6 +696,8 @@ class AutoPilotNavigator:
             "displacement_px": round(verify.displacement_px, 2) if verify else 0.0,
             "speed_mps": round(verify.speed_mps, 3) if verify else 0.0,
             "target": list(self._last_target.normalized) if self._last_target else None,
+            "position_samples": verify.position_samples,
+            "observed_span_s": round(verify.last_sample_at - verify.first_sample_at, 3),
         }
         self._emit("autopilot_verify_failed", now, **detail)
         self._logger.warning(
@@ -699,6 +757,12 @@ class AutoPilotNavigator:
 
     def _handle_missing_observation(self, now: float) -> list[Action]:
         """地图动作序列期间感知不可用：不盲点；超过宽限时间则尽力关图后中止。"""
+        if self._phase is _Phase.VERIFY:
+            if self._verify is not None:
+                self._verify = _VerifyState(started_at=self._verify.started_at)
+            if now >= self._phase_deadline:
+                self._verify_failed(now)
+            return []
         if not self._map_sequence or now < self._phase_deadline + _OBS_MISSING_GRACE_S:
             return []
         map_was_open = self._map_open
@@ -790,7 +854,7 @@ class AutoPilotNavigator:
     def _current_own_norm(self, observation: Observation) -> tuple[float, float] | None:
         """当前观测的自身标记归一化位置；使用实际小地图内容尺寸，不用旧出生点。"""
         ship = observation.ship
-        if ship is None or ship.source == "lost":
+        if not self._marker_position_available(observation):
             return None
         content = self._minimap_content_rect(observation)
         if content is None or content.w <= 0 or content.h <= 0:
@@ -814,7 +878,7 @@ class AutoPilotNavigator:
 
     def _remember_own_position(self, observation: Observation) -> None:
         ship = observation.ship
-        if ship is None or ship.source == "lost":
+        if not self._marker_position_available(observation):
             return
         if self._own_norm is not None:
             return

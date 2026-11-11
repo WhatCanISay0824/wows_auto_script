@@ -34,6 +34,7 @@ from ..common.types import (
 )
 from ..config.models import AppConfig, BattleHudConfig, ClientProfile, MapPack, PerceptionConfig
 from .capture import Frame, GdiCapture
+from .combat import MinimapCombatObserver
 from .death import DeathDetector
 from .features import FeatureMatcher
 from .map_identify import MapIdentifier
@@ -295,6 +296,7 @@ class PerceptionEngine:
         self._last_hp_log: tuple[str, int | None] | None = None
         # 以下显示/解析类可选：main 启动时按当前船只调用 configure_ship_hp_bar() 覆盖
         self._extras_configured = False
+        self._combat_observer = MinimapCombatObserver(self.profile.minimap) if self.profile.minimap else None
 
     # ------------------------------------------------------------------
     # 生命周期与状态
@@ -346,6 +348,8 @@ class PerceptionEngine:
         self._last_map_match = None
         self._last_map_check = float("-inf")
         self._last_map_id = None
+        if self._combat_observer is not None:
+            self._combat_observer.reset()
 
     def end_battle(self) -> None:
         self._death_detector = None
@@ -355,6 +359,8 @@ class PerceptionEngine:
         self._calibration = None
         self._last_map_match = None
         self._ship_locator.reset()
+        if self._combat_observer is not None:
+            self._combat_observer.reset()
 
     def close(self) -> None:
         if self._capture is not None:
@@ -1039,6 +1045,13 @@ class PerceptionEngine:
             features.update(self._feature_matcher.match_many(extra, frame))
         ship = self.locate_own_ship(now, frame)
         death = self.check_death(now, frame, features, ship) if self._death_detector is not None else None
+        combat = None
+        if self.config.global_config.behavior.targeted_combat and current is State.BATTLE_ACTIVE:
+            region = self.minimap_content_rect(frame)
+            if region is not None and self._combat_observer is not None:
+                combat = self._combat_observer.observe(frame.crop(region), ship, frame.frame_id, frame.timestamp)
+        elif self._combat_observer is not None:
+            self._combat_observer.reset()
         return Observation(
             timestamp=now,
             window_rect=frame.window_rect.to_tuple(),
@@ -1051,6 +1064,7 @@ class PerceptionEngine:
             capture_error=None,
             frame_id=frame.frame_id,
             frame_timestamp=frame.timestamp,
+            combat=combat,
         )
 
     # ------------------------------------------------------------------

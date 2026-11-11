@@ -496,16 +496,21 @@ class StateMachine:
         self._port_phase = "idle"
         # 本会话尚未完成任何战斗（含暂停恢复后的重新进港口）时不等待；
         # 只有“两场之间”才使用随机冷却
-        if self._port_wait_battle_count != self._battles_completed:
-            between = (0.0 if self._battles_completed == 0 else
-                       min(10.0, max(3.0, self.deps.session.sample_between_battle_s())))
-            self._port_wait_until = now + between
-            self._port_wait_battle_count = self._battles_completed
+        self._ensure_between_battle_wait(now, self._battles_completed)
         between = max(0.0, self._port_wait_until - now)
         self._port_start_attempts = 0
         self._port_loadout_started = False
         self.deps.ship_checker.reset()
         self._log_action("state_change", {"to": "PORT", "between_battle_s": round(between, 2)})
+
+    def _ensure_between_battle_wait(self, now: float, completed_count: int) -> None:
+        """每个场间间隔只采样一次，结算回港和暂停恢复共用期限。"""
+        if self._port_wait_battle_count == completed_count:
+            return
+        seconds = 0.0 if completed_count == 0 else max(0.0, self.deps.session.sample_between_battle_s())
+        self._port_wait_until = now + seconds
+        self._port_wait_battle_count = completed_count
+        self._log_action("between_battle_wait", {"completed_count": completed_count, "wait_s": round(seconds, 2)})
 
     def _handle_port(self, observation: Observation, now: float) -> list[Action]:
         phase = self._port_phase
@@ -1009,7 +1014,7 @@ class StateMachine:
         return actions
 
     def _choose_result_button(self, observation: Observation, now: float) -> list[Action]:
-        """结算页：有“继续战斗！”直接点击（下一局），否则点“回到港口”（2026-10-31）。
+        """结算页：有“继续战斗！”时等待场间间隔后点击，否则点“回到港口”。
 
         注意：若本场结束后会话将因场次/时长上限停止，则不点“继续战斗”（否则脚本会在
         排队界面退出、把游戏留在队列里），改点“回到港口”让游戏正常回港后再停止。
@@ -1023,6 +1028,11 @@ class StateMachine:
             match = observation.feature(continue_feature) or self._match_feature(continue_feature, now)
             continue_match = match
             if match is not None and match.found:
+                self._ensure_between_battle_wait(now, self._battles_completed + 1)
+                # 等待间距不消耗识别按钮的期限；每次仍使用当前帧的按钮坐标。
+                self._result_buttons_until = max(self._result_buttons_until, self._port_wait_until + 60.0)
+                if now < self._port_wait_until:
+                    return []
                 self._result_continue_clicked = True
                 self._mark_exit_requested()
                 self._log_action("result_step", {"step": "continue_battle", "feature": continue_feature})
@@ -1100,10 +1110,22 @@ class StateMachine:
             if self._port_visible(observation, now):
                 self._mark_returned_to_port()
                 self._transition(State.POST_EXIT_INTERFACE, "dead_wait_port")
-            elif now >= self._dead_result_wait_until:
+                return []
+            if now >= self._dead_result_wait_until:
                 self.request_pause("death_result_timeout", "死亡退出未成功，等待正常结算或回港超时")
-            else:
-                self._log_dead_wait_once("exit_menu_timeout_waiting_result")
+                return []
+            # 模态界面会遮住血量，只接续本场已授权的退出，且须使用新鲜画面。
+            frame_age = now - float(observation.frame_timestamp)
+            max_age = float(self.config.global_config.behavior.max_input_frame_age_s)
+            if self._has_authorized_exit_context() and 0.0 <= frame_age <= max_age:
+                exit_cfg = self.profile.exit
+                for feature in (exit_cfg.confirm_feature, exit_cfg.menu_open_feature, exit_cfg.direct_exit_feature):
+                    match = self._match_feature(feature)
+                    if match is not None and match.found:
+                        self._transition(State.EXIT_MENU_OPEN, "dead_wait_exit_interface")
+                        # 复用可见界面的处理；同一帧会清除待发 Esc，不关闭确认框。
+                        return self._handle_exit_menu_open(observation, now)
+            self._log_dead_wait_once("exit_menu_timeout_waiting_result")
             return []
         if now < self._dead_wait_until:
             self._log_dead_wait_once("awaiting_wait_window")
@@ -1208,9 +1230,10 @@ class StateMachine:
                 "escape_retried": self._exit_retried,
             })
             if self._has_authorized_exit_context():
-                # 战斗结束动画和延迟可能使 Esc 无效；停止退出输入，等待本场正常结算。
+                # 等待结算或可识别的退出界面，后续接续不能重置首次等待期限。
                 self._pending_exit_actions = []
-                self._dead_result_wait_until = now + float(self.config.global_config.timeouts.exit_s)
+                if self._dead_result_wait_until is None:
+                    self._dead_result_wait_until = now + float(self.config.global_config.timeouts.exit_s)
                 self._transition(State.DEAD_PENDING_EXIT, "exit_menu_wait_result")
             else:
                 self._transition(State.ERROR_RECOVERY, "exit_menu_timeout")
@@ -1532,15 +1555,16 @@ class StateMachine:
                     return
         detected = None if observation.window_missing else self._safe_detect_state(now)
         battle_id = self._battle_id
-        battle_active = battle_id is not None and self._battle is not None and self._battle_result != "finished"
+        # 本进程的未结束 battle_id 就是恢复身份；排队/加载阶段尚未创建 _BattleRuntime。
+        battle_active = battle_id is not None and self._battle_result != "finished"
         if battle_active:
             if detected in (State.EXIT_MENU_OPEN, State.EXIT_CONFIRMING) and not self._has_authorized_exit_context():
                 self._stay_paused("resume_exit_unconfirmed", "本场未确认死亡，不接续退出操作", source)
                 return
-            if detected in (State.BATTLE_ACTIVE, State.QUEUEING, State.LOADING):
+            if detected in (State.QUEUEING, State.LOADING, State.BATTLE_ACTIVE):
                 self._log_action("resume", {"source": source, "mode": "battle", "detected": detected.value})
-                self._transition(State.BATTLE_ACTIVE, f"resume_battle:{source}")
-                self._open_input_gate("resume_battle")
+                self._transition(detected, f"resume_battle:{source}")
+                self._open_input_gate(f"resume_{detected.value.lower()}")
                 return
             if detected is State.BATTLE_FINISHED:
                 self._battle_result = "finished"

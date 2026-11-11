@@ -50,6 +50,7 @@ class ActionKind(StrEnum):
     MOVE_ABS = "move_abs"
     MOVE_REL = "move_rel"
     KEY_DOWN = "key_down"
+    KEY_TAP = "key_tap"
     KEY_UP = "key_up"
     MOUSE_DOWN = "mouse_down"
     MOUSE_UP = "mouse_up"
@@ -102,6 +103,11 @@ class Action:
     @classmethod
     def key_down(cls, key: str, label: str = "", priority: int = 20) -> Action:
         return cls(ActionKind.KEY_DOWN, key=key, label=label, priority=priority)
+
+    @classmethod
+    def tap_key(cls, key: str, label: str = "") -> Action:
+        """在当前位置按下并释放，后端作为一个动作执行。"""
+        return cls(ActionKind.KEY_TAP, key=key, label=label)
 
     @classmethod
     def key_up(cls, key: str, label: str = "", priority: int = 20) -> Action:
@@ -392,6 +398,23 @@ class DeathSignals:
 
 
 @dataclass(frozen=True, slots=True)
+class EnemyContact:
+    """连续新帧确认的小地图实心敌舰标记，坐标相对小地图内容区。"""
+
+    minimap_px: tuple[float, float]
+
+
+@dataclass(frozen=True, slots=True)
+class CombatObservation:
+    timestamp: float
+    frame_id: int
+    own_px: tuple[float, float] | None = None
+    camera_bearing_deg: float | None = None
+    enemies: tuple[EnemyContact, ...] = ()
+    enemy_candidates: int = 0
+
+
+@dataclass(frozen=True, slots=True)
 class Observation:
     """一帧结构化观察结果（详细设计 5.1）。
 
@@ -411,6 +434,7 @@ class Observation:
     # 帧序号与截屏时间：行为模块用它判断感知结果是否足够新（防止在过期画面上输入）
     frame_id: int = 0
     frame_timestamp: float = 0.0
+    combat: CombatObservation | None = None
 
     def feature(self, feature_id: str) -> MatchResult | None:
         return self.features.get(feature_id)

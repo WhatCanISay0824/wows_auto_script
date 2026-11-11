@@ -949,6 +949,7 @@ class SessionRunner:
                 except Exception as exc:
                     self._logger.debug("失焦恢复截帧失败: %s", exc)
             observation = engine.observe(state=machine.state, now=now)
+            now = self.runtime.clock.now()
             if self._wait_for_gui(now):
                 return True
             return self._focus_return_to_game(observation, now)
@@ -1047,6 +1048,8 @@ class SessionRunner:
         info = _LAST_WINDOW[0]
         if info is not None:
             observation = engine.observe(state=machine.state, now=now)
+            # 截屏完成后帧时间才确定，决策不能继续使用截屏前的时间。
+            now = clock.now()
             if self._wait_for_gui(now):
                 return
             if self._gui_waiting and info.foreground:
@@ -1071,6 +1074,7 @@ class SessionRunner:
                     return
                 engine.latest_frame(now, force=True)
                 observation = engine.observe(state=machine.state, now=now)
+                now = clock.now()
                 if self._wait_for_gui(now):
                     return
                 if self._gui_map_close_after is not None and (
@@ -1096,6 +1100,8 @@ class SessionRunner:
                 self._update_overload_context(now)
                 time.sleep(self._tick_s)
                 return
+            # 小地图处理也消耗时间，按实际决策时刻检查帧龄和动作期限。
+            now = clock.now()
             actions = machine.step(observation, now)
             if actions:
                 executor.submit(actions)

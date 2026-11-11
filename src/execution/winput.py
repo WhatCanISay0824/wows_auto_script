@@ -696,6 +696,14 @@ class _TrackedInputBackend:
             self._raw_move_relative(dx, dy)
         elif kind is ActionKind.KEY_DOWN:
             self._key_event(action.key, down=True)
+        elif kind is ActionKind.KEY_TAP:
+            binding = resolve_key(action.key or "")
+            hold = self._config.click_hold_ms if binding.is_mouse else self._config.key_hold_ms
+            try:
+                self._key_event(action.key, down=True)
+                self._sleeper.sleep(self._hold_seconds(hold))
+            finally:
+                self._key_event(action.key, down=False)
         elif kind is ActionKind.KEY_UP:
             self._key_event(action.key, down=False)
         elif kind is ActionKind.MOUSE_DOWN:

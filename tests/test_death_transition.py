@@ -120,3 +120,92 @@ def test_wait_keeps_result_limit_and_explicit_stop(tmp_path: Path) -> None:
     assert h.step() == []
     assert h.machine.state is State.STOPPING
     assert h.machine._dead_result_wait_until is None
+
+
+def test_late_confirmation_resumes_exit_and_counts_once(tmp_path: Path) -> None:
+    h = stalled_exit(tmp_path)
+    starts = (h.autopilot.started, h.behavior.started)
+    h.perception.features = {"exit_confirm": _match("exit_confirm")}
+    h.clock.advance(12)
+
+    assert h.step() == []
+    assert h.machine.state is State.EXIT_CONFIRMING
+    actions = h.step()
+    assert [action.label for action in actions] == ["exit_confirm"]
+    assert h.machine.state is State.EXITING
+    assert h.step() == []  # 复用同一帧也不能再点一次。
+    assert (h.autopilot.started, h.behavior.started) == starts
+    h.perception.features = {"port_indicator": _match("port_indicator")}
+    h.step()
+    h.step()
+    assert h.machine.battles_completed == 11
+    assert h.session.battle_ends == 1
+    assert h.machine._dead_result_wait_until is None
+
+
+def test_late_menu_resumes_without_escape(tmp_path: Path) -> None:
+    h = stalled_exit(tmp_path)
+    h.perception.features = {key: _match(key) for key in ("exit_menu_panel", "return_port")}
+    actions = h.step()
+    assert [action.label for action in actions] == ["exit_return_port"]
+    assert h.machine.state is State.EXIT_CONFIRMING
+
+
+@pytest.mark.parametrize("age", [-1.0, 5.0])
+def test_late_dialog_requires_fresh_frame(tmp_path: Path, age: float) -> None:
+    h = stalled_exit(tmp_path)
+    h.perception.features = {"exit_confirm": _match("exit_confirm")}
+    observation = replace(h.obs(), frame_timestamp=h.clock.now() - age)
+    assert h.machine.step(observation, h.clock.now()) == []
+    assert h.machine.state is State.DEAD_PENDING_EXIT
+    h.clock.advance(0.6)
+    assert h.step() == []
+    assert h.machine.state is State.EXIT_CONFIRMING
+
+
+@pytest.mark.parametrize("invalid_context", ["no_battle_id", "no_battle", "alive"])
+def test_late_dialog_requires_authorized_battle_context(tmp_path: Path, invalid_context: str) -> None:
+    h = stalled_exit(tmp_path)
+    if invalid_context == "no_battle_id":
+        h.machine._battle_id = None
+    elif invalid_context == "no_battle":
+        h.machine._battle = None
+    else:
+        h.machine._battle_result = ""
+    h.perception.features = {"exit_confirm": _match("exit_confirm")}
+    assert h.step() == []
+    assert h.machine.state is State.DEAD_PENDING_EXIT
+
+
+def test_reentered_menu_timeout_preserves_first_deadline(tmp_path: Path) -> None:
+    h = stalled_exit(tmp_path)
+    deadline = h.machine._dead_result_wait_until
+    h.clock.advance(20)
+    h.machine._transition(State.EXIT_MENU_OPEN, "test_resume_menu")
+    h.step()
+    h.clock.advance(9)
+    h.step()
+    assert h.machine.state is State.DEAD_PENDING_EXIT
+    assert h.machine._dead_result_wait_until == deadline
+
+
+@pytest.mark.parametrize("priority", ["timeout", "result", "port", "stop", "pause"])
+def test_late_dialog_keeps_guards_and_terminal_interfaces_first(tmp_path: Path, priority: str) -> None:
+    h = stalled_exit(tmp_path)
+    h.perception.features = {"exit_confirm": _match("exit_confirm")}
+    expected = State.PAUSED
+    if priority == "timeout":
+        h.clock.advance(h.app.global_config.timeouts.exit_s + 0.1)
+    elif priority == "result":
+        h.perception.features["battle_results"] = _match("battle_results")
+        expected = State.BATTLE_FINISHED
+    elif priority == "port":
+        h.perception.features["port_indicator"] = _match("port_indicator")
+        expected = State.POST_EXIT_INTERFACE
+    elif priority == "stop":
+        h.machine.request_stop("gui_stop")
+        expected = State.STOPPING
+    else:
+        h.machine.request_pause("manual")
+    assert h.step() == []
+    assert h.machine.state is expected

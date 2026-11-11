@@ -25,6 +25,10 @@ minimap:
   frame_feature: null
   marker_template: marker/marker.png
   marker_angles: 24
+  enemy_hsv_lower: [0, 150, 170]        # 只筛红橙敌舰；粉色友舰不纳入
+  enemy_hsv_upper: [18, 255, 255]
+  view_cone_hsv_lower: [95, 60, 35]     # 小地图镜头扇区颜色，需按客户端实测
+  view_cone_hsv_upper: [102, 255, 160]
   marker_hsv_lower:
   - 0
   - 0

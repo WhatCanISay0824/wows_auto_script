@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import random
+from dataclasses import replace
 
 import cv2
 import numpy as np
@@ -265,7 +266,10 @@ def test_retry_after_no_movement_selects_different_safe_candidate() -> None:
     assert first.normalized == pytest.approx((0.5, 0.2))
 
     # 验证窗口结束仍无位移/船速 -> 自动目标进入失败邻域，1s 后开始下一周期。
-    assert nav.tick(observation, 10.0) == []
+    for index in range(16):
+        moment = 2.0 + index * 0.5
+        nav.tick(replace(observation, timestamp=moment, frame_timestamp=moment), moment)
+    assert nav.tick(replace(observation, timestamp=10.0, frame_timestamp=10.0), 10.0) == []
     assert nav.phase == "reclick"
     assert events.last("autopilot_target_rejected")["reason"] == "no_movement"
     assert nav.next_click_at == pytest.approx(11.0)
@@ -288,7 +292,10 @@ def test_user_override_keeps_exact_requested_target() -> None:
 
     # 先产生一个失败自动目标，再确认用户显式目标不受水域筛选和失败邻域影响。
     run_full_cycle(nav, observation, 0.0)
-    assert nav.tick(observation, 10.0) == []
+    for index in range(16):
+        moment = 2.0 + index * 0.5
+        nav.tick(replace(observation, timestamp=moment, frame_timestamp=moment), moment)
+    assert nav.tick(replace(observation, timestamp=10.0, frame_timestamp=10.0), 10.0) == []
     assert nav.phase == "reclick"
     calls_before_override = provider.calls
     adjustments_before_override = events.names().count("autopilot_target_adjusted")

@@ -92,6 +92,10 @@ class MinimapConfig:
     marker_hsv_upper: tuple[int, int, int] | None = None
     marker_jump_px: float = 300.0
     marker_lost_s: float = 3.0
+    enemy_hsv_lower: tuple[int, int, int] = (0, 150, 170)
+    enemy_hsv_upper: tuple[int, int, int] = (18, 255, 255)
+    view_cone_hsv_lower: tuple[int, int, int] = (95, 60, 35)
+    view_cone_hsv_upper: tuple[int, int, int] = (102, 255, 160)
 
 
 @dataclass(frozen=True, slots=True)
@@ -472,6 +476,16 @@ class BehaviorConfig:
     battle_start_quiet_s: float = 10.0
     # 行为输入前允许的感知帧最大年龄；超过则跳过本次动作（防止在过期画面上输入）
     max_input_frame_age_s: float = 1.0
+    targeted_combat: bool = False
+    idle_camera_interval_s: tuple[float, float] = (3.0, 4.5)
+    idle_camera_move_px: tuple[int, int] = (24, 48)
+    idle_camera_duration_s: tuple[float, float] = (0.5, 0.7)
+    idle_camera_actions_per_minute_max: int = 180
+    combat_fire_interval_s: tuple[float, float] = (3.0, 5.0)
+    aim_tolerance_deg: float = 12.0
+    aim_counts_per_degree: float = 6.0
+    aim_step_max_px: int = 80
+    aim_feedback_s: float = 0.6
 
 
 @dataclass(frozen=True, slots=True)

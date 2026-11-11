@@ -21,18 +21,21 @@ window:
 
 keys_file: keys.yaml
 
-# 小地图标定（2026-11-01 诊断截图，2560×1600）：小地图位于右下角，profile 矩形外框约 376×376，
-# 按 border_px=2 四边内缩后实际内容区 372×372；右下贴边。旧矩形外框约 514×507，误含左上方
-# 战斗画面；本轮按当前游戏截图校正。
+# 小地图标定（2026-11-03 诊断截图，2560×1600）：小地图位于右下角，profile 矩形外框 520×520，
+# 按 border_px=2 四边内缩后实际内容区 516×516；右下贴边。旧矩形误裁掉己方标记。
 # 注意：该标定对应当前游戏的小地图尺寸；用户在游戏内调整小地图大小后仍需重新标定。
 minimap:
-  rect: [0.853125, 0.765, 1.0, 1.0]
+  rect: [0.796875, 0.675, 1.0, 1.0]
   border_px: 2
   frame_feature: null                    # 小地图边框模板不稳定，暂不使用
   marker_template: marker/marker.png     # 自身舰船白色箭头（已从实机截图提取）
   marker_angles: 24
-  marker_hsv_lower: [0, 0, 200]          # 白色箭头：低饱和、高亮度
-  marker_hsv_upper: [180, 60, 255]
+  enemy_hsv_lower: [0, 150, 170]        # 只筛红橙敌舰；粉色友舰不纳入
+  enemy_hsv_upper: [18, 255, 255]
+  view_cone_hsv_lower: [90, 60, 65]     # 小地图镜头扇区颜色，需按客户端实测
+  view_cone_hsv_upper: [102, 255, 160]
+  marker_hsv_lower: [0, 0, 180]          # 白色箭头：低饱和、高亮度
+  marker_hsv_upper: [180, 140, 255]
   marker_jump_px: 300
   marker_lost_s: 3
 

@@ -5,7 +5,7 @@ language: zh_cn
 reference_resolution:
 - 2560
 - 1600
-notes: 初始模板复制自 cn360，适用于简体中文 2560×1600 基线；未使用直营服实机截图验证，使用前应独立标定。
+notes: 初始模板复制自 cn360；小地图范围已按 2026-11-04 亚服 2560×1600 截图修正，标记颜色通过已有实图回放；其余模板与实际连续托管仍需本服验证。
 window:
   process_names:
   - WorldOfWarships.exe
@@ -17,21 +17,25 @@ window:
 keys_file: keys.yaml
 minimap:
   rect:
-  - 0.853125
-  - 0.765
+  - 0.796875
+  - 0.675
   - 1.0
   - 1.0
   border_px: 2
   frame_feature: null
   marker_template: marker/marker.png
   marker_angles: 24
+  enemy_hsv_lower: [0, 150, 170]        # 只筛红橙敌舰；粉色友舰不纳入
+  enemy_hsv_upper: [18, 255, 255]
+  view_cone_hsv_lower: [95, 60, 35]     # 小地图镜头扇区颜色，需按客户端实测
+  view_cone_hsv_upper: [102, 255, 160]
   marker_hsv_lower:
   - 0
   - 0
-  - 200
+  - 180
   marker_hsv_upper:
   - 180
-  - 60
+  - 140
   - 255
   marker_jump_px: 300
   marker_lost_s: 3

@@ -613,6 +613,7 @@ def _validate_behavior(issues: list[ValidationIssue], behavior: BehaviorConfig, 
         return _loc(location, f"behavior.{name}")
 
     pairs: list[tuple[str, tuple[float, float], float]] = [
+        ("combat_fire_interval_s", behavior.combat_fire_interval_s, 1.0),
         ("camera_interval_s", behavior.camera_interval_s, 0.0),
         ("attack_interval_s", behavior.attack_interval_s, 0.0),
         ("consumable_ratio_range", behavior.consumable_ratio_range, 0.0),
@@ -626,6 +627,9 @@ def _validate_behavior(issues: list[ValidationIssue], behavior: BehaviorConfig, 
         ("fire_burst", (float(behavior.fire_burst[0]), float(behavior.fire_burst[1])), 0.0),
         ("fire_interval_ms", (float(behavior.fire_interval_ms[0]), float(behavior.fire_interval_ms[1])), 0.0),
         ("activity_watchdog_s", behavior.activity_watchdog_s, 0.0),
+        ("idle_camera_interval_s", behavior.idle_camera_interval_s, 0.0),
+        ("idle_camera_move_px", (float(behavior.idle_camera_move_px[0]), float(behavior.idle_camera_move_px[1])), 1.0),
+        ("idle_camera_duration_s", behavior.idle_camera_duration_s, 0.0),
     ]
     for name, pair, minimum in pairs:
         _check_pair(issues, pair, loc(name), name, minimum=minimum)
@@ -654,12 +658,47 @@ def _validate_behavior(issues: list[ValidationIssue], behavior: BehaviorConfig, 
     _check_probability(issues, behavior.fire_turn_probability, loc("fire_turn_probability"), "开火转向概率")
     if not 0.0 < behavior.fire_sector_deg <= 180.0:
         _error(issues, "range", loc("fire_sector_deg"), f"开火扇区半角应在 (0,180]，当前 {behavior.fire_sector_deg}")
+    for name in ("aim_counts_per_degree", "aim_feedback_s"):
+        _check_positive(issues, getattr(behavior, name), loc(name), name)
+    _check_int_positive(issues, behavior.aim_step_max_px, loc("aim_step_max_px"), "单步镜头移动上限")
+    if not 0 < behavior.aim_tolerance_deg <= 30:
+        _error(issues, "range", loc("aim_tolerance_deg"), "镜头对齐容差必须在 (0,30] 度")
     _check_int_non_negative(
         issues, behavior.consumable_max_per_battle, loc("consumable_max_per_battle"), "消耗品单场上限"
     )
     _check_int_positive(issues, behavior.actions_per_minute_max, loc("actions_per_minute_max"), "每分钟动作上限")
     _check_non_negative(issues, behavior.battle_start_quiet_s, loc("battle_start_quiet_s"), "战斗开始静默时长")
     _check_positive(issues, behavior.max_input_frame_age_s, loc("max_input_frame_age_s"), "感知帧最大年龄")
+    idle_interval_low, idle_interval_high = behavior.idle_camera_interval_s
+    if not 2.0 <= idle_interval_low <= idle_interval_high <= 4.5:
+        _error(
+            issues,
+            "range",
+            loc("idle_camera_interval_s"),
+            f"无敌人视角开始间隔必须在 [2.0,4.5] 且有序，当前 {behavior.idle_camera_interval_s!r}",
+        )
+    idle_move_low, idle_move_high = behavior.idle_camera_move_px
+    if not 1 <= idle_move_low <= idle_move_high <= 80:
+        _error(
+            issues,
+            "range",
+            loc("idle_camera_move_px"),
+            f"无敌人视角幅度必须为 1..80 的正整数有序区间，当前 {behavior.idle_camera_move_px!r}",
+        )
+    idle_duration_low, idle_duration_high = behavior.idle_camera_duration_s
+    if not 0.3 <= idle_duration_low <= idle_duration_high <= 1.0:
+        _error(
+            issues,
+            "range",
+            loc("idle_camera_duration_s"),
+            f"无敌人视角持续时间必须在 [0.3,1.0] 且有序，当前 {behavior.idle_camera_duration_s!r}",
+        )
+    _check_int_positive(
+        issues,
+        behavior.idle_camera_actions_per_minute_max,
+        loc("idle_camera_actions_per_minute_max"),
+        "无敌人视角每分钟动作上限",
+    )
 
 
 def _validate_perception(
@@ -1044,6 +1083,11 @@ def validate_profile(
             _check_image_file(expected, issues, f"{minimap_loc}.marker_template")
         _check_positive(issues, minimap.marker_jump_px, f"{minimap_loc}.marker_jump_px", "标记跳变阈值")
         _check_positive(issues, minimap.marker_lost_s, f"{minimap_loc}.marker_lost_s", "标记丢失时间")
+        for name in ("enemy", "view_cone"):
+            _validate_hsv_pair(
+                issues, getattr(minimap, f"{name}_hsv_lower"), getattr(minimap, f"{name}_hsv_upper"),
+                f"{minimap_loc}.{name}_hsv", required=True,
+            )
         _validate_hsv_pair(
             issues,
             minimap.marker_hsv_lower,

@@ -1869,7 +1869,7 @@ def test_first_port_visit_skips_between_battle_wait(tmp_path: Path) -> None:
     h.machine._battles_completed = 1
     h.clock.advance(1.0)
     h.machine._enter_port(h.clock.now(), "test_second_visit")
-    assert h.machine._port_wait_until == pytest.approx(h.clock.now() + 10.0)
+    assert h.machine._port_wait_until == pytest.approx(h.clock.now() + 30.0)
 
 
 def test_paused_window_unavailable_auto_resumes_when_window_returns(tmp_path: Path) -> None:
