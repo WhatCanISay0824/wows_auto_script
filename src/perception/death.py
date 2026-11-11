@@ -25,9 +25,10 @@
 ---------------------------------------------
 状态机的 ``BATTLE_ACTIVE -> DEAD_PENDING_EXIT`` 与“按 ESC/离开战斗”前的二次校验
 **只认** ``DeathSignals.exit_authorized``。它由感知上游（``PerceptionEngine``）给出的
-颜色无关血条填充分析驱动：
+数字判零或兼容配置的血条填充分析驱动：
 
-- ``hp_evidence == "zero"``：血条区域有效且填充列比例低于 ``hp_bar_empty_max_ratio``；
+- 配置 ``hp_zero_feature`` 时，必须从己方血量数字确认 ``hp_current == 0``；
+  未配置时使用血条填充兼容路径，低于 ``hp_bar_empty_max_ratio`` 才给出零血证据；
 - 连续 ``hp_bar_confirm_frames`` 个**新帧**（同一帧被 10Hz 主循环重复消费只计一次）
   都是 ``zero``；
 - 最近一次归零证据在 ``hp_bar_evidence_ttl_s`` 内（超时或没有新帧即撤销）；
@@ -104,6 +105,11 @@ def _normalize_fill_ratio(value: float | None) -> float | None:
     return min(1.0, max(0.0, ratio))
 
 
+def _normalize_hp_current(value: int | None) -> int | None:
+    """目前只确认数字零值；其他值不冒称可读，统一返回 None。"""
+    return 0 if isinstance(value, int) and not isinstance(value, bool) and value == 0 else None
+
+
 class DeathDetector:
     """死亡投票器（详细设计 5.9）。
 
@@ -150,6 +156,7 @@ class DeathDetector:
         self._hp_zero_frames = 0
         self._evidence_at = 0.0
         self._hp_frame_id: int | None = None
+        self._hp_current: int | None = None
 
     # ------------------------------------------------------------------
     # 公开状态
@@ -226,6 +233,7 @@ class DeathDetector:
         self._hp_zero_frames = 0
         self._evidence_at = 0.0
         self._hp_frame_id = None
+        self._hp_current = None
 
     def update(
         self,
@@ -235,6 +243,7 @@ class DeathDetector:
         hp_fill_ratio: float | None = None,
         hp_evidence: str | None = None,
         frame_id: int | None = None,
+        hp_current: int | None = None,
     ) -> DeathSignals:
         """输入一帧投票与血条归零证据并返回当前死亡信号。
 
@@ -246,15 +255,21 @@ class DeathDetector:
                 None 表示调用方未提供血条证据：此时沿用 ``votes["hp_zero"]`` 的旧语义，
                 但 ``exit_authorized`` 恒为 False（兼容手工调用，绝不放宽退出门禁）。
             frame_id: 帧序号；10Hz 主循环复用同一张 2Hz 帧时只计一次“连续帧”。
+            hp_current: 数字判读的当前血量；目前只有确认零值时传 0，其余为 None。
+                数字零证据允许 ``hp_fill_ratio`` 缺失，但绝不伪造填充比例。
         """
         timestamp = float(timestamp)
         raw = {name: bool(votes.get(name, False)) for name in SIGNAL_NAMES}
         hp_supplied = hp_evidence is not None
         hp_level = _normalize_hp_evidence(hp_evidence)
         fill_ratio = _normalize_fill_ratio(hp_fill_ratio)
-        if hp_level in ("alive", "zero") and fill_ratio is None:
+        current_hp = _normalize_hp_current(hp_current)
+        numeric_zero = current_hp == 0 and hp_level == _ZERO_EVIDENCE
+        if hp_level in ("alive", "zero") and fill_ratio is None and not numeric_zero:
             # 没有填充比例时不能声称已判读血条，保守降为 unknown（不授权）。
             hp_level = "unknown"
+        if current_hp is not None and hp_level != _ZERO_EVIDENCE:
+            current_hp = None
         if self._in_ignore_window(timestamp):
             self._clear_evidence()
             signals = self._compose(
@@ -266,16 +281,18 @@ class DeathDetector:
                 hp_evidence=hp_level if hp_supplied else "unavailable",
                 exit_authorized=False,
                 evidence_at=0.0,
+                hp_current=None,
             )
             self._last_signals = signals
             self._last_raw_score = 0.0
             return signals
         effective = self._apply_latches(raw, timestamp)
-        applied_level, _applied_ratio = self._update_hp_evidence(
+        applied_level, _applied_ratio, _applied_current = self._update_hp_evidence(
             hp_level if hp_supplied else "unavailable",
             fill_ratio if hp_supplied else None,
             timestamp,
             frame_id if hp_supplied else None,
+            current_hp if hp_supplied else None,
         )
         if hp_supplied:
             # 引擎传入血条证据时，hp_zero 投票严格由证据推导（alive/unknown 均为 False）。
@@ -297,6 +314,7 @@ class DeathDetector:
                 hp_evidence=self._hp_evidence,
                 exit_authorized=exit_authorized,
                 evidence_at=self._reported_evidence_at(),
+                hp_current=self._hp_current,
             )
             self._last_signals = signals
             return signals
@@ -323,6 +341,7 @@ class DeathDetector:
             hp_evidence=self._hp_evidence,
             exit_authorized=exit_authorized,
             evidence_at=self._reported_evidence_at(),
+            hp_current=self._hp_current,
         )
         self._last_signals = signals
         return signals
@@ -336,18 +355,21 @@ class DeathDetector:
         fill_ratio: float | None,
         timestamp: float,
         frame_id: int | None,
-    ) -> tuple[str, float | None]:
-        """累计连续“确认归零”帧，返回本帧实际生效的 (证据等级, 填充比例)。"""
+        hp_current: int | None,
+    ) -> tuple[str, float | None, int | None]:
+        """累计连续“确认归零”帧，返回本帧实际生效的 (证据等级, 填充比例, 数字血量)。"""
         if self._spectator_mode:
             # 观战界面显示的不是己方血条：己方血条证据一律不可用。
             evidence = "unavailable"
             fill_ratio = None
+            hp_current = None
         if frame_id is not None and self._hp_frame_id is not None and frame_id == self._hp_frame_id:
             # 同一张帧被 10Hz 主循环重复消费：不重复累计，也不刷新证据时间戳。
-            return self._hp_evidence, self._hp_fill_ratio
+            return self._hp_evidence, self._hp_fill_ratio, self._hp_current
         self._hp_frame_id = frame_id
         self._hp_evidence = evidence
         self._hp_fill_ratio = fill_ratio
+        self._hp_current = hp_current if evidence == _ZERO_EVIDENCE else None
         if evidence == _ZERO_EVIDENCE:
             self._hp_zero_frames += 1
             self._evidence_at = timestamp
@@ -355,7 +377,7 @@ class DeathDetector:
             # 存活/未知/不可用都属于矛盾证据：立即撤销尚未执行的退出授权。
             self._hp_zero_frames = 0
             self._evidence_at = 0.0
-        return self._hp_evidence, self._hp_fill_ratio
+        return self._hp_evidence, self._hp_fill_ratio, self._hp_current
 
     def _authorized_at(self, timestamp: float) -> bool:
         """当前时刻是否满足提前退出授权（连续帧归零 + 证据在 TTL 内 + 无矛盾证据）。"""
@@ -510,6 +532,7 @@ class DeathDetector:
         hp_evidence: str,
         exit_authorized: bool,
         evidence_at: float,
+        hp_current: int | None,
     ) -> DeathSignals:
         votes = {name: bool(effective.get(name, False)) for name in SIGNAL_NAMES}
         reported_score = float(max(0.0, score))
@@ -530,6 +553,7 @@ class DeathDetector:
             hp_evidence=hp_evidence,
             exit_authorized=bool(exit_authorized),
             evidence_at=float(evidence_at),
+            hp_current=hp_current,
         )
 
 

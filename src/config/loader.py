@@ -799,6 +799,12 @@ def load_global(
     behavior_raw = section("behavior")
     beh_loc = f"{label}: behavior"
     behavior = BehaviorConfig(
+        targeted_combat=_bool_value(behavior_raw, "targeted_combat", defaults.behavior.targeted_combat, collected, beh_loc),
+        combat_fire_interval_s=_float_pair(behavior_raw, "combat_fire_interval_s", defaults.behavior.combat_fire_interval_s, collected, beh_loc),
+        aim_tolerance_deg=_float_value(behavior_raw, "aim_tolerance_deg", defaults.behavior.aim_tolerance_deg, collected, beh_loc),
+        aim_counts_per_degree=_float_value(behavior_raw, "aim_counts_per_degree", defaults.behavior.aim_counts_per_degree, collected, beh_loc),
+        aim_step_max_px=_int_value(behavior_raw, "aim_step_max_px", defaults.behavior.aim_step_max_px, collected, beh_loc),
+        aim_feedback_s=_float_value(behavior_raw, "aim_feedback_s", defaults.behavior.aim_feedback_s, collected, beh_loc),
         camera_interval_s=_float_pair(
             behavior_raw, "camera_interval_s", defaults.behavior.camera_interval_s, collected, beh_loc
         ),
@@ -899,6 +905,34 @@ def load_global(
             behavior_raw,
             "max_input_frame_age_s",
             defaults.behavior.max_input_frame_age_s,
+            collected,
+            beh_loc,
+        ),
+        idle_camera_interval_s=_float_pair(
+            behavior_raw,
+            "idle_camera_interval_s",
+            defaults.behavior.idle_camera_interval_s,
+            collected,
+            beh_loc,
+        ),
+        idle_camera_move_px=_int_pair(
+            behavior_raw,
+            "idle_camera_move_px",
+            defaults.behavior.idle_camera_move_px,
+            collected,
+            beh_loc,
+        ),
+        idle_camera_duration_s=_float_pair(
+            behavior_raw,
+            "idle_camera_duration_s",
+            defaults.behavior.idle_camera_duration_s,
+            collected,
+            beh_loc,
+        ),
+        idle_camera_actions_per_minute_max=_int_value(
+            behavior_raw,
+            "idle_camera_actions_per_minute_max",
+            defaults.behavior.idle_camera_actions_per_minute_max,
             collected,
             beh_loc,
         ),
@@ -1554,6 +1588,10 @@ def load_profile(
                 minimap_raw, "marker_jump_px", 300.0, collected, f"{label}: minimap"
             ),
             marker_lost_s=_float_value(minimap_raw, "marker_lost_s", 3.0, collected, f"{label}: minimap"),
+            enemy_hsv_lower=_int_triple(minimap_raw, "enemy_hsv_lower", (0, 150, 170), collected, f"{label}: minimap"),
+            enemy_hsv_upper=_int_triple(minimap_raw, "enemy_hsv_upper", (18, 255, 255), collected, f"{label}: minimap"),
+            view_cone_hsv_lower=_int_triple(minimap_raw, "view_cone_hsv_lower", (95, 60, 35), collected, f"{label}: minimap"),
+            view_cone_hsv_upper=_int_triple(minimap_raw, "view_cone_hsv_upper", (102, 255, 160), collected, f"{label}: minimap"),
         )
 
     battle_hud_raw = _section(raw, "battle_hud", collected, label)
@@ -1576,6 +1614,7 @@ def load_profile(
         hp_bar_evidence_ttl_s=_float_value(
             battle_hud_raw, "hp_bar_evidence_ttl_s", 1.0, collected, hud_loc
         ),
+        hp_zero_feature=_opt_str(battle_hud_raw, "hp_zero_feature", None, collected, hud_loc),
         spectator_features=_str_list(battle_hud_raw, "spectator_features", (), collected, hud_loc),
         death_banner_feature=_str_value(
             battle_hud_raw, "death_banner_feature", "death_banner", collected, hud_loc
@@ -1677,6 +1716,7 @@ def load_profile(
         popup_features=_str_list(raw, "popup_features", (), collected, f"{label}: popup_features"),
         profile_dir=profile_dir,
         notes=_str_value(raw, "notes", "", collected, label),
+        calibration_required=_bool_value(raw, "calibration_required", False, collected, label),
     )
 
 

@@ -178,6 +178,23 @@ class SessionController:
         )
         return duration
 
+    def abort_battle(self, reason: str = "") -> float | None:
+        """中断进行中的场次计时；不计完成数，无进行中场次时返回 None。"""
+        if self._battle_started_at is None:
+            return None
+        duration = max(0.0, self._clock.now() - self._battle_started_at)
+        self._battle_started_at = None
+        self._last_battle_duration_s = duration
+        self._emit(
+            "battle_aborted",
+            {
+                "duration_s": round(duration, 1),
+                "battles_completed": self._battles_completed,
+                "reason": reason,
+            },
+        )
+        return duration
+
     # ------------------------------------------------------------------
     # 上限检查
     # ------------------------------------------------------------------

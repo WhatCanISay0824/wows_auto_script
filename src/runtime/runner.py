@@ -782,6 +782,20 @@ class SessionRunner:
             machine.set_rotation_limit(limit)
         else:
             machine.set_rotation_limit(None)
+        safety = runtime.app.global_config.safety
+        if limit is not None and limit > 0:
+            self._logger.info(
+                "启动场次限制：本次目标=%s，全局安全上限=%s，会话时长上限=%.1f 分钟",
+                limit,
+                safety.max_battles_per_session,
+                safety.max_session_minutes,
+            )
+        else:
+            self._logger.info(
+                "启动场次限制：本次目标未指定，全局安全上限=%s，会话时长上限=%.1f 分钟",
+                safety.max_battles_per_session,
+                safety.max_session_minutes,
+            )
         machine.start(runtime.clock.now())
         runtime.watchdog.start()
         _ensure_game_foreground(runtime)
@@ -935,6 +949,7 @@ class SessionRunner:
                 except Exception as exc:
                     self._logger.debug("失焦恢复截帧失败: %s", exc)
             observation = engine.observe(state=machine.state, now=now)
+            now = self.runtime.clock.now()
             if self._wait_for_gui(now):
                 return True
             return self._focus_return_to_game(observation, now)
@@ -1033,6 +1048,8 @@ class SessionRunner:
         info = _LAST_WINDOW[0]
         if info is not None:
             observation = engine.observe(state=machine.state, now=now)
+            # 截屏完成后帧时间才确定，决策不能继续使用截屏前的时间。
+            now = clock.now()
             if self._wait_for_gui(now):
                 return
             if self._gui_waiting and info.foreground:
@@ -1057,6 +1074,7 @@ class SessionRunner:
                     return
                 engine.latest_frame(now, force=True)
                 observation = engine.observe(state=machine.state, now=now)
+                now = clock.now()
                 if self._wait_for_gui(now):
                     return
                 if self._gui_map_close_after is not None and (
@@ -1082,6 +1100,8 @@ class SessionRunner:
                 self._update_overload_context(now)
                 time.sleep(self._tick_s)
                 return
+            # 小地图处理也消耗时间，按实际决策时刻检查帧龄和动作期限。
+            now = clock.now()
             actions = machine.step(observation, now)
             if actions:
                 executor.submit(actions)
@@ -1685,6 +1705,8 @@ class SessionRunner:
     def _session_view(self) -> SessionView:
         runtime = self.runtime
         session = runtime.session
+        count_today = getattr(session, "count_battles_today", None)
+        daily_used = count_today() if callable(count_today) else (self.plan.daily_used if self.plan else None)
         return SessionView(
             account_alias=runtime.app.account_alias,
             battles_completed=self.battles_completed,
@@ -1692,7 +1714,7 @@ class SessionRunner:
             battle_in_progress=_value(runtime.machine, "battle") is not None,
             elapsed_s=float(_value(session, "elapsed_s", 0.0) or 0.0),
             last_battle_duration_s=_value(session, "last_battle_duration_s"),
-            daily_used=(self.plan.daily_used if self.plan is not None else None),
+            daily_used=daily_used,
             rotation_index=None,
             rotation_aliases=(),
             next_alias=None,

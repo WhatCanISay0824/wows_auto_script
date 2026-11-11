@@ -60,6 +60,47 @@ def test_allowed_hours_valid(project: fx.TestProject, tmp_path: Path) -> None:
     assert report.ok, report.format_lines()
 
 
+@pytest.mark.parametrize("field,value", [
+    ("combat_fire_interval_s", [.5, 5]), ("combat_fire_interval_s", [5, 3]),
+    ("aim_tolerance_deg", 0), ("aim_tolerance_deg", 31),
+    ("aim_counts_per_degree", 0), ("aim_step_max_px", 0), ("aim_feedback_s", -1),
+])
+def test_invalid_combat_parameters_are_rejected(project: fx.TestProject, tmp_path: Path, field, value) -> None:
+    fx.edit_yaml_file(tmp_path / "config.yaml", f"behavior.{field}", value)
+    report = _report(tmp_path, project)
+    assert any(issue.code == "range" and field in issue.location for issue in report.errors)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("idle_camera_interval_s", [1.9, 4.0]),
+    ("idle_camera_interval_s", [3.0, 4.6]),
+    ("idle_camera_interval_s", [4.5, 3.0]),
+    ("idle_camera_interval_s", [2.0, float("inf")]),
+    ("idle_camera_move_px", [0, 48]),
+    ("idle_camera_move_px", [24, 81]),
+    ("idle_camera_move_px", [50, 40]),
+    ("idle_camera_duration_s", [0.2, 0.7]),
+    ("idle_camera_duration_s", [0.5, 1.1]),
+    ("idle_camera_duration_s", [0.8, 0.5]),
+    ("idle_camera_actions_per_minute_max", 0),
+])
+def test_invalid_idle_camera_parameters_are_rejected(
+    project: fx.TestProject, tmp_path: Path, field, value
+) -> None:
+    fx.edit_yaml_file(tmp_path / "config.yaml", f"behavior.{field}", value)
+    report = _report(tmp_path, project)
+    assert any(issue.code == "range" and field in issue.location for issue in report.errors)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("enemy_hsv_upper", [181, 255, 255]), ("view_cone_hsv_lower", [110, 60, 35]),
+])
+def test_invalid_combat_hsv_is_rejected(project: fx.TestProject, tmp_path: Path, field, value) -> None:
+    fx.edit_yaml_file(project.profile_dir / "profile.yaml", f"minimap.{field}", value)
+    report = _report(tmp_path, project)
+    assert any(issue.code == "range" and field.split("_hsv")[0] in issue.location for issue in report.errors)
+
+
 # ---------------------------------------------------------------------------
 # 真实仓库：实机截图提取完成后应无 error（warning 可接受）
 # ---------------------------------------------------------------------------

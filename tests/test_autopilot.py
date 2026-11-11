@@ -441,9 +441,13 @@ def test_full_map_verify_failure_keeps_full_map_and_limits_retries() -> None:
         assert nav.tick(obs, t0 + 1.2) != []  # 点击
         assert nav.tick(obs, t0 + 1.6) != []  # 关图（verify deadline = t0+9.6）
         assert nav.phase == "verify"
-        assert nav.tick(obs, t0 + 9.4) == []  # 验证窗口内，无位移/速度
+        for index in range(15):
+            moment = t0 + 2.0 + index * 0.5
+            sample = replace(obs, timestamp=moment, frame_timestamp=moment)
+            assert nav.tick(sample, moment) == []
+        assert nav.tick(replace(obs, frame_timestamp=t0 + 9.4), t0 + 9.4) == []
         assert nav.phase == "verify"
-        assert nav.tick(obs, t0 + 9.7) == []  # 超过验证窗口 -> 失败
+        assert nav.tick(replace(obs, frame_timestamp=t0 + 9.7), t0 + 9.7) == []
         assert nav.blocks_behavior is False
 
     run_failing_cycle(0.0)
@@ -478,7 +482,10 @@ def test_full_map_success_resets_retry_counter() -> None:
     nav.tick(obs, 1.2)
     nav.tick(obs, 1.3)
     nav.tick(obs, 1.8)
-    nav.tick(obs, 9.9)
+    for index in range(16):
+        moment = 2.0 + index * 0.5
+        nav.tick(replace(obs, timestamp=moment, frame_timestamp=moment), moment)
+    nav.tick(replace(obs, timestamp=9.9, frame_timestamp=9.9), 9.9)
     assert nav.phase == "reclick"
     # 第二个周期验证成功 -> 计数清零，不降级
     nav.tick(obs, 11.0)

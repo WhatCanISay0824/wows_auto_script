@@ -8,6 +8,7 @@ venv/
 # 工具缓存
 .pytest_cache/
 .ruff_cache/
+pytest_work/
 
 # 运行产物（设计第 2.5 / 11 章：日志、截图、数据库只保存在本地）
 data/*.db

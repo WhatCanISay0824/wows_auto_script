@@ -121,10 +121,23 @@ class StateMachine:
         self._confirm_seen = False
         self._dead_wait_until = 0.0
         self._dead_wait_log_reason = ""
+        self._dead_numeric_confirmed = False
+        self._dead_result_wait_until: float | None = None
         self._pending_exit_actions: list[Action] = []
+        self._exit_menu_key_at: float | None = None
+        self._exit_menu_key_frame: tuple[int, float] | None = None
+        # 退出菜单补点：与确认点击共享最后一次点击的时间/帧，避免同一帧重复发送。
+        self._exit_last_click_at: float | None = None
+        self._exit_last_click_frame: tuple[int, float] | None = None
+        self._exit_last_seen_frame: tuple[int, float] | None = None
+        self._exit_last_click_kind = ""
+        # EXITING 若由结算按钮触发，结算动画可能仍在屏，不能再次进入结算。
+        self._exiting_from_result_click = False
         # 结算页按钮选择（2026-10-31）：优先“继续战斗！”直接下一局，否则“回到港口”
         self._result_continue_clicked = False
         self._result_choice_until = 0.0
+        self._result_buttons_until = 0.0
+        self._result_continue_missing_logged = False
         # 回港弹窗
         self._popup_rounds = 0
         self._popup_wait_until = 0.0
@@ -261,6 +274,8 @@ class StateMachine:
         detected = None if observation.window_missing else self._safe_detect_state(now)
         allowed = (State.PORT, State.QUEUEING, State.LOADING, State.BATTLE_ACTIVE,
                    State.BATTLE_FINISHED, State.DEAD_PENDING_EXIT, State.POST_EXIT_INTERFACE)
+        if self._has_authorized_exit_context():
+            allowed += (State.EXIT_MENU_OPEN, State.EXIT_CONFIRMING)
         if detected not in allowed:
             self.request_pause("gui_return_unknown", "返回游戏后无法识别画面，请检查后恢复")
             return
@@ -337,6 +352,16 @@ class StateMachine:
         return False
 
     def _check_timeout(self, now: float) -> str | None:
+        if (
+            self._state is State.BATTLE_FINISHED
+            and self._observation is not None
+            and self._result_visible(self._observation, now)
+        ):
+            return None  # 已确认结算由按钮等待期限处理。
+        if self._state is State.DEAD_PENDING_EXIT and (
+            self._dead_numeric_confirmed or self._dead_result_wait_until is not None
+        ):
+            return None  # 数字确认死亡后等新鲜退出证据或自然结算，不重启托管。
         timeouts = self.config.global_config.timeouts
         mapping: dict[State, tuple[float, str]] = {
             State.INIT: (timeouts.init_s, "init_timeout"),
@@ -364,6 +389,8 @@ class StateMachine:
             return
         previous = self._state
         self._state = target
+        if previous is State.PAUSED:
+            self._pause_reason = ""
         self._entered_at = self._now
         self._transitions.append((self._now, previous, target, reason))
         self._logger.info("状态 %s -> %s (%s)", previous.value, target.value, reason)
@@ -469,19 +496,31 @@ class StateMachine:
         self._port_phase = "idle"
         # 本会话尚未完成任何战斗（含暂停恢复后的重新进港口）时不等待；
         # 只有“两场之间”才使用随机冷却
-        if self._port_wait_battle_count != self._battles_completed:
-            between = (0.0 if self._battles_completed == 0 else
-                       min(10.0, max(3.0, self.deps.session.sample_between_battle_s())))
-            self._port_wait_until = now + between
-            self._port_wait_battle_count = self._battles_completed
+        self._ensure_between_battle_wait(now, self._battles_completed)
         between = max(0.0, self._port_wait_until - now)
         self._port_start_attempts = 0
         self._port_loadout_started = False
         self.deps.ship_checker.reset()
         self._log_action("state_change", {"to": "PORT", "between_battle_s": round(between, 2)})
 
+    def _ensure_between_battle_wait(self, now: float, completed_count: int) -> None:
+        """每个场间间隔只采样一次，结算回港和暂停恢复共用期限。"""
+        if self._port_wait_battle_count == completed_count:
+            return
+        seconds = 0.0 if completed_count == 0 else max(0.0, self.deps.session.sample_between_battle_s())
+        self._port_wait_until = now + seconds
+        self._port_wait_battle_count = completed_count
+        self._log_action("between_battle_wait", {"completed_count": completed_count, "wait_s": round(seconds, 2)})
+
     def _handle_port(self, observation: Observation, now: float) -> list[Action]:
         phase = self._port_phase
+        if phase in ("starting", "start_full"):
+            # 开局后队列可能瞬间消失，以当前画面接续，不能再次点击加入战斗。
+            self._handle_start_coop(observation, now)
+            if self._state is not State.PORT:
+                self.deps.steps.reset()
+                self.deps.session.record_start_success()
+                return []
         if phase == "idle":
             stop = self.deps.session.check_stop()
             if stop is not None:
@@ -632,6 +671,11 @@ class StateMachine:
     # ==================================================================
     def _enter_battle_active(self, now: float, reason: str) -> None:
         self._stop_subflows()
+        if (
+            self._dead_numeric_confirmed or self._dead_result_wait_until is not None
+        ) and self._battle_id is not None:
+            self._transition(State.DEAD_PENDING_EXIT, "confirmed_zero_wait")
+            return
         # ISS-006：同一场次内从暂停恢复时保留 _battle/_battle_id，不重建场次上下文
         resuming = self._battle is not None and self._battle_id is not None
         if not resuming and self.deps.autopilot is not None:
@@ -719,6 +763,21 @@ class StateMachine:
             return self.deps.perception.match_feature(feature, now=now).found
         except Exception:
             return False
+
+    def _continue_current_battle_result(
+        self, observation: Observation, now: float, reason: str
+    ) -> bool:
+        """当前场次出现结算页时统一转入结算；无场次上下文不作为接管依据。"""
+        if self._battle_id is None or self._battle is None:
+            return False
+        if self._stop_request is not None or self._state in (State.PAUSED, State.STOPPING):
+            return False
+        if not self._result_visible(observation, now):
+            return False
+        self._pending_exit_actions = []
+        self._battle_result = "finished"
+        self._transition(State.BATTLE_FINISHED, reason)
+        return True
 
     def _bootstrap_battle(self, observation: Observation, now: float) -> list[Action]:
         """战斗内启动：autopilot 模式只启动自动驾驶与随机行为；waypoints 模式识别地图/航线。"""
@@ -933,7 +992,9 @@ class StateMachine:
     def _enter_battle_finished(self, now: float, reason: str) -> None:
         self._stop_subflows()
         self._result_continue_clicked = False
-        self._result_choice_until = now + 20.0  # 结算按钮等待上限（结算动画/网络延迟）
+        self._result_choice_until = now + 20.0  # 优先等待继续战斗，再允许回港兜底。
+        self._result_buttons_until = now + 60.0
+        self._result_continue_missing_logged = False
         sequence = self.config.profile.result_sequence
         if sequence:
             try:
@@ -945,13 +1006,15 @@ class StateMachine:
         status, actions = self._advance_steps(observation, now)
         if status is StepStatus.DONE:
             done_actions = self._choose_result_button(observation, now)
+            if self._state in (State.PAUSED, State.STOPPING):
+                return []
             return actions + done_actions
         if status is StepStatus.FAILED:
             self._transition(State.ERROR_RECOVERY, "result_sequence_failed")
         return actions
 
     def _choose_result_button(self, observation: Observation, now: float) -> list[Action]:
-        """结算页：有“继续战斗！”直接点击（下一局），否则点“回到港口”（2026-10-31）。
+        """结算页：有“继续战斗！”时等待场间间隔后点击，否则点“回到港口”。
 
         注意：若本场结束后会话将因场次/时长上限停止，则不点“继续战斗”（否则脚本会在
         排队界面退出、把游戏留在队列里），改点“回到港口”让游戏正常回港后再停止。
@@ -959,9 +1022,17 @@ class StateMachine:
         hud = self.profile.battle_hud
         continue_feature = hud.result_continue_feature
         stop_ahead = self._stop_expected_after_battle()
+        continue_match = None
+        return_match = None
         if continue_feature and not stop_ahead:
             match = observation.feature(continue_feature) or self._match_feature(continue_feature, now)
+            continue_match = match
             if match is not None and match.found:
+                self._ensure_between_battle_wait(now, self._battles_completed + 1)
+                # 等待间距不消耗识别按钮的期限；每次仍使用当前帧的按钮坐标。
+                self._result_buttons_until = max(self._result_buttons_until, self._port_wait_until + 60.0)
+                if now < self._port_wait_until:
+                    return []
                 self._result_continue_clicked = True
                 self._mark_exit_requested()
                 self._log_action("result_step", {"step": "continue_battle", "feature": continue_feature})
@@ -969,13 +1040,15 @@ class StateMachine:
                 return [_click_action(match, observation, "result_continue")]
             if now < self._result_choice_until:
                 return []
-            self._save_diagnostic("result_continue_missing", now)
-            self._log_action("result_step", {"step": "continue_unavailable",
-                "feature": continue_feature, "score": match.score if match is not None else None,
-                "wait_s": 20.0})
+            if not self._result_continue_missing_logged:
+                self._result_continue_missing_logged = True
+                self._log_action("result_step", {"step": "continue_unavailable",
+                    "feature": continue_feature, "score": match.score if match is not None else None,
+                    "wait_s": 20.0})
         return_feature = hud.result_return_feature
         if return_feature:
             match = observation.feature(return_feature) or self._match_feature(return_feature, now)
+            return_match = match
             if match is not None and match.found:
                 self._mark_exit_requested()
                 detail = {"step": "return_port", "feature": return_feature}
@@ -984,17 +1057,27 @@ class StateMachine:
                 self._log_action("result_step", detail)
                 self._transition(State.EXITING, "result_return_click")
                 return [_click_action(match, observation, "result_return_port")]
-        # 按钮尚未出现（结算动画/网络延迟）：短暂重试，避免误入异常恢复
-        if now >= self._result_choice_until:
+        # 已确认结算时单独等待按钮，避免每 20 秒反复消耗通用恢复次数。
+        if self._result_visible(observation, now):
+            if now < self._result_buttons_until:
+                return []
             self._save_diagnostic("result_buttons_missing", now)
             self._log_action(
-                "result_step", {"step": "buttons_missing", "timeout_s": 20.0}
+                "result_step", {
+                    "step": "buttons_missing", "timeout_s": 60.0,
+                    "continue_score": continue_match.score if continue_match is not None else None,
+                    "return_score": return_match.score if return_match is not None else None,
+                }
             )
-            self._transition(State.ERROR_RECOVERY, "result_buttons_missing")
+            self.request_pause("result_buttons_missing", "结算页等待 60 秒仍未识别到可用按钮")
+        elif now >= self._result_choice_until:
+            self._transition(State.ERROR_RECOVERY, "result_interface_unknown")
         return []
 
     def _stop_expected_after_battle(self) -> bool:
         """本场结束后是否会因场次/时长上限停止（用于决定是否点“继续战斗”）。"""
+        if self._battles_completed + 1 >= self.config.global_config.safety.max_battles_per_session:
+            return True
         try:
             if self.deps.session.check_stop() is not None:
                 return True
@@ -1009,6 +1092,9 @@ class StateMachine:
     # ==================================================================
     def _enter_dead_pending_exit(self, now: float, reason: str) -> None:
         self._stop_subflows()
+        death = self._observation.death if self._observation is not None else None
+        if death is not None and death.hp_current == 0 and death.exit_authorized:
+            self._dead_numeric_confirmed = True
         wait = self._rng.uniform(0.8, 2.0)
         self._dead_wait_until = now + wait
         self._dead_wait_log_reason = ""
@@ -1020,11 +1106,35 @@ class StateMachine:
             self._battle_result = "finished"
             self._transition(State.BATTLE_FINISHED, "dead_wait_result")
             return []
+        if self._dead_result_wait_until is not None:
+            if self._port_visible(observation, now):
+                self._mark_returned_to_port()
+                self._transition(State.POST_EXIT_INTERFACE, "dead_wait_port")
+                return []
+            if now >= self._dead_result_wait_until:
+                self.request_pause("death_result_timeout", "死亡退出未成功，等待正常结算或回港超时")
+                return []
+            # 模态界面会遮住血量，只接续本场已授权的退出，且须使用新鲜画面。
+            frame_age = now - float(observation.frame_timestamp)
+            max_age = float(self.config.global_config.behavior.max_input_frame_age_s)
+            if self._has_authorized_exit_context() and 0.0 <= frame_age <= max_age:
+                exit_cfg = self.profile.exit
+                for feature in (exit_cfg.confirm_feature, exit_cfg.menu_open_feature, exit_cfg.direct_exit_feature):
+                    match = self._match_feature(feature)
+                    if match is not None and match.found:
+                        self._transition(State.EXIT_MENU_OPEN, "dead_wait_exit_interface")
+                        # 复用可见界面的处理；同一帧会清除待发 Esc，不关闭确认框。
+                        return self._handle_exit_menu_open(observation, now)
+            self._log_dead_wait_once("exit_menu_timeout_waiting_result")
+            return []
         if now < self._dead_wait_until:
             self._log_dead_wait_once("awaiting_wait_window")
             return []
         # ISS-002：发送退出操作前再次校验“血条确认归零”证据仍在有效期内。
         if not self._exit_authorized(observation, now):
+            if self._dead_numeric_confirmed:
+                self._log_dead_wait_once("confirmed_numeric_zero_waiting_fresh_evidence")
+                return []
             death = observation.death
             evidence = str(getattr(death, "hp_evidence", "unavailable"))
             banner = bool(getattr(death, "banner", False))
@@ -1055,57 +1165,97 @@ class StateMachine:
         exit_cfg = self.profile.exit
         key = self.deps.config.keymap.resolve(exit_cfg.menu_key)
         self._exit_retried = False
+        self._exit_menu_key_at = None
+        self._exit_menu_key_frame = None
+        self._exit_last_click_at = None
+        self._exit_last_click_frame = None
+        self._exit_last_seen_frame = None
+        self._exit_last_click_kind = ""
         self._log_action("exit_step", {"state": "EXIT_MENU_OPEN", "key": key})
         self._pending_exit_actions = [Action.key_down(key, label="exit_menu"), Action.key_up(key, label="exit_menu")]
 
     def _handle_exit_menu_open(self, observation: Observation, now: float) -> list[Action]:
-        actions = self._pending_exit_actions
-        self._pending_exit_actions = []
+        if self._continue_current_battle_result(observation, now, "exit_menu_result"):
+            return []
         exit_cfg = self.profile.exit
         # 部分客户端死亡后可直接离开战斗
         direct = self._match_feature(exit_cfg.direct_exit_feature)
         if direct is not None and direct.found:
+            self._pending_exit_actions = []
             self._exit_method = "direct"
             self._mark_exit_requested()
             self._transition(State.EXITING, "direct_exit")
-            return actions + [_click_action(direct, observation, "exit_direct")]
+            return [_click_action(direct, observation, "exit_direct")]
         # 2026-10-31 实机：死亡后按 ESC 可能直接弹出“确认离开战斗?”（死亡界面提示 ESC=离开战斗），
         # 不经过“菜单→离开战斗”按钮；先识别确认框，避免误判为菜单未打开而重复按 ESC 把确认框关掉。
         confirm = self._match_feature(exit_cfg.confirm_feature)
         if confirm is not None and confirm.found:
+            self._pending_exit_actions = []
             self._confirm_seen = True
             self._exit_method = "confirm"
             self._mark_exit_requested()
             self._log_action("exit_step", {"step": "confirm_dialog_direct"})
             self._transition(State.EXIT_CONFIRMING, "confirm_dialog_direct")
-            return actions
+            return []
         menu = self._match_feature(exit_cfg.menu_open_feature)
         if menu is not None and menu.found:
+            self._pending_exit_actions = []
             target = self._match_feature(exit_cfg.return_port_feature)
             if target is not None and target.found:
                 self._exit_method = "menu"
                 self._mark_exit_requested()
+                self._record_exit_click(observation, now, "menu")
                 self._transition(State.EXIT_CONFIRMING, "return_port_click")
-                return actions + [_click_action(target, observation, "exit_return_port")]
+                return [_click_action(target, observation, "exit_return_port")]
             if now - self._entered_at > 1.0:
                 self._log_action("exit_step", {"step": "return_port_missing"})
                 self._transition(State.ERROR_RECOVERY, "return_port_missing")
+            return []
+        # 先处理已打开的界面，再发送待发 Esc，避免把已出现的确认框关闭。
+        if self._pending_exit_actions:
+            actions = self._pending_exit_actions
+            self._pending_exit_actions = []
+            self._exit_menu_key_at = now
+            self._exit_menu_key_frame = (int(observation.frame_id), float(observation.frame_timestamp))
             return actions
         elapsed = now - self._entered_at
-        # 重试延迟放宽到 2.5s：死亡镜头/结算动画期间 ESC 可能被吞掉，过早重试会把已打开的
-        # 菜单/确认框关掉（实机 2026-10-31 17:13 死亡退出失败即此风险）
-        if not self._exit_retried and elapsed > 2.5:
+        timeout = float(self.config.global_config.timeouts.exit_menu_s)
+        if elapsed > timeout:
+            self._save_diagnostic("exit_menu_timeout", now)
+            self._log_action("exit_step", {
+                "step": "exit_menu_timeout", "elapsed_s": round(elapsed, 2),
+                "confirm_score": confirm.score if confirm is not None else None,
+                "menu_score": menu.score if menu is not None else None,
+                "exit_authorized": self._exit_authorized(observation, now),
+                "escape_retried": self._exit_retried,
+            })
+            if self._has_authorized_exit_context():
+                # 等待结算或可识别的退出界面，后续接续不能重置首次等待期限。
+                self._pending_exit_actions = []
+                if self._dead_result_wait_until is None:
+                    self._dead_result_wait_until = now + float(self.config.global_config.timeouts.exit_s)
+                self._transition(State.DEAD_PENDING_EXIT, "exit_menu_wait_result")
+            else:
+                self._transition(State.ERROR_RECOVERY, "exit_menu_timeout")
+            return []
+        # 只有发送之后的新鲜零血帧才能补按；未知画面可能是未识别的确认框。
+        if not self._exit_retried and self._can_retry_exit_menu(observation, now):
             self._exit_retried = True
             self._save_diagnostic("exit_menu_retry", now)
             key = self.deps.config.keymap.resolve(exit_cfg.menu_key)
             self._log_action("exit_step", {"step": "retry_menu_key", "elapsed_s": round(elapsed, 2)})
-            return actions + [Action.key_down(key, label="exit_menu_retry"), Action.key_up(key, label="exit_menu_retry")]
-        timeout = float(self.config.global_config.timeouts.exit_menu_s)
-        if elapsed > timeout:
-            self._save_diagnostic("exit_menu_timeout", now)
-            self._log_action("exit_step", {"step": "exit_menu_timeout", "elapsed_s": round(elapsed, 2)})
-            self._transition(State.ERROR_RECOVERY, "exit_menu_timeout")
-        return actions
+            return [Action.key_down(key, label="exit_menu_retry"), Action.key_up(key, label="exit_menu_retry")]
+        return []
+
+    def _can_retry_exit_menu(self, observation: Observation, now: float) -> bool:
+        sent_at = self._exit_menu_key_at
+        if sent_at is None or now - sent_at <= 2.5 or not self._exit_authorized(observation, now):
+            return False
+        frame = (int(observation.frame_id), float(observation.frame_timestamp))
+        if frame == self._exit_menu_key_frame or frame[1] <= sent_at:
+            return False
+        max_age = float(self.config.global_config.behavior.max_input_frame_age_s)
+        return 0.0 <= now - frame[1] <= max_age
 
     def _enter_exit_confirming(self, now: float, reason: str) -> None:
         self._confirm_seen = False
@@ -1116,28 +1266,50 @@ class StateMachine:
         self._pending_confirm_key = self.deps.config.keymap.resolve(exit_cfg.menu_key)
 
     def _handle_exit_confirming(self, observation: Observation, now: float) -> list[Action]:
+        if self._continue_current_battle_result(observation, now, "exit_confirm_result"):
+            return []
         exit_cfg = self.profile.exit
         confirm = self._match_feature(exit_cfg.confirm_feature)
         if confirm is not None and confirm.found:
             self._confirm_seen = True
             self._exit_method = "confirm"
+            if self._exit_click_used_on_frame(observation, ("confirm",)):
+                return []
+            self._record_exit_click(observation, now, "confirm")
             self._transition(State.EXITING, "confirm_click")
             return [_click_action(confirm, observation, "exit_confirm")]
+        timeout = float(self.config.global_config.timeouts.exit_confirm_s)
+        if now - self._entered_at > timeout:
+            # 确认框等待超时优先于菜单补点，补点不能延长等待窗口。
+            self._transition(State.EXITING, "no_confirm_dialog")
+            return []
         # 反向兜底：先出现的是“菜单”而不是确认框时，先点菜单里的“离开战斗”再等确认框
         menu = self._match_feature(exit_cfg.menu_open_feature)
         if menu is not None and menu.found:
             target = self._match_feature(exit_cfg.return_port_feature)
-            if target is not None and target.found:
+            if (
+                target is not None
+                and target.found
+                and self._can_send_exit_menu_fallback(observation, now)
+            ):
                 self._exit_method = "menu"
+                self._record_exit_click(observation, now, "fallback")
                 self._log_action("exit_step", {"step": "confirm_menu_fallback"})
                 return [_click_action(target, observation, "exit_return_port_fallback")]
-        timeout = float(self.config.global_config.timeouts.exit_confirm_s)
-        if now - self._entered_at > timeout:
-            # 没有确认框：按“点击返回港口后直接退出”处理（详细设计 6.6）
-            self._transition(State.EXITING, "no_confirm_dialog")
         return []
 
+    def _enter_exiting(self, now: float, reason: str) -> None:
+        self._exiting_from_result_click = reason in (
+            "result_continue_click",
+            "result_return_click",
+        )
+
     def _handle_exiting(self, observation: Observation, now: float) -> list[Action]:
+        if (
+            not self._exiting_from_result_click
+            and self._continue_current_battle_result(observation, now, "exit_result_visible")
+        ):
+            return []
         # 结算页“继续战斗！”：游戏会直接回到排队界面（不再经过港口）
         next_battle_visible = (self._observed_feature(observation, "queue_indicator")
             or self._observed_feature(observation, "loading_indicator")
@@ -1233,6 +1405,8 @@ class StateMachine:
             pass
         self._battle_id = None
         self._battle = None
+        self._dead_numeric_confirmed = False
+        self._dead_result_wait_until = None
         self._notify_battle_context(None)
         # 下一局直接排队（继续战斗）时也要遵守会话时长/场次/轮换限制（2026-10-31）
         stop = self.deps.session.check_stop()
@@ -1268,7 +1442,14 @@ class StateMachine:
         if detected is State.POST_EXIT_INTERFACE:
             self._transition(State.POST_EXIT_INTERFACE, "recovery_popup")
             return []
-        if detected in (State.BATTLE_ACTIVE, State.BATTLE_FINISHED, State.DEAD_PENDING_EXIT):
+        if detected is State.BATTLE_FINISHED:
+            if self._continue_current_battle_result(
+                observation, now, "recovery_result_visible"
+            ):
+                return []
+            self.request_pause("recovery_mid_battle", f"detected={detected.value}")
+            return []
+        if detected in (State.BATTLE_ACTIVE, State.DEAD_PENDING_EXIT):
             self.request_pause("recovery_mid_battle", f"detected={detected.value}")
             return []
         actions: list[Action] = []
@@ -1374,12 +1555,16 @@ class StateMachine:
                     return
         detected = None if observation.window_missing else self._safe_detect_state(now)
         battle_id = self._battle_id
-        battle_active = battle_id is not None and self._battle is not None and self._battle_result != "finished"
+        # 本进程的未结束 battle_id 就是恢复身份；排队/加载阶段尚未创建 _BattleRuntime。
+        battle_active = battle_id is not None and self._battle_result != "finished"
         if battle_active:
-            if detected in (State.BATTLE_ACTIVE, State.QUEUEING, State.LOADING):
+            if detected in (State.EXIT_MENU_OPEN, State.EXIT_CONFIRMING) and not self._has_authorized_exit_context():
+                self._stay_paused("resume_exit_unconfirmed", "本场未确认死亡，不接续退出操作", source)
+                return
+            if detected in (State.QUEUEING, State.LOADING, State.BATTLE_ACTIVE):
                 self._log_action("resume", {"source": source, "mode": "battle", "detected": detected.value})
-                self._transition(State.BATTLE_ACTIVE, f"resume_battle:{source}")
-                self._open_input_gate("resume_battle")
+                self._transition(detected, f"resume_battle:{source}")
+                self._open_input_gate(f"resume_{detected.value.lower()}")
                 return
             if detected is State.BATTLE_FINISHED:
                 self._battle_result = "finished"
@@ -1471,6 +1656,39 @@ class StateMachine:
     # ==================================================================
     # 辅助
     # ==================================================================
+    def _has_authorized_exit_context(self) -> bool:
+        """模态界面遮挡血量时，只接续本场先前已经获准的死亡退出。"""
+        return self._battle_id is not None and self._battle is not None and self._battle_result == "dead"
+
+    def _record_exit_click(self, observation: Observation, now: float, kind: str) -> None:
+        self._exit_last_click_at = now
+        self._exit_last_click_frame = (
+            int(observation.frame_id),
+            float(observation.frame_timestamp),
+        )
+        self._exit_last_seen_frame = self._exit_last_click_frame
+        self._exit_last_click_kind = kind
+
+    def _exit_click_used_on_frame(
+        self, observation: Observation, kinds: tuple[str, ...]
+    ) -> bool:
+        frame = (int(observation.frame_id), float(observation.frame_timestamp))
+        return self._exit_last_click_frame == frame and self._exit_last_click_kind in kinds
+
+    def _can_send_exit_menu_fallback(self, observation: Observation, now: float) -> bool:
+        frame = (int(observation.frame_id), float(observation.frame_timestamp))
+        if self._exit_last_seen_frame == frame:
+            return False
+        # 先记录已见帧：即使间隔未到，也不能在稍后用同一帧补点。
+        self._exit_last_seen_frame = frame
+        if self._exit_last_click_at is None:
+            return True
+        wait_s = max(
+            0.5,
+            float(self.profile.exit.post_click_wait_ms or 0) / 1000.0,
+        )
+        return now - self._exit_last_click_at >= wait_s
+
     def _mark_exit_requested(self) -> None:
         if self._battle_id is None:
             return
@@ -1497,6 +1715,8 @@ class StateMachine:
             self._exit_method = "none"
             self._exit_error = None
             self._result_continue_clicked = False
+            self._dead_numeric_confirmed = False
+            self._dead_result_wait_until = None
             self._battle_id = self.deps.events.begin_battle(self._session_id, map_id)
             self.deps.screenshots.begin_battle(self._battle_id)
             self.deps.session.begin_battle()
@@ -1509,6 +1729,10 @@ class StateMachine:
 
     def _abort_battle(self, now: float, reason: str) -> None:
         """ISS-006：离开战斗上下文但未走完结算时显式结束场次记录（幂等）。"""
+        try:
+            self.deps.session.abort_battle(reason)
+        except Exception as exc:
+            self._logger.warning("清理中断场次计时失败: %s", exc)
         battle_id = self._battle_id
         if battle_id is not None:
             try:
@@ -1520,6 +1744,8 @@ class StateMachine:
         self._battle_id = None
         self._battle = None
         self._battle_result = ""
+        self._dead_numeric_confirmed = False
+        self._dead_result_wait_until = None
         self._notify_battle_context(None)
 
     def _notify_battle_context(self, battle_id: int | None) -> None:
@@ -1534,7 +1760,7 @@ class StateMachine:
     def _exit_authorized(self, observation: Observation, now: float) -> bool:
         """ISS-002：判断是否已满足“血条确认归零”的提前退出门禁。
 
-        只认感知层给出的 ``exit_authorized``（基于颜色无关的空条证据 + 连续帧 + TTL）；
+        只认感知层给出的 ``exit_authorized``（数字零血或兼容配置的空条证据 + 连续帧 + TTL）；
         死亡提示、血条名称模板消失、小地图标记丢失都不能单独授权。
         """
         death = observation.death

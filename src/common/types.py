@@ -50,6 +50,7 @@ class ActionKind(StrEnum):
     MOVE_ABS = "move_abs"
     MOVE_REL = "move_rel"
     KEY_DOWN = "key_down"
+    KEY_TAP = "key_tap"
     KEY_UP = "key_up"
     MOUSE_DOWN = "mouse_down"
     MOUSE_UP = "mouse_up"
@@ -102,6 +103,11 @@ class Action:
     @classmethod
     def key_down(cls, key: str, label: str = "", priority: int = 20) -> Action:
         return cls(ActionKind.KEY_DOWN, key=key, label=label, priority=priority)
+
+    @classmethod
+    def tap_key(cls, key: str, label: str = "") -> Action:
+        """在当前位置按下并释放，后端作为一个动作执行。"""
+        return cls(ActionKind.KEY_TAP, key=key, label=label)
 
     @classmethod
     def key_up(cls, key: str, label: str = "", priority: int = 20) -> Action:
@@ -342,7 +348,7 @@ HP_EVIDENCE_LEVELS: tuple[str, ...] = ("alive", "zero", "unknown", "unavailable"
 class DeathSignals:
     """死亡信号投票结果（详细设计 5.9 / 评审 10.2）。
 
-    退出授权只认 ``exit_authorized``：血条区域有效 + 连续帧确认归零 + 证据在 TTL 内；
+    退出授权只认 ``exit_authorized``：己方血量证据有效 + 连续帧确认归零 + 证据在 TTL 内；
     ``banner`` / ``hp_bar_absent`` / ``marker_lost`` / ``spectator_ui`` 仍参与投票与日志，
     但**不能单独授权提前退出**（ISS-002）。
     """
@@ -365,6 +371,8 @@ class DeathSignals:
     exit_authorized: bool = False
     #: 最近一次“确认归零”证据的时间戳（单调时钟秒；0 表示从未确认）。
     evidence_at: float = 0.0
+    #: 当前血量；目前只确认数字零值，非零或未判定时为 None。
+    hp_current: int | None = None
 
     @property
     def dead(self) -> bool:
@@ -385,7 +393,25 @@ class DeathSignals:
             "hp_evidence": self.hp_evidence,
             "exit_authorized": self.exit_authorized,
             "evidence_at": round(self.evidence_at, 3),
+            "hp_current": self.hp_current,
         }
+
+
+@dataclass(frozen=True, slots=True)
+class EnemyContact:
+    """连续新帧确认的小地图实心敌舰标记，坐标相对小地图内容区。"""
+
+    minimap_px: tuple[float, float]
+
+
+@dataclass(frozen=True, slots=True)
+class CombatObservation:
+    timestamp: float
+    frame_id: int
+    own_px: tuple[float, float] | None = None
+    camera_bearing_deg: float | None = None
+    enemies: tuple[EnemyContact, ...] = ()
+    enemy_candidates: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -408,6 +434,7 @@ class Observation:
     # 帧序号与截屏时间：行为模块用它判断感知结果是否足够新（防止在过期画面上输入）
     frame_id: int = 0
     frame_timestamp: float = 0.0
+    combat: CombatObservation | None = None
 
     def feature(self, feature_id: str) -> MatchResult | None:
         return self.features.get(feature_id)

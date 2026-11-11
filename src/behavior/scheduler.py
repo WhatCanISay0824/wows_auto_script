@@ -1,6 +1,12 @@
-"""防挂机随机行为调度器（详细设计 8.2~8.8；评审 P1-6 / 算法层补充第 9 条）。
+"""战斗行为调度器（详细设计 8.2~8.8 与定向交战实现补充）。
 
 实现口径：
+启用 targeted_combat 时，根据连续确认的敌舰标记和镜头扇区小步转向、原地开火；
+停用旧随机视角、随机开火、随机消耗品和活动看门狗，避免未标定按键干扰交战。
+可靠无敌人画面使用独立限流的短幅水平平滑移动，候选敌舰出现后取消剩余运动。
+输入必须通过前台、弹窗、帧龄和每分钟额度检查；原地单次按键按两个输入事件计数。
+
+未启用定向交战时保留以下兼容行为：
 - 两个独立计时器（视角 ``camera``、攻击 ``attack``）+ 一个活动看门狗；
 - 采样使用**截断正态**（``camera_sd_s`` / ``attack_sd_s``，有限次拒绝采样，失败钳位），
   间隔均值 = 基准均值 / 本场频率倍率（评审 P1-6：倍率越大越频繁）；
@@ -26,8 +32,10 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-from ..common.types import Action, ActionKind, Observation, Rect
+from ..common.types import Action, ActionKind, CombatObservation, Observation, Rect
 from ..config.models import BehaviorConfig, KeyMap
+from .combat import CombatController
+from .idle_camera import IdleCameraController
 from .random_profile import RandomProfile
 
 BehaviorEventCallback = Callable[[str, dict[str, Any]], None]
@@ -69,7 +77,7 @@ class BehaviorContext:
 
 
 class BehaviorScheduler:
-    """随机行为调度器（每场战斗创建一个实例）。"""
+    """战斗行为调度器，按配置选择定向交战或旧随机行为。"""
 
     def __init__(
         self,
@@ -96,6 +104,12 @@ class BehaviorScheduler:
         self._last_activity = 0.0
         self._consumables_used = 0
         self._action_times: deque[float] = deque()
+        self._combat = CombatController(config, keymap.resolve("fire"))
+        self._combat_log_reason = ""
+        self._behavior_mode_key: tuple[str, str] | None = None
+        self._idle = IdleCameraController(config)
+        self._idle_action_times: deque[float] = deque()
+        self._idle_log_reason = ""
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -117,6 +131,12 @@ class BehaviorScheduler:
         self._last_activity = self._quiet_until
         self._consumables_used = 0
         self._action_times.clear()
+        self._combat.reset(profile.seed)
+        self._combat_log_reason = ""
+        self._behavior_mode_key = None
+        self._idle.reset(profile.seed)
+        self._idle_action_times.clear()
+        self._idle_log_reason = ""
         self._emit(
             "behavior_start",
             now,
@@ -130,6 +150,9 @@ class BehaviorScheduler:
         """停止行为调度：之后 tick 不再返回任何动作。"""
         self._running = False
         self._stopped = True
+        self._combat.reset()
+        self._idle.cancel()
+        self._behavior_mode_key = None
 
     # ------------------------------------------------------------------
     # 主循环
@@ -142,18 +165,24 @@ class BehaviorScheduler:
     ) -> list[Action]:
         """推进一次行为调度，返回本次需要提交的输入动作列表。"""
         if not self._running or self._stopped or self._profile is None:
+            self._idle.cancel()
             return []
         ctx = context if context is not None else BehaviorContext()
         if not ctx.in_battle:
+            self._idle.cancel()
             return []
         self._prune_action_window(now)
-        if now < self._quiet_until:
+        self._prune_idle_window(now)
+        quiet = now < self._quiet_until
+        if quiet and not self._config.targeted_combat:
             return []
         if self._heading_deg is None:
             heading = observation.ship.heading_deg if observation is not None and observation.ship else None
             self._heading_deg = float(heading) if heading is not None else 0.0
 
         skip_reason = self._input_gate(observation, ctx, now)
+        if self._config.targeted_combat:
+            return self._advance_targeted_combat(observation, now, skip_reason, quiet)
         actions: list[Action] = []
 
         # 1) 视角计时器
@@ -209,6 +238,11 @@ class BehaviorScheduler:
         self._next_attack = now + self._sample_attack_interval()
         self._watchdog_deferred_until = 0.0
         self._last_activity = now
+        self._combat.reset(self._profile.seed)
+        self._combat_log_reason = ""
+        self._behavior_mode_key = None
+        self._idle.cancel()
+        self._idle_log_reason = ""
         self._emit("behavior_resume", now, next_camera_at=round(self._next_camera, 2),
                    next_attack_at=round(self._next_attack, 2), consumables_used=self._consumables_used)
 
@@ -247,6 +281,186 @@ class BehaviorScheduler:
     # ------------------------------------------------------------------
     # 事件实现
     # ------------------------------------------------------------------
+    def _advance_targeted_combat(
+        self,
+        observation: Observation | None,
+        now: float,
+        skip_reason: str | None,
+        quiet: bool,
+    ) -> list[Action]:
+        frame = observation.combat if observation is not None else None
+        if skip_reason is not None:
+            self._combat.reset()
+            self._idle.cancel()
+            self._idle_log_reason = ""
+            reason = skip_reason
+            self._combat_log_reason = reason
+            self._emit_behavior_mode(observation, frame, now, "blocked", reason)
+            return []
+
+        has_contact = frame is not None and bool(frame.enemies or frame.enemy_candidates)
+        if quiet:
+            if has_contact:
+                self._idle.cancel()
+                self._idle_log_reason = ""
+                self._emit_behavior_mode(observation, frame, now, "blocked", "quiet")
+                return []
+            return self._advance_idle(frame, now, observation)
+
+        if frame is not None and not frame.enemies and frame.enemy_candidates:
+            self._idle.cancel()
+            self._idle_log_reason = ""
+            # 未确认候选只清除旧目标，不进入开火/转向路径。
+            self._combat.tick(frame, now)
+            reason = self._contact_wait_reason(frame, "candidate_unconfirmed")
+            self._combat_log_reason = reason
+            self._emit_behavior_mode(observation, frame, now, "candidate", reason)
+            return []
+
+        if has_contact:
+            self._idle.cancel()
+            self._idle_log_reason = ""
+            if self._remaining_quota(now) < 2:
+                reason = "input_quota"
+                actions, detail = [], {"reason": reason}
+            else:
+                assert frame is not None
+                actions, detail = self._combat.tick(frame, now)
+                reason = self._contact_wait_reason(frame, str(detail.get("reason", "")))
+            if actions:
+                accepted = self._limit_actions(actions, now)
+                if accepted:
+                    self._touch(now)
+                    self._emit(accepted[0].label, now, **detail, emitted=len(accepted))
+                self._combat_log_reason = reason
+                self._emit_behavior_mode(observation, frame, now, "combat", reason)
+                return accepted
+            self._combat_log_reason = reason
+            mode = "blocked" if reason in (
+                "input_quota", "combat_frame_unavailable", "own_unavailable", "camera_unavailable"
+            ) else "combat"
+            self._emit_behavior_mode(observation, frame, now, mode, reason)
+            return []
+
+        # 既有 no-target 分支仍负责清除旧交战目标；该调用不会产生动作或消耗随机流。
+        _, detail = self._combat.tick(frame, now)
+        self._combat_log_reason = detail.get("reason", "")
+        return self._advance_idle(frame, now, observation)
+
+    def _advance_idle(
+        self,
+        frame: CombatObservation | None,
+        now: float,
+        observation: Observation | None = None,
+    ) -> list[Action]:
+        if self._remaining_idle_quota(now) <= 0:
+            self._idle.cancel()
+            self._emit_behavior_mode(observation, frame, now, "blocked", "idle_quota")
+            if self._idle_log_reason != "idle_quota":
+                self._emit(
+                    "idle_camera_rate_limited",
+                    now,
+                    reason="idle_quota",
+                    limit=self._config.idle_camera_actions_per_minute_max,
+                )
+                self._idle_log_reason = "idle_quota"
+            return []
+
+        actions, detail = self._idle.tick(frame, now)
+        raw_reason = str(detail.get("reason", "idle_wait"))
+        if raw_reason in ("idle_ineligible", "idle_frame_unavailable"):
+            mode = "blocked"
+            reason = self._idle_blocked_reason(frame, now)
+        else:
+            mode = "idle"
+            reason = "no_contact"
+        self._emit_behavior_mode(observation, frame, now, mode, reason)
+        if raw_reason == "idle_motion_started":
+            self._idle_log_reason = ""
+            self._emit(
+                "idle_camera_move",
+                now,
+                movement_id=detail.get("movement_id"),
+                amplitude_px=detail.get("amplitude_px"),
+                duration_s=detail.get("duration_s"),
+            )
+        if actions:
+            self._idle_action_times.append(now)
+            self._touch(now)
+        return actions
+
+    def _idle_blocked_reason(self, frame: CombatObservation | None, now: float) -> str:
+        if frame is None:
+            return "frame_unavailable"
+        own = frame.own_px
+        if own is None or len(own) < 2 or not all(math.isfinite(float(value)) for value in own[:2]):
+            return "own_unavailable"
+        age = now - frame.timestamp
+        if age < 0:
+            return "future_frame"
+        if age > self._config.max_input_frame_age_s:
+            return "stale_frame"
+        return "idle_ineligible"
+
+    @staticmethod
+    def _contact_wait_reason(frame: CombatObservation, fallback: str) -> str:
+        own = frame.own_px
+        if own is None or len(own) < 2 or not all(math.isfinite(float(value)) for value in own[:2]):
+            return "own_unavailable"
+        camera = frame.camera_bearing_deg
+        if camera is None or not math.isfinite(float(camera)):
+            return "camera_unavailable"
+        return fallback
+
+    def _emit_behavior_mode(
+        self,
+        observation: Observation | None,
+        frame: CombatObservation | None,
+        now: float,
+        mode: str,
+        reason: str,
+    ) -> None:
+        key = (mode, reason)
+        if self._behavior_mode_key == key:
+            return
+        self._behavior_mode_key = key
+        if frame is not None:
+            candidates = int(frame.enemy_candidates)
+            confirmed = len(frame.enemies)
+            own = frame.own_px
+            own_available = bool(
+                own is not None
+                and len(own) >= 2
+                and all(math.isfinite(float(value)) for value in own[:2])
+            )
+            camera = frame.camera_bearing_deg
+            camera_available = camera is not None and math.isfinite(float(camera))
+            frame_time: float | None = frame.timestamp
+        else:
+            candidates = 0
+            confirmed = 0
+            own_available = False
+            camera_available = False
+            frame_time = None
+            if observation is not None:
+                frame_time = (
+                    observation.frame_timestamp
+                    if observation.frame_timestamp > 0
+                    else observation.timestamp
+                )
+        age = None if frame_time is None else round(now - frame_time, 3)
+        self._emit(
+            "behavior_mode",
+            now,
+            mode=mode,
+            reason=reason,
+            candidate_count=candidates,
+            confirmed_count=confirmed,
+            own_available=own_available,
+            camera_available=camera_available,
+            frame_age_s=age,
+        )
+
     def _advance_camera(self, now: float) -> list[Action]:
         self._next_camera = now + self._sample_camera_interval()
         if self._camera_rng.random() < self._long_stare_probability():
@@ -460,6 +674,15 @@ class BehaviorScheduler:
         while self._action_times and self._action_times[0] < cutoff:
             self._action_times.popleft()
 
+    def _prune_idle_window(self, now: float) -> None:
+        cutoff = now - _ACTION_WINDOW_S
+        while self._idle_action_times and self._idle_action_times[0] < cutoff:
+            self._idle_action_times.popleft()
+
+    def _remaining_idle_quota(self, now: float) -> int:
+        self._prune_idle_window(now)
+        return max(0, self._config.idle_camera_actions_per_minute_max - len(self._idle_action_times))
+
     def _remaining_quota(self, now: float) -> int:
         self._prune_action_window(now)
         return max(0, self._config.actions_per_minute_max - len(self._action_times))
@@ -472,11 +695,12 @@ class BehaviorScheduler:
             if action.kind is ActionKind.WAIT:
                 accepted.append(action)
                 continue
-            if remaining <= 0:
+            cost = 2 if action.kind is ActionKind.KEY_TAP else 1
+            if remaining < cost:
                 break
             accepted.append(action)
-            self._action_times.append(now)
-            remaining -= 1
+            self._action_times.extend([now] * cost)
+            remaining -= cost
         return accepted
 
     # ------------------------------------------------------------------
@@ -496,6 +720,8 @@ class BehaviorScheduler:
         frame_time = observation.frame_timestamp if observation.frame_timestamp > 0 else observation.timestamp
         if now - frame_time > self._config.max_input_frame_age_s:
             return "stale_frame"
+        if frame_time > now:
+            return "future_frame"
         return None
 
     @staticmethod

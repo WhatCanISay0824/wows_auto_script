@@ -1,0 +1,21 @@
+# 船只配置（详细设计 3.2 / 6.8）
+# 由控制台“首次船卡导入”生成；模板相对本目录（card.png）。
+# 信号旗校验由 profile.ship_check_sequence 完成；loadout_slots 允许为空。
+
+ship_id: ship_002
+display_name: 敦刻尔克
+card_template: card.png
+card_search_region: &id001
+- 0.0
+- 0.8
+- 1.0
+- 1.0
+selected_feature: selected.png
+selected_region: *id001
+selected_threshold: 0.78
+loadout_preset_feature: null
+max_scrolls: 20
+scroll_direction: down
+scroll_clicks: 2
+loadout_slots: []
+notes: 由 GUI 首次导入生成；未实机验证识别效果。

@@ -28,6 +28,7 @@ import cv2
 import numpy as np
 
 from ..common.errors import ConfigError, Severity, ValidationIssue
+from ..common.images import read_color_image
 from ..common.types import MatchResult, NormalizedRect, Rect
 from ..config.models import ClientProfile, FeatureDef, PerceptionConfig
 from .capture import Frame, clip_rect
@@ -140,7 +141,7 @@ def compile_feature(
     if not path.is_file():
         _error("template_missing", f"模板文件不存在: {path}")
         return None, tuple(issues)
-    image = cv2.imread(str(path), cv2.IMREAD_COLOR)
+    image = read_color_image(path)
     if image is None:
         _error("template_unreadable", f"模板文件无法读取（不是有效图片）: {path}")
         return None, tuple(issues)

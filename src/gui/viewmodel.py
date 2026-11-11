@@ -102,6 +102,7 @@ PAUSE_REASON_TEXT: dict[str, str] = {
     "ship_check_failed": "船只校验失败（未找到/未选中目标船）",
     "recovery_frequency": "异常恢复过于频繁（10 分钟超限）",
     "recovery_mid_battle": "异常恢复时检测到战斗中画面",
+    "death_result_timeout": "死亡退出未成功，等待正常结算或回港超时",
     "recovery_failed": "连续 3 次异常恢复失败",
     "heartbeat_timeout": "主循环心跳超时",
     "input_failed": "输入后端连续失败",

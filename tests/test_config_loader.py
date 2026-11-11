@@ -24,6 +24,33 @@ from tests.fixtures.configs import builder as fx
 FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures" / "configs"
 
 
+def test_targeted_combat_configuration_is_loaded(tmp_path: Path) -> None:
+    project = fx.build_valid_project(tmp_path)
+    behavior = {
+        "targeted_combat": True, "combat_fire_interval_s": [4, 7],
+        "aim_tolerance_deg": 9, "aim_counts_per_degree": 4.5,
+        "aim_step_max_px": 55, "aim_feedback_s": .8,
+        "idle_camera_interval_s": [2.5, 4.0],
+        "idle_camera_move_px": [28, 52],
+        "idle_camera_duration_s": [.4, .8],
+        "idle_camera_actions_per_minute_max": 120,
+    }
+    for key, value in behavior.items():
+        fx.edit_yaml_file(tmp_path / "config.yaml", f"behavior.{key}", value)
+    hsv = {
+        "enemy_hsv_lower": [1, 160, 180], "enemy_hsv_upper": [16, 250, 250],
+        "view_cone_hsv_lower": [96, 65, 40], "view_cone_hsv_upper": [101, 250, 150],
+    }
+    for key, value in hsv.items():
+        fx.edit_yaml_file(project.profile_dir / "profile.yaml", f"minimap.{key}", value)
+    loaded = load_project(tmp_path, project.client_id)
+    assert not loaded.errors
+    for key, value in behavior.items():
+        assert getattr(loaded.config.global_config.behavior, key) == (tuple(value) if isinstance(value, list) else value)
+    for key, value in hsv.items():
+        assert getattr(loaded.config.profile.minimap, key) == tuple(value)
+
+
 # ---------------------------------------------------------------------------
 # 真实仓库配置（模板/地图待实机标定，加载应不崩溃）
 # ---------------------------------------------------------------------------
@@ -57,6 +84,10 @@ def test_load_global_new_fields_from_review(project_root: Path) -> None:
     assert behavior.attack_sd_s == pytest.approx(21.0)
     assert behavior.actions_per_minute_max == 40
     assert behavior.max_input_frame_age_s == 1.0
+    assert behavior.idle_camera_interval_s == (3.0, 4.5)
+    assert behavior.idle_camera_move_px == (24, 48)
+    assert behavior.idle_camera_duration_s == (0.5, 0.7)
+    assert behavior.idle_camera_actions_per_minute_max == 180
     perception = config.perception
     assert perception.map_min_inlier_hull_ratio == 0.25
     assert perception.map_verify_ncc == 0.30
@@ -105,7 +136,8 @@ def test_load_profile_real_cn360(project_root: Path) -> None:
     assert profile.client_id == "cn360"
     assert profile.display_name
     assert profile.reference_resolution == (2560, 1600)
-    assert len(profile.features) == 19  # 18 个界面模板 + 2026-10-31 新增 result_continue_battle_button
+    assert len(profile.features) == 20
+    assert profile.battle_hud.hp_zero_feature == "hp_zero_value"
     # 2026-10-30 实机截图已全部提取（含退出菜单/确认框/装备页/标签页）
     assert all(feature.template_path is not None for feature in profile.features.values())
     assert profile.battle_hud.spectator_features == ()
@@ -118,8 +150,9 @@ def test_load_profile_real_cn360(project_root: Path) -> None:
     assert feature.region.to_list() == [0.40, 0.0, 0.56, 0.06]
     assert profile.minimap is not None
     assert profile.minimap.marker_template == "marker/marker.png"
-    assert profile.minimap.rect.to_list() == [0.853125, 0.765, 1.0, 1.0]
-    assert profile.minimap.marker_hsv_lower == (0, 0, 200)
+    assert profile.minimap.rect.to_list() == [0.796875, 0.675, 1.0, 1.0]
+    assert profile.minimap.marker_hsv_lower == (0, 0, 180)
+    assert profile.minimap.marker_hsv_upper == (180, 140, 255)
     assert profile.battle_hud.hp_fill_zero_ratio == 0.05
     assert profile.exit.menu_key == "escape"
     assert profile.exit.confirm_feature == "exit_confirm_yes"

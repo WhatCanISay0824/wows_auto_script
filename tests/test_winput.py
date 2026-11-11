@@ -20,9 +20,41 @@ from src.execution import winput
 FAKE_VIRTUAL_RECT = Rect(0, 0, 1920, 1080)
 
 
+@pytest.mark.parametrize('key', ['mouse_left', 'r'])
+def test_atomic_tap_sends_press_release_without_cursor_movement(key: str) -> None:
+    fake = FakeSendInput()
+    clock = FakeClock()
+    backend = make_sendinput_backend(fake, clock)
+    backend.send([Action.tap_key(key, 'test_fire')])
+    assert len(fake.events) == 2
+    assert not backend.pressed_keys
+    assert not backend.pressed_buttons
+    if key == 'mouse_left':
+        assert [event.dwFlags for event in fake.mouse_events()] == [winput.MOUSEEVENTF_LEFTDOWN, winput.MOUSEEVENTF_LEFTUP]
+    else:
+        assert len(fake.key_events()) == 2
+
+
 # ---------------------------------------------------------------------------
 # 测试替身
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("key", ["mouse_left", "r"])
+def test_atomic_tap_releases_even_when_hold_is_interrupted(key: str) -> None:
+    fake = FakeSendInput()
+    backend = make_sendinput_backend(fake, FakeClock())
+
+    class InterruptedHold:
+        def sleep(self, seconds):
+            raise RuntimeError("interrupted hold")
+
+    backend._sleeper = InterruptedHold()
+    with pytest.raises(RuntimeError, match="interrupted hold"):
+        backend.send([Action.tap_key(key)])
+    assert len(fake.events) == 2
+    assert not backend.pressed_keys
+    assert not backend.pressed_buttons
 
 
 class FakeSendInput:

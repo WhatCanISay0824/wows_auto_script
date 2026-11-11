@@ -204,7 +204,7 @@ class RunPage(tk.Frame):
             return cell
 
         self.profile_var = tk.StringVar(value="")
-        self.profile_combo = ttk.Combobox(field("客户端", 0, 0), textvariable=self.profile_var, state="readonly")
+        self.profile_combo = ttk.Combobox(field("客户端 / 服务器", 0, 0), textvariable=self.profile_var, state="readonly")
         self.profile_combo.pack(fill="x")
         self.profile_text = tk.Label(self.profile_combo.master, textvariable=self.profile_var,
                                     bg=widgets.PANEL, fg=widgets.TEXT, font=widgets.font(10), anchor="w")

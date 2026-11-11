@@ -21,18 +21,21 @@ window:
 
 keys_file: keys.yaml
 
-# 小地图标定（2026-11-01 诊断截图，2560×1600）：小地图位于右下角，profile 矩形外框约 376×376，
-# 按 border_px=2 四边内缩后实际内容区 372×372；右下贴边。旧矩形外框约 514×507，误含左上方
-# 战斗画面；本轮按当前游戏截图校正。
+# 小地图标定（2026-11-03 诊断截图，2560×1600）：小地图位于右下角，profile 矩形外框 520×520，
+# 按 border_px=2 四边内缩后实际内容区 516×516；右下贴边。旧矩形误裁掉己方标记。
 # 注意：该标定对应当前游戏的小地图尺寸；用户在游戏内调整小地图大小后仍需重新标定。
 minimap:
-  rect: [0.853125, 0.765, 1.0, 1.0]
+  rect: [0.796875, 0.675, 1.0, 1.0]
   border_px: 2
   frame_feature: null                    # 小地图边框模板不稳定，暂不使用
   marker_template: marker/marker.png     # 自身舰船白色箭头（已从实机截图提取）
   marker_angles: 24
-  marker_hsv_lower: [0, 0, 200]          # 白色箭头：低饱和、高亮度
-  marker_hsv_upper: [180, 60, 255]
+  enemy_hsv_lower: [0, 150, 170]        # 只筛红橙敌舰；粉色友舰不纳入
+  enemy_hsv_upper: [18, 255, 255]
+  view_cone_hsv_lower: [90, 60, 65]     # 小地图镜头扇区颜色，需按客户端实测
+  view_cone_hsv_upper: [102, 255, 160]
+  marker_hsv_lower: [0, 0, 180]          # 白色箭头：低饱和、高亮度
+  marker_hsv_upper: [180, 140, 255]
   marker_jump_px: 300
   marker_lost_s: 3
 
@@ -52,6 +55,7 @@ battle_hud:
   hp_bar_alive_min_ratio: 0.10                  # 高于=存活；两者之间=无法判断（不授权）
   hp_bar_confirm_frames: 2                      # 连续 N 个新帧确认归零才授权提前退出
   hp_bar_evidence_ttl_s: 1.0                    # 归零证据有效期（秒）；超时/矛盾证据撤销授权
+  hp_zero_feature: hp_zero_value                # 可选数字零血模板；配置后空条不再单独授权
   spectator_features: []                        # 用户确认：死亡立刻退出，不需要观战界面
   death_banner_feature: death_banner            # 已提取（“您的战舰已被玩家摧毁”）
   result_feature: battle_results                # 已提取（结算页右侧固定分页栏）
@@ -133,6 +137,10 @@ features:
     template: features/hp_bar_present.png          # 左下“VII 列宁格勒”血条文字（静态）
     region: [0.0, 0.72, 0.17, 0.80]
     threshold: 0.82
+  hp_zero_value:
+    template: features/hp_zero_value.png           # 当前血量“0/”局部（红橙 0 + 中性亮度分隔符）
+    region: [0.075, 0.77, 0.17, 0.795]             # 数字专用 ROI，覆盖当前血量与分隔符
+    threshold: 0.92                                # 前景分类匹配；默认多尺度 0.95/1.0/1.05
   death_banner:
     template: features/death_banner.png            # “您的战舰已被玩家摧毁”（静态文字）
     region: [0.38, 0.82, 0.74, 0.93]
@@ -160,7 +168,7 @@ features:
     threshold: 0.78   # 2026-10-31 下调：菜单淡入期间匹配分数偏低，避免误判未打开而重复按 ESC
   exit_confirm_yes:
     template: features/exit_confirm_yes.png           # “离开战斗?” 确认框里的“是”按钮
-    region: [0.34, 0.45, 0.48, 0.53]
+    region: [0.34, 0.45, 0.48, 0.57]                 # 覆盖普通确认及“战斗提前结束”说明增高后的按钮
     threshold: 0.78   # 与退出菜单同步下调
   # ---- 实测港口标签页 / 装备页信号旗（210924 / 214644）----
   port_equip_tab:

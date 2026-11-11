@@ -621,6 +621,28 @@ def test_invalid_max_battles_blocks_start(app, fake_service) -> None:
     assert "场次上限" in app.banner.text
 
 
+@pytest.mark.parametrize("profile_id", ["wg_asia", "wg_eu", "wg_na"])
+def test_production_direct_server_selection_reaches_start_and_tools(app, fake_service, profile_id):
+    from src.gui.app import load_gui_catalog
+
+    app.project_root = Path(__file__).resolve().parents[1]
+    app.catalog = load_gui_catalog(app.project_root)
+    app._apply_catalog()
+    page = app.run_page
+    assert page.profile_combo.winfo_manager() == "pack"
+    option = next(item for item in app.catalog.profiles if item.profile_id == profile_id)
+    page.profile_combo.set(option.label)
+    page._on_profile_selected()
+    assert page.selected_profile_id() == profile_id
+    assert {ship.ship_id for ship in app.catalog.ships} >= {"iron_duke", "leningrad"}
+    page.ship_name_var.set("铁公爵")
+    page._apply_ship_match()
+    app.on_start_clicked()
+    assert fake_service.start_options[-1].profile_id == profile_id
+    assert fake_service.start_options[-1].ship_id == "iron_duke"
+    assert app._tool_context()[:2] == (profile_id, "iron_duke")
+
+
 def test_non_stopped_disables_form_and_import(app, fake_service) -> None:
     fake_service.set_lifecycle(RunLifecycle.RUNNING)
     app.poll_once()

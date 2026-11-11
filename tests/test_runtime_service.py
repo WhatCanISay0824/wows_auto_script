@@ -823,6 +823,19 @@ def _fake_runtime():  # noqa: ANN202 - 测试替身
     return runtime, calls, controller
 
 
+def test_session_snapshot_refreshes_daily_usage_from_controller() -> None:
+    from src.runtime.runner import SessionRunner
+
+    runtime, _, _ = _fake_runtime()
+    count = [4]
+    runtime.session.count_battles_today = lambda: count[0]
+    runner = SessionRunner(runtime)
+
+    assert runner.snapshot_state(0.0).session.daily_used == 4
+    count[0] = 5
+    assert runner.snapshot_state(1.0).session.daily_used == 5
+
+
 def test_session_runner_view_mapping_and_controls() -> None:
     from src.runtime.runner import SessionRunner
 

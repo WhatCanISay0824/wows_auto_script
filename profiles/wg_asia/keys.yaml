@@ -1,0 +1,25 @@
+# 按键映射（详细设计 3.4）
+# 配置只出现可读按键名；虚拟键码与扫描码在 src/execution/winput.py 维护。
+# 待验证 V21/V22：实机确认开火为鼠标左键、消耗品栏位与游戏内设置一致。
+
+actions:
+  escape: escape          # ESC 菜单 / 关闭弹窗
+  fire: mouse_left        # 开火（鼠标左键）
+  full_map: m             # 全屏地图开关
+
+camera:
+  relative: true          # 视角使用鼠标相对移动
+  sensitivity: 1.0        # 与 profile.camera.sensitivity 保持一致，实机标定后调整
+
+# 消耗品栏位（按游戏内设置填写的实际按键）。纯随机点击，不做状态判断。
+consumables:
+  - key: "1"
+    name: 损管小组
+  - key: "2"
+    name: 维修小组
+  - key: "3"
+    name: 水听
+  - key: "4"
+    name: 引擎增压
+  - key: "5"
+    name: 侦察机
